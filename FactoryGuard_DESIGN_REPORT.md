@@ -1,8 +1,8 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v2.5
+> 文档版本：v2.6
 > 成文日期：2026-10-07
-> 文档状态：立项稿（硬件健康、崩溃恢复、负载保护与 IPC 契约增强版）
+> 文档状态：立项稿（数据盘治理、服务启动就绪、硬件健康与崩溃恢复增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
 > v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
@@ -11,6 +11,7 @@
 > v2.3 增补：勒索软件防护和攻击面减少、崩溃转储符号化、补丁生命周期、安全事件响应、根因分析和客户公告。
 > v2.4 增补：WDAC/AppLocker 应用白名单、可移动介质、SMB/RDP/WinRM 加固、防御式编译/Fuzzing/CI、Qt UI 状态一致性与降级模式。
 > v2.5 增补：硬件 SMART/温度/UPS 监测、崩溃后启动恢复、告警风暴和 Load Shedding、命名管道消息目录与会话版本契约。
+> v2.6 增补：数据盘身份、GPT/NTFS、簇大小、分区对齐、盘符持久化、容量边界，以及服务依赖最小化、启动顺序、就绪确认和冷启动竞态治理。
 
 ---
 
@@ -8338,11 +8339,631 @@ IPC 契约越清晰，Windows 现场升级和故障诊断越不容易依赖“�
 
 ---
 
-## 74. 行业资料与标准依据
+## 74. 数据盘初始化、盘符持久化与文件系统验收
+
+### 74.1 为什么数据盘必须作为可靠性对象治理
+
+FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告警前后片段、临时片段、日志、诊断包和本地备份副本。若这些数据直接散落在系统盘、U 盘、网络共享或未验收卷上，即使检测进程本身正常，也可能出现以下失效：
+
+- Windows 更新、日志、转储或第三方软件占满系统盘，导致数据库无法提交；
+- 维护人员插入移动硬盘后盘符变化，服务把数据写到错误位置；
+- 卷被格式化为 FAT/exFAT，缺少 NTFS ACL、元数据事务和成熟恢复能力；
+- 开启 NTFS 压缩，CPU 在高告警时段被压缩和解压占用，且媒体文件压缩收益很低；
+- BitLocker 已启用但未托管恢复密钥，更换主板或冷启动后数据盘无法解锁；
+- 数据盘使用 USB 转接、劣质硬盘盒或非固定介质，瞬时断连造成文件句柄失效；
+- 分区未按现代扇区边界对齐，造成额外写放大和性能下降；
+- 数据库、片段和临时目录跨卷，原子重命名退化为复制，崩溃时容易留下半成品；
+- 只检查“目录存在”，没有核验磁盘序列号、卷身份和容量边界，无法证明服务使用的是客户授权的目标磁盘。
+
+因此，v1.0 不允许安装器在启动时自动寻找“看起来容量最大”的磁盘并格式化。数据盘必须经过勘察、身份确认、审批、初始化、验收和登记。系统上线后，服务每次启动都要核验磁盘身份；身份不符时只能进入安全模式并告警，不能静默改写磁盘或切换到系统盘。
+
+### 74.2 v1.0 标准文件系统决策
+
+| 项目 | v1.0 标准决策 | 说明 |
+| --- | --- | --- |
+| 磁盘形态 | 固定内置磁盘，优先 SATA/NVMe 直连 | 禁止把 USB 移动硬盘、SD 卡、网络共享作为活跃数据库或主媒体目录 |
+| 系统盘/数据盘 | 必须分离 | 系统盘安装 OS 和程序；数据盘承载数据库、媒体、日志和诊断数据 |
+| 分区表 | GPT | 新装机统一使用 GPT；MBR 仅用于客户已有机器的兼容评估，不作为新盘标准 |
+| 分区对齐 | 起始偏移可被 1 MiB 整除 | 最低要求可被 4096 字节整除；现代 Windows 默认分区通常满足该条件 |
+| 默认文件系统 | NTFS | 具备成熟工具链、ACL、BitLocker、恢复和审计能力，是 v1.0 默认选择 |
+| 簇大小 | 4096 字节 | 同时兼顾 SQLite 小页、截图、日志和 MP4 大文件，避免 64K 簇造成空间浪费 |
+| 卷标 | FactoryGuard | 卷标用于人工识别，不可替代磁盘唯一 ID |
+| 盘符 | 现场约定固定盘符 | 建议使用不常被移动存储占用的盘符，并写入部署档案 |
+| NTFS 压缩 | 禁用 | 不在数据库、媒体、日志、诊断目录上启用压缩 |
+| BitLocker | 可选，但必须托管密钥 | 启用后应验证自动解锁或组织托管恢复密钥，不能只保存单一人工口令 |
+| ReFS | 仅作为预研/定制选项 | 需确认 Windows 版本、功能可用性、备份工具和现场运维能力，不作为 v1.0 默认 |
+
+结论很明确：**新项目首版默认“固定数据盘 + GPT + NTFS + 4K 簇 + 固定盘符 + 显式身份登记”**。ReFS 的完整性流、块克隆和弹性能力值得关注，但不同 Windows 版本和使用场景的能力边界不同；在没有完成现场兼容性验证前，不应为了追求单一特性而更换默认文件系统。
+
+### 74.3 磁盘身份识别与防误格式化
+
+磁盘编号可能因为插拔顺序、控制器和 BIOS 设置变化，不能作为唯一身份。实施时至少记录以下字段：
+
+- 物理磁盘序列号；
+- Storage UniqueId；
+- 总线类型、介质类型、型号、固件版本；
+- 标称容量和实际可见容量；
+- 分区样式、分区数量、分区偏移；
+- 卷 GUID、盘符、卷标、文件系统和簇大小；
+- 客户资产编号、安装位置和审批人。
+
+初始化脚本必须通过 \`UniqueId\` 或序列号精确选择磁盘，并再次确认该磁盘不是启动盘、系统盘，且没有分区。任何“按容量自动匹配”“只有一块空盘所以直接格式化”的逻辑都不允许进入生产安装器。
+
+### 74.4 数据目录与容量边界
+
+以盘符 \`V\` 为例，标准布局如下：
+
+| 路径 | 用途 | 治理要求 |
+| --- | --- | --- |
+| \`V:\FactoryGuard\db\` | SQLite 主库、WAL、SHM 和迁移状态 | 只允许服务账户和管理员访问；不得放网络盘 |
+| \`V:\FactoryGuard\media\snapshots\` | 告警截图 | 文件写完并 Flush 后再发布到数据库 |
+| \`V:\FactoryGuard\media\clips\` | 告警前后 MP4 片段 | 受保留策略和容量水位控制 |
+| \`V:\FactoryGuard\spool\` | FFmpeg 临时文件、原子重命名暂存 | 必须与最终媒体目录在同一 NTFS 卷 |
+| \`V:\FactoryGuard\exports\` | 人工导出证据包 | 导出完成后可按审批记录清理 |
+| \`V:\FactoryGuard\logs\` | 服务日志、审计日志 | 设置滚动和保留上限 |
+| \`V:\FactoryGuard\diagnostics\` | 一键诊断包、崩溃转储索引 | 设置保留数量，避免无限堆积 |
+| \`V:\FactoryGuard\backups-local\` | 本地临时备份副本 | 不能替代异地或离线备份 |
+
+容量水位由应用强制执行，而不是依赖人工查看：
+
+- 剩余空间大于 20%：正常运行；
+- 剩余空间不大于 20%：产生警告，提前清理过期片段并通知值班人员；
+- 剩余空间不大于 12%：进入容量保护，暂停非关键导出、调试日志和可选诊断采集；
+- 剩余空间不大于 8%：主动执行低优先级媒体清理，新片段降级为最短窗口，截图和事件元数据优先；
+- 剩余空间不大于 5%：进入证据安全模式，只允许数据库事务、核心告警、截图和必要日志写入；
+- 磁盘身份不符或卷不可写：服务不得切换到系统盘，应保持核心进程存活并输出明确故障状态。
+
+数据库所在目录应保留独立最小空间，例如 5 GB 或按现场通道数计算的上限。媒体清理不能通过删除数据库文件、WAL 文件或尚未完成取证审批的证据来换取空间。
+
+### 74.5 受控初始化脚本示例
+
+以下脚本默认只执行 WhatIf 预演；只有传入 \`-Commit\` 才会真正初始化。生产交付时应把同等校验逻辑固化到签名安装器，并把命令输出存入部署证据包。
+
+```powershell
+#Requires -RunAsAdministrator
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+  [Parameter(Mandatory = $true)]
+  [string]$DiskIdentity,
+
+  [ValidatePattern('^[A-Z]$')]
+  [string]$DriveLetter = 'V',
+
+  [string]$Label = 'FactoryGuard',
+
+  [UInt64]$MinimumSizeGB = 250,
+
+  [switch]$Commit
+)
+
+$ErrorActionPreference = 'Stop'
+
+if ($DriveLetter -eq 'C') {
+  throw '禁止把系统盘符作为 FactoryGuard 数据盘目标盘符'
+}
+
+$candidates = @(
+  Get-Disk | Where-Object {
+    -not $_.IsBoot -and
+    -not $_.IsSystem -and
+    (
+      ($_.UniqueId -eq $DiskIdentity) -or
+      ($_.SerialNumber -and ($_.SerialNumber.Trim() -eq $DiskIdentity))
+    )
+  }
+)
+
+if ($candidates.Count -ne 1) {
+  throw "磁盘身份必须唯一匹配；当前匹配数量：$($candidates.Count)"
+}
+
+$disk = $candidates[0]
+
+if ($disk.PartitionStyle -ne 'RAW') {
+  throw "目标磁盘分区样式为 $($disk.PartitionStyle)，新盘初始化流程要求为 RAW"
+}
+if ($disk.NumberOfPartitions -ne 0) {
+  throw "目标磁盘存在 $($disk.NumberOfPartitions) 个分区，禁止按空盘流程初始化"
+}
+if ($disk.BusType.ToString() -eq 'USB') {
+  throw '目标磁盘通过 USB 总线连接，禁止作为 v1.0 活跃数据盘'
+}
+if (@($disk.OperationalStatus) -notcontains 'OK') {
+  throw "目标磁盘运行状态不是 OK：$($disk.OperationalStatus)"
+}
+
+$minimumBytes = $MinimumSizeGB * 1GB
+if ($disk.Size -lt $minimumBytes) {
+  throw "目标磁盘容量小于最低要求：$MinimumSizeGB GB"
+}
+
+$initializeArgs = @{
+  Number         = $disk.Number
+  PartitionStyle = 'GPT'
+  PassThru       = $true
+}
+$partitionArgs = @{
+  DiskNumber     = $disk.Number
+  UseMaximumSize = $true
+  DriveLetter    = [char]$DriveLetter
+  GptType        = '{EBD0A0A2-B9E5-4433-87C0-68B6B72699C7}'
+}
+$formatArgs = @{
+  DriveLetter       = [char]$DriveLetter
+  FileSystem        = 'NTFS'
+  NewFileSystemLabel = $Label
+  AllocationUnitSize = 4096
+  Confirm           = $false
+}
+
+if (-not $Commit) {
+  $initializeArgs.WhatIf = $true
+  $partitionArgs.WhatIf = $true
+  $formatArgs.WhatIf = $true
+}
+
+$initializedDisk = Initialize-Disk @initializeArgs
+$partition = New-Partition @partitionArgs
+$volume = Format-Volume @formatArgs
+
+if ($Commit) {
+  $root = Join-Path "$DriveLetter`:" 'FactoryGuard'
+  $directories = @(
+    'db',
+    'media\snapshots',
+    'media\clips',
+    'spool',
+    'exports',
+    'logs',
+    'diagnostics',
+    'backups-local'
+  )
+
+  foreach ($directory in $directories) {
+    $fullPath = Join-Path $root $directory
+    New-Item -ItemType Directory -Path $fullPath -Force | Out-Null
+  }
+
+  [pscustomobject]@{
+    DiskNumber       = $disk.Number
+    UniqueId         = $disk.UniqueId
+    SerialNumber     = $disk.SerialNumber
+    DriveLetter      = $DriveLetter
+    Root             = $root
+    FileSystem       = $volume.FileSystem
+    AllocationUnit   = $volume.AllocationUnitSize
+    Initialized      = $true
+  }
+} else {
+  '预演完成：未初始化磁盘、未创建分区、未格式化卷、未写入目录'
+}
+```
+
+### 74.6 只读盘点与对齐核验脚本
+
+以下脚本只读不写，用于部署前和每次大版本升级前采集证据：
+
+```powershell
+[CmdletBinding()]
+param(
+  [ValidatePattern('^[A-Z]$')]
+  [string]$DriveLetter = 'V'
+)
+
+$physicalDisks = Get-PhysicalDisk |
+  Select-Object DeviceId, FriendlyName, SerialNumber, MediaType, BusType,
+                HealthStatus, OperationalStatus, Size
+
+$disks = Get-Disk |
+  Select-Object Number, UniqueId, FriendlyName, SerialNumber, PartitionStyle,
+                NumberOfPartitions, BusType, OperationalStatus, HealthStatus,
+                IsBoot, IsSystem, Size
+
+$partitions = foreach ($partition in Get-Partition) {
+  [pscustomobject]@{
+    DiskNumber       = $partition.DiskNumber
+    PartitionNumber  = $partition.PartitionNumber
+    DriveLetter      = $partition.DriveLetter
+    Offset           = $partition.Offset
+    Size             = $partition.Size
+    AlignedTo4K      = ($partition.Offset % 4096 -eq 0)
+    AlignedTo1MiB    = ($partition.Offset % 1048576 -eq 0)
+  }
+}
+
+$volumes = Get-Volume |
+  Select-Object DriveLetter, FileSystemLabel, FileSystem, HealthStatus,
+                SizeRemaining, Size, AllocationUnitSize
+
+$ntfsInfo = & fsutil fsinfo ntfsinfo "$DriveLetter`:"
+
+[pscustomobject]@{
+  PhysicalDisks = $physicalDisks
+  Disks         = $disks
+  Partitions    = $partitions
+  Volumes       = $volumes
+  NtfsInfo      = $ntfsInfo
+}
+```
+
+验收时必须确认目标分区的 \`AlignedTo1MiB\` 为 true，文件系统为 NTFS，簇大小为 4096，且剩余容量符合容量规划。若 \`fsutil\` 返回权限或路径错误，应在提权命令行中重新执行并保存原始输出。
+
+### 74.7 NTFS 与 ReFS 的工程选择
+
+| 维度 | NTFS | ReFS |
+| --- | --- | --- |
+| v1.0 定位 | 默认生产文件系统 | 预研和特定客户环境 |
+| Windows 版本一致性 | 桌面端和服务器端普遍可用 | 可用性受版本、edition 和功能影响 |
+| ACL 与审计 | 成熟 | 支持相关 Windows 安全模型 |
+| BitLocker | 成熟可验收 | 需结合具体版本验证 |
+| 数据恢复工具 | 工具链和现场经验丰富 | 需确认备份、救援和运维工具 |
+| 适用数据 | SQLite、截图、日志、MP4、导出包 | 大容量存储、完整性流或块克隆等场景 |
+| 发布要求 | 默认路径 | 必须完成故障注入、备份恢复和运维培训 |
+
+不能把 ReFS 宣传成“永远不会损坏”。文件系统只能提高某些故障的检测和恢复能力，无法替代 UPS、断电写入测试、数据库事务、备份和物理磁盘健康监测。
+
+### 74.8 写入持久性和原子重命名演练
+
+初始化完成后不能只验证“能创建文件”，还应验证显式 Flush、崩溃和重命名语义。
+
+```powershell
+[CmdletBinding()]
+param(
+  [string]$Root = 'V:\FactoryGuard'
+)
+
+$probeDirectory = Join-Path $Root '.reliability-probe'
+New-Item -ItemType Directory -Path $probeDirectory -Force | Out-Null
+
+foreach ($index in 1..10) {
+  $temporaryPath = Join-Path $probeDirectory "probe-$index.tmp"
+  $finalPath = Join-Path $probeDirectory "probe-$index.dat"
+  $stream = [System.IO.File]::Open(
+    $temporaryPath,
+    [System.IO.FileMode]::Create,
+    [System.IO.FileAccess]::Write
+  )
+
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes("factoryguard-write-probe-$index")
+  $stream.Write($bytes, 0, $bytes.Length)
+  $stream.Flush($true)
+  $stream.Close()
+
+  Move-Item -LiteralPath $temporaryPath -Destination $finalPath
+}
+
+Get-ChildItem -LiteralPath $probeDirectory |
+  Select-Object Name, Length, LastWriteTime
+```
+
+建议演练三类中断：
+
+1. 文件写入并调用 \`Flush($true)\` 后立即长按电源关机；
+2. 文件写入完成但重命名前终止进程；
+3. 重命名过程中断电或强制重启。
+
+重启后检查：最终文件可读取；临时文件可被启动恢复任务识别并清理；数据库不会引用不存在的媒体文件；没有半个文件被标记为“已发布”。
+
+### 74.9 数据盘异常处理矩阵
+
+| 异常 | 期望检测 | 系统动作 |
+| --- | --- | --- |
+| 磁盘离线 | 启动盘点或周期健康检查发现 | 进入数据盘故障状态，提示资产编号和磁盘 ID，不自动初始化 |
+| 盘符变化 | 实际卷身份与配置不一致 | 通过卷身份尝试只读确认，要求维护员按预案恢复盘符 |
+| 错误文件系统 | 非 NTFS 默认卷 | 阻断生产启动；允许导出诊断，不自动转换文件系统 |
+| 簇大小不是 4096 | 卷信息核验失败 | 标记配置偏差；只有经过审批才可接受非默认值 |
+| 分区未对齐 | Offset 不能被 4096 整除 | 阻止交付，重新分区并复核 |
+| NTFS 压缩启用 | 目录或卷属性异常 | 阻止启用新录制，给出解压和重新验收步骤 |
+| USB 数据盘 | BusType 为 USB | 阻断生产模式，提示使用固定磁盘 |
+| BitLocker 锁定 | 卷不可访问 | 启动最小控制台，要求通过托管密钥解锁 |
+| 空间不足 | 容量水位越界 | 按分级策略清理和降级，保留核心告警 |
+| SMART 警告 | 健康状态或可靠性计数器异常 | 提前更换磁盘并执行迁移，不等待完全失效 |
+
+### 74.10 验收记录 JSON
+
+```json
+{
+  "version": 1,
+  "generatedAt": "2026-10-07T10:00:00+08:00",
+  "customerAssetId": "FG-DISK-001",
+  "physicalDisk": {
+    "friendlyName": "Enterprise SSD",
+    "serialNumber": "EXAMPLE-SERIAL",
+    "uniqueId": "EXAMPLE-UNIQUE-ID",
+    "busType": "SATA",
+    "mediaType": "SSD",
+    "healthStatus": "Healthy",
+    "sizeBytes": 512110190592
+  },
+  "partition": {
+    "partitionStyle": "GPT",
+    "partitionNumber": 1,
+    "offsetBytes": 1048576,
+    "alignedTo1MiB": true
+  },
+  "volume": {
+    "driveLetter": "V",
+    "fileSystem": "NTFS",
+    "fileSystemLabel": "FactoryGuard",
+    "allocationUnitSizeBytes": 4096,
+    "compressionEnabled": false
+  },
+  "directories": [
+    "V:\\FactoryGuard\\db",
+    "V:\\FactoryGuard\\media\\snapshots",
+    "V:\\FactoryGuard\\media\\clips",
+    "V:\\FactoryGuard\\spool",
+    "V:\\FactoryGuard\\logs",
+    "V:\\FactoryGuard\\diagnostics"
+  ],
+  "tests": {
+    "writeFlushPowerCycle": true,
+    "atomicRenameRecovery": true,
+    "aclProbe": true,
+    "capacityWatermarkProbe": true,
+    "bitLockerKeyEscrowVerified": true
+  },
+  "approval": {
+    "preparedBy": "implementation-engineer",
+    "approvedBy": "customer-site-owner",
+    "evidencePackageId": "FG-EVIDENCE-001"
+  }
+}
+```
+
+### 74.11 发布门禁
+
+- 安装器不得提供“一键自动格式化所有空盘”功能；
+- 没有磁盘序列号、UniqueId、客户审批和现场照片，不得执行初始化；
+- 活跃数据库和媒体目录不得位于 USB、SD、网络共享或系统盘；
+- GPT、NTFS、4096 字节簇、1 MiB 对齐和固定盘符必须通过脚本验收；
+- 盘符变化、磁盘离线、BitLocker 锁定和容量越界必须有事件 ID、通知和恢复手册；
+- 断电写入测试、原子重命名恢复和容量水位演练是 v1.0 发布红线。
+
+---
+
+## 75. Windows 服务依赖、启动顺序与就绪确认
+
+### 75.1 SCM 能保证什么，不能保证什么
+
+Windows Service Control Manager 可以根据服务配置、服务依赖和加载顺序组安排服务进程启动。Microsoft 对 \`CreateService\` 的 \`lpDependencies\` 参数定义为：系统必须在当前服务之前启动的服务或加载顺序组；依赖一个组只表示该组至少一个成员在尝试启动后处于运行状态。
+
+但 SCM 的“服务已启动”不等于业务链路已经就绪。例如：
+
+- Windows 网络栈已启动，不代表交换机生成树已经收敛、摄像机已经可达；
+- DNS Client 已运行，不代表域名缓存已经正确或内部 DNS 可访问；
+- GPU 内核驱动已加载，不代表 DirectML 提供程序已经成功初始化；
+- 卷已经出现盘符，不代表 BitLocker 已解锁、ACL 正确或容量足够；
+- 服务进程已经创建，不代表 SQLite WAL 已恢复、IPC 安全描述符已就绪。
+
+因此，FactoryGuard 必须同时管理两层顺序：第一层是 SCM 的进程和系统服务启动顺序；第二层是 FactoryGuard 内部的资源就绪顺序。不能把 SCM 依赖当成摄像机、模型、数据库或 NVR 的健康监控。
+
+### 75.2 默认依赖最小化原则
+
+v1.0 的默认核心服务采用：
+
+- 启动类型：\`SERVICE_AUTO_START\`，即普通自动启动；
+- 进程类型：\`SERVICE_WIN32_OWN_PROCESS\`；
+- 运行账户：虚拟服务账户 \`NT SERVICE\FactoryGuard\`；
+- 默认加载顺序组：无；
+- 默认硬依赖：无广泛依赖；
+- 默认延迟启动：不使用。
+
+不把一堆系统服务加入依赖，是为了避免某个非关键依赖暂时不可用时 SCM 阻止 FactoryGuard 启动，进而使故障完全不可见。尤其不应依赖 Qt UI、第三方安全软件、数据库服务、远程支持工具或摄像机厂商私有服务。
+
+| 对象 | 是否作为硬依赖 | 原因 |
+| --- | --- | --- |
+| Qt UI | 否 | UI 是可选控制台，关闭或不启动不能影响检测 |
+| SQLite 外部服务 | 否 | SQLite 是进程内数据库，没有独立 Windows 服务 |
+| ONNX Runtime | 否 | 作为本地库加载，失败通过运行时健康和 CPU 降级处理 |
+| GPU 驱动 | 否 | 不适合作为 SCM 服务依赖；应在初始化时探测并重试 |
+| 摄像机/NVR | 否 | 不是本机 SCM 管理对象；单路设备故障不能阻断全部服务 |
+| Windows Event Log | 默认否 | 系统早期启动，且日志失败应由本地缓冲和降级路径处理 |
+| DNS Client | 可选 | 只有现场使用主机名、目录服务或网络 URI 时才考虑 |
+| Workstation 服务 | 可选 | 仅 SMB/UNC 备份或文件投递需要；RTSP IP 直连不需要 |
+| TCP/IP Protocol Driver | 默认否 | \`Tcpip\` 是 boot start 驱动，普通自动服务启动前已加载，硬依赖通常没有必要 |
+
+依赖关系应服务于“没有它进程不应该启动”的场景，而不是为了让配置表看起来完整。
+
+### 75.3 内部启动阶段
+
+FactoryGuard 的 \`ServiceMain\` 应按以下阶段推进，并及时向 SCM 报告 \`SERVICE_START_PENDING\`、checkpoint 和 wait hint：
+
+1. 注册控制处理器，接收停止、关机、预关机和参数变化控制；
+2. 加载只读内置默认配置，随后读取现场配置；
+3. 校验安装路径、配置签名、配置版本和 Schema；
+4. 核验数据盘 UniqueId、卷、盘符、ACL 和容量水位；
+5. 创建或恢复 SQLite 数据库，执行 WAL 恢复和迁移；
+6. 初始化审计日志、Windows 事件日志连接器和本地 Outbox；
+7. 创建命名管道并设置最小权限安全描述符；
+8. 初始化 Engine、Job Object、进程托管和看门狗；
+9. 加载规则、布防计划、摄像机目录和模型注册表；
+10. 探测网络接口、网关、NTP、NVR 和摄像机；
+11. 加载 ONNX Runtime，尝试 GPU，失败时按策略切到 CPU；
+12. 启动每路摄像机的独立接入状态机；
+13. 报告 \`SERVICE_RUNNING\`，同时发布各子系统健康状态。
+
+启动阶段必须周期性更新 checkpoint。任何一个阶段可能超过 SCM 的默认等待窗口时，都不能让主线程无提示阻塞；应每 5～10 秒报告一次仍在启动，并说明当前阶段。
+
+### 75.4 “运行中”的业务定义
+
+只有在下面条件满足后，才能对外部显示为完整 Running：
+
+| 子系统 | 就绪标准 | 不满足时的处理 |
+| --- | --- | --- |
+| 配置 | Schema 合法，版本兼容，签名或完整性校验通过 | 使用上一版已确认配置或阻断启动，按严重程度处理 |
+| 数据盘 | UniqueId 匹配，卷可写，ACL 正确，容量未到红线 | 进入数据盘故障安全模式 |
+| 数据库 | 完整性检查通过，迁移版本正确，WAL 已恢复 | 禁止半初始化，按恢复流程处理 |
+| IPC | 管道可创建，ACL 正确，协议版本可协商 | UI 进入只读/不可连接模式，核心服务继续尝试 |
+| 规则 | 布防计划、区域、绊线和通知策略加载成功 | 相关通道停用，其他通道继续 |
+| 网络 | 至少一个网络接口工作，基础路由可用 | 网络故障状态，设备状态机持续重试 |
+| 时间 | 时间源和偏差在阈值内 | 告警带双时间戳，通知运维校时 |
+| 推理 | GPU 或 CPU 至少一个后端可用 | GPU 失败降级 CPU；均失败则停止智能检测并告警 |
+| 摄像机 | 每路独立报告可达、码流可解析或明确失败 | 单路故障不阻断其他通道 |
+| 通知 | Webhook 或备用通道可发送，Outbox 可写 | 先存 Outbox，恢复后补偿 |
+
+单路摄像机不可达、某一个 Webhook 超时或 GPU 不可用，不应导致整个 Windows 服务停留在 Start Pending。服务可以进入 Running，但健康面板必须明确列出降级项。
+
+### 75.5 依赖配置脚本示例
+
+安装器权威实现应调用 \`CreateService\` 或 \`ChangeServiceConfig\`。命令行脚本只用于复核或现场诊断。
+
+```powershell
+[CmdletBinding()]
+param(
+  [string]$ServiceName = 'FactoryGuard',
+
+  [ValidateNotNull()]
+  [string[]]$Dependencies = @()
+)
+
+$ErrorActionPreference = 'Stop'
+$service = Get-Service -Name $ServiceName -ErrorAction Stop
+
+$configArgs = @(
+  $ServiceName,
+  'start=', 'auto'
+)
+
+if ($Dependencies.Count -gt 0) {
+  $configArgs += 'depend='
+  $configArgs += ($Dependencies -join '/')
+}
+
+& sc.exe @configArgs
+if ($LASTEXITCODE -ne 0) {
+  throw 'FactoryGuard 服务启动类型或依赖配置失败'
+}
+
+& sc.exe qc $ServiceName
+if ($LASTEXITCODE -ne 0) {
+  throw '无法读取服务配置'
+}
+```
+
+只有在确认现场确实需要时才应传入依赖，例如：
+
+```powershell
+# 仅示例：现场配置明确使用 DNS 名称，且冷启动竞态可复现时。
+& .\Set-FactoryGuardServiceDependencies.ps1 -Dependencies Dnscache
+```
+
+依赖名称必须使用服务键名，而不是显示名称。多个依赖以正斜杠分隔。若要清除依赖，应在安装器中实现单独的显式操作并保存变更记录，不应在普通诊断脚本中隐式清空。
+
+### 75.6 自动启动与延迟启动选择
+
+| 启动方式 | 适用对象 | FactoryGuard 结论 |
+| --- | --- | --- |
+| Automatic | 开机后必须尽快恢复的核心服务 | FactoryGuard 核心检测服务使用 |
+| Delayed Automatic | 希望避开开机风暴、非关键辅助服务 | 不用于核心检测；可用于 UI 提示器或非关键助手 |
+| Manual | 按需启动工具 | 诊断、导出、维护工具使用 |
+| Disabled | 不应运行的组件 | 停用的远程支持或旧组件使用 |
+
+延迟启动不能保证在某个网络服务、交换机链路或 GPU 初始化完成之后执行，也不能替代内部就绪检查。对安防系统而言，开机后数分钟不能检测是实质性风险。若现场存在开机风暴，应优先优化启动阶段、分批复连摄像机、限制启动时全量扫描，而不是简单把核心服务改为 delayed-auto。
+
+### 75.7 冷启动证据采集脚本
+
+```powershell
+[CmdletBinding()]
+param(
+  [string]$ServiceName = 'FactoryGuard',
+
+  [ValidatePattern('^[A-Z]$')]
+  [string]$DataDrive = 'V'
+)
+
+& sc.exe qc $ServiceName
+
+$win32Service = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" |
+  Select-Object Name, State, StartMode, StartName, PathName, ServiceType
+
+$operatingSystem = Get-CimInstance Win32_OperatingSystem
+$bootSummary = [pscustomobject]@{
+  LastBootTime = $operatingSystem.LastBootUpTime
+  CurrentTime = Get-Date
+  Uptime = (Get-Date) - $operatingSystem.LastBootUpTime
+}
+
+$networkAdapters = Get-NetAdapter |
+  Select-Object Name, Status, LinkSpeed, MacAddress, InterfaceDescription
+
+$dataVolume = Get-Volume -DriveLetter $DataDrive |
+  Select-Object DriveLetter, FileSystem, HealthStatus, SizeRemaining, Size
+
+$dataPartition = Get-Partition -DriveLetter $DataDrive |
+  Select-Object DiskNumber, PartitionNumber, Offset, Size
+
+$timeStatus = & w32tm /query /status
+
+$recentServiceEvents = Get-WinEvent -FilterHashtable @{
+  LogName = 'System'
+  ProviderName = 'Service Control Manager'
+  StartTime = $operatingSystem.LastBootUpTime
+} -ErrorAction SilentlyContinue |
+  Select-Object -First 30 TimeCreated, Id, LevelDisplayName, Message
+
+[pscustomobject]@{
+  Service = $win32Service
+  Boot = $bootSummary
+  NetworkAdapters = $networkAdapters
+  DataVolume = $dataVolume
+  DataPartition = $dataPartition
+  TimeService = $timeStatus
+  RecentServiceEvents = $recentServiceEvents
+}
+```
+
+冷启动证据应能回答：服务是否自动启动、启动类型是否被改变、依赖是什么、开机后多久进入 Running、数据盘是否准时出现、网络是否就绪、时钟是否可信、是否出现 SCM 超时或崩溃恢复。
+
+### 75.8 冷启动竞态与重试策略
+
+| 竞态 | 典型表现 | FactoryGuard 策略 |
+| --- | --- | --- |
+| 交换机端口收敛慢 | 开机后 20～60 秒才连通 | 摄像机状态机独立重试，采用指数退避和抖动 |
+| Wi-Fi 或 VPN 慢 | 默认路由延迟出现 | v1.0 不建议 Wi-Fi；等待网络位置变化并记录 |
+| BitLocker 解锁慢 | 盘符存在但不可访问 | 启动阶段等待卷可写，超时后进入最小故障模式 |
+| GPU 初始化慢 | DirectML 首次创建设备失败 | 有限重试，仍失败则 CPU 降级并通知 |
+| Defender 启动扫描 | 读取模型和媒体文件变慢 | 精确签名信任，不使用宽泛排除；测量启动耗时 |
+| NTP 尚未同步 | 时间偏差暂时过大 | 使用双时间戳，持续校时，严重偏差时通知 |
+| DNS 缓存未就绪 | 摄像机主机名暂时无法解析 | 重试 DNS；生产摄像机配置优先固定 IP |
+| IPC 客户端太早连接 | UI 启动时管道尚未监听 | UI 执行有限重连并显示服务启动阶段 |
+| Outbox 积压 | 开机后集中补发通知 | 按限流、优先级和接收方状态补偿 |
+
+所有重试都必须有次数、间隔、超时、日志和最终状态，避免无限 busy loop。核心链路的重试间隔应短于非核心链路，非关键导出、诊断和更新检查应延后。
+
+### 75.9 启动测试矩阵
+
+| 测试 | 操作 | 通过标准 |
+| --- | --- | --- |
+| 正常冷启动 | 关机后重新上电，不登录用户 | 无人登录情况下服务自动启动并恢复检测 |
+| 系统重启 | 从 Windows 发起重启 | SCM 受控停止，重启后状态完整恢复 |
+| 强制断电 | 运行中断电并重新上电 | WAL、Outbox、媒体状态和进程恢复通过 |
+| 服务进程崩溃 | 终止 supervisor/engine 进程 | Job Object、看门狗或 SCM 按策略恢复 |
+| UI 不启动 | 禁止 UI 程序运行 | 检测、录像协同、事件和通知不受影响 |
+| 网络延迟 | 开机后 60 秒再连接交换机 | 摄像机逐个恢复，不阻塞其他子系统 |
+| 数据盘延迟 | 先启动系统再挂载/解锁数据盘 | 服务进入明确故障/等待状态，不写系统盘 |
+| GPU 不可用 | 禁用 GPU 或使用无 GPU 主机 | CPU 降级策略生效并产生容量提示 |
+| 配置损坏 | 启动前破坏非关键配置 | 使用已确认版本或明确阻断，不加载半解析配置 |
+| 时钟偏差 | 开机时制造时间偏差 | 偏差可见、可通知，事件时间链路保留异常标记 |
+| 依赖缺失 | 可选依赖服务禁用 | 若非硬依赖，核心服务仍能启动并报告降级 |
+| SCM 恢复 | 连续触发服务失败 | 恢复动作、退避和事件计数符合配置 |
+
+### 75.10 发布门禁
+
+- 核心检测服务必须为自动启动，不能依赖用户登录；
+- 不允许把 Qt UI 或远程支持工具配置为核心服务的前置条件；
+- SCM 依赖必须逐项说明必要性，默认采用最小依赖；
+- 长时间启动必须持续报告 checkpoint 和 wait hint；
+- Running 状态必须由内部就绪证据支持，而不是仅以进程存在作为依据；
+- 冷启动、断电恢复、网络延迟、数据盘延迟和 GPU 不可用必须纳入发布前演练。
+
+---
+
+## 76. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 74.1 平台与可靠性资料
+### 76.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -8429,9 +9050,18 @@ IPC 契约越清晰，Windows 现场升级和故障诊断越不容易依赖“�
 | Microsoft Learn：Get-FileHash | 文件 SHA256、证据导出和完整性校验参考 |
 | NIST SP 800-86 Guide to Integrating Forensic Techniques | 电子证据保全、采集、检查和事件响应参考 |
 | ISO/IEC 27037 Guidelines for identification/collection/acquisition | 电子证据识别、收集、保存和流转参考 |
+| Microsoft Learn：NTFS overview | NTFS 能力、恢复和文件系统行为参考 |
+| Microsoft Learn：ReFS overview | ReFS 能力、适用版本和弹性特性边界 |
+| Microsoft Learn：format | 文件系统格式化、簇大小和格式化参数参考 |
+| Microsoft Learn：fsutil / fsutil behavior | 文件系统信息、行为查询和卷诊断参考 |
+| Microsoft Storage：Initialize-Disk / New-Partition / Format-Volume | 磁盘初始化、分区、盘符和格式化自动化依据 |
+| Microsoft Storage：Get-Disk / Get-Partition / Get-Volume | 磁盘身份、分区偏移、卷健康和簇大小验收依据 |
+| Microsoft Learn：Automatically Starting Services | 自动服务、加载组、依赖和启动顺序参考 |
+| Microsoft Learn：CreateService / ChangeServiceConfig | 服务创建、依赖、启动类型和配置变更依据 |
+| Microsoft Learn：sc qc（旧版但仍可访问） | 查询服务启动类型、依赖、路径和账户配置 |
 | ISA/IEC 62443 series | 工业控制系统安全分区、供应商和运维安全参考 |
 
-### 58.2 视频与设备协议资料
+### 76.2 视频与设备协议资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -8441,7 +9071,7 @@ IPC 契约越清晰，Windows 现场升级和故障诊断越不容易依赖“�
 | GB/T 28181 相关公共安全视频监控联网标准 | 二期平台级联和协议扩展预研 |
 | GA/T 1400 相关公共安全视频图像信息系统标准 | 二期视图库、事件对象和平台对接预研 |
 
-### 58.3 主要链接
+### 76.3 主要链接
 
 - https://learn.microsoft.com/en-us/windows/win32/services/service-programs
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w
@@ -8546,6 +9176,22 @@ IPC 契约越清晰，Windows 现场升级和故障诊断越不容易依赖“�
 - https://www.iso.org/standard/50038.html
 - https://www.atlassian.com/itsm/change-management
 - https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/sc-config
+- https://learn.microsoft.com/en-us/windows-server/storage/file-server/ntfs-overview
+- https://learn.microsoft.com/en-us/windows-server/storage/refs/refs-overview
+- https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/format
+- https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/fsutil
+- https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/fsutil-behavior
+- https://learn.microsoft.com/en-us/powershell/module/storage/initialize-disk
+- https://learn.microsoft.com/en-us/powershell/module/storage/new-partition
+- https://learn.microsoft.com/en-us/powershell/module/storage/format-volume
+- https://learn.microsoft.com/en-us/powershell/module/storage/get-disk
+- https://learn.microsoft.com/en-us/powershell/module/storage/get-partition
+- https://learn.microsoft.com/en-us/powershell/module/storage/get-volume
+- https://learn.microsoft.com/en-us/powershell/module/storage/add-partitionaccesspath
+- https://learn.microsoft.com/en-us/windows/win32/services/automatically-starting-services
+- https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-createservicea
+- https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfigw
+- https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2012-r2-and-2012/cc742055(v=ws.11)
 - https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls
 - https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipes
 - https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createnamedpipea
