@@ -1,13 +1,14 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v2.2
+> 文档版本：v2.3
 > 成文日期：2026-10-07
-> 文档状态：立项稿（服务状态机、通知升级、备份密钥与发布追踪增强版）
+> 文档状态：立项稿（勒索防护、崩溃分析、补丁治理与安全事件响应增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
 > v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
 > v2.1 增补：时间同步和电子证据链、配置漂移与文件完整性、72 小时/30 天长稳压力协议、冷备主机和备件切换机制。
 > v2.2 增补：Windows 服务状态机、通知模板与值班升级、备份加密和密钥托管、需求—测试—证据追踪矩阵及发布授权包。
+> v2.3 增补：勒索软件防护和攻击面减少、崩溃转储符号化、补丁生命周期、安全事件响应、根因分析和客户公告。
 
 ---
 
@@ -6173,11 +6174,741 @@ critical 可靠性门禁不得作为例外跳过，例如无人登录不能自�
 
 ---
 
-## 62. 行业资料与标准依据
+## 62. 勒索软件防护、攻击面减少与备份恢复验证
+
+FactoryGuard 的运行主机长期连接厂区内网，一旦被勒索软件、木马或未经批准的脚本破坏，风险不只是文件被加密，还可能导致告警中断、证据丢失和值班人员误判系统仍在保护现场。必须把预防、检测、隔离、备份和恢复作为同一套机制设计。
+
+### 62.1 防护目标和失败定义
+
+| 目标 | 通过证据 |
+| --- | --- |
+| 普通非授权程序不能篡改数据库、配置和备份 | 受控文件夹访问事件、允许应用清单、攻击演练 |
+| 可疑脚本、下载文件和恶意行为被阻断或审计 | ASR 策略、事件日志、测试样本结果 |
+| 安全设置不能被普通用户随意关闭 | 防篡改、管理员权限、基线漂移报告 |
+| 即使主机文件被加密，仍有离线或不可变副本 | 介质封存记录、快照策略、隔离恢复演练 |
+| 恢复后能确认系统版本、配置和证据完整性 | 恢复报告、哈希、签名、数据库校验 |
+
+以下说法都不能作为完成：只安装了杀毒软件；备份和生产数据在同一台机器；从未做过恢复；所有用户都是本地管理员；Defender 策略显示启用但事件日志无解释能力。
+
+### 62.2 分层控制
+
+| 层级 | 控制项 | 说明 |
+| --- | --- | --- |
+| 身份和权限 | 最小权限、专用服务账户、操作员不加入管理员组 | 降低恶意程序获得高权限后的破坏范围 |
+| 应用防护 | Windows Defender、云交付保护、自动样本提交策略 | 按客户隐私要求配置，不默认上传含客户画面的大文件 |
+| 勒索防护 | 受控文件夹访问 | 保护数据库、配置、证据和备份目录 |
+| 攻击面减少 | ASR 规则、网络保护 | 先审计后强制，避免误伤合法安装器或运维脚本 |
+| 设置保护 | 防篡改和管理权限 | 防止本地用户或脚本修改关键安全配置 |
+| 网络控制 | 出站白名单、禁用无关共享、限制横向移动 | 与防火墙和 SMB 权限配合 |
+| 数据恢复 | 离线介质、不可变快照、冷备主机 | 防止所有可写副本同时被加密 |
+| 响应机制 | 事件分级、隔离、密钥轮换和复盘 | 技术防护失败后仍可恢复业务 |
+
+### 62.3 保护目录和允许应用
+
+应保护以下目录：
+
+- C:\ProgramData\FactoryGuard\db；
+- C:\ProgramData\FactoryGuard\config；
+- C:\ProgramData\FactoryGuard\evidence；
+- C:\ProgramData\FactoryGuard\exports；
+- 经客户批准的备份目录；
+- 不在 C:\Program Files\FactoryGuard 下但由服务写入的自定义数据目录。
+
+不能简单把整个 ProgramData、D:\ 或备份盘全部保护后忽略兼容性；必须确认安装器、诊断工具、备份任务和升级流程都能合法写入。
+
+```powershell
+$protectedFolders = @(
+  'C:\ProgramData\FactoryGuard\db',
+  'C:\ProgramData\FactoryGuard\config',
+  'C:\ProgramData\FactoryGuard\evidence',
+  'C:\ProgramData\FactoryGuard\exports'
+)
+
+$allowedApplications = @(
+  'C:\Program Files\FactoryGuard\bin\FactoryGuardEngine.exe',
+  'C:\Program Files\FactoryGuard\bin\FactoryGuardCtl.exe',
+  'C:\Program Files\FactoryGuard\bin\FactoryGuardDiagnostics.exe',
+  'C:\Windows\System32\backgroundTaskHost.exe'
+)
+
+Set-MpPreference -EnableControlledFolderAccess Enabled
+foreach ($folder in $protectedFolders) {
+  Add-MpPreference -ControlledFolderAccessProtectedFolders $folder
+}
+foreach ($application in $allowedApplications) {
+  Add-MpPreference -ControlledFolderAccessAllowedApplications $application
+}
+
+Get-MpPreference |
+  Select-Object EnableControlledFolderAccess,
+    ControlledFolderAccessProtectedFolders,
+    ControlledFolderAccessAllowedApplications |
+  Format-List
+```
+
+实施要求：
+
+- 允许列表使用完整路径，不允许写入临时目录下的脚本或可执行文件；
+- 路径变化必须随安装器版本同步更新并重新验证；
+- 第三方备份程序应使用厂商签名路径，不把整个脚本解释器加入允许列表；
+- 若启用后阻断合法任务，应先查看事件，再按变更流程添加最小允许项。
+
+### 62.4 ASR 规则启用方法
+
+ASR规则在不同客户环境可能影响运维脚本、安装器或压缩工具，因此必须按“审计—复核—强制—复测”推进。规则 ID、规则名称和事件 ID 以 Microsoft 当前文档为准。
+
+```powershell
+param(
+  [Parameter(Mandatory = $true)]
+  [string]$RulesCsv
+)
+
+$ErrorActionPreference = 'Stop'
+$rules = Import-Csv -Path $RulesCsv
+foreach ($rule in $rules) {
+  if ($rule.Action -notin @('Audit','Block','Warn','Disabled')) {
+    throw "Unsupported action for rule $($rule.RuleId): $($rule.Action)"
+  }
+
+  $actionValue = switch ($rule.Action) {
+    'Audit' { 2 }
+    'Block' { 1 }
+    'Warn' { 6 }
+    'Disabled' { 0 }
+  }
+
+  Add-MpPreference -AttackSurfaceReductionRules_Ids $rule.RuleId
+  Add-MpPreference -AttackSurfaceReductionRules_Actions $actionValue
+}
+
+Get-MpPreference |
+  Select-Object AttackSurfaceReductionRules_Ids,
+    AttackSurfaceReductionRules_Actions |
+  Format-List
+```
+
+建议首批选择与恶意脚本、凭据窃取、可疑下载和横向移动相关的规则；对可能影响签名安装器、备份程序和客户工业软件的规则，先在样板机审计至少一周。
+
+ASR CSV 必须包含审批人、启用原因、影响评估和回退方式，不允许现场工程师凭经验一次性强制全部规则。
+
+### 62.5 网络保护和通信边界
+
+```powershell
+Set-MpPreference -EnableNetworkProtection Enabled
+Set-MpPreference -AllowSwitchToAsyncInspection $false
+Get-MpPreference | Select-Object EnableNetworkProtection | Format-List
+```
+
+网络保护应与防火墙出站控制协同：
+
+- NVR 访问只需要厂区内网 RTSP 端口和必要管理端口；
+- 通知、时间同步、证书吊销检查和远程支持应使用明确的域名或地址；
+- 不建议值守电脑启用访客 Wi‑Fi、个人网盘、P2P 下载或未授权远程工具；
+- 若工业网络要求完全离线，FactoryGuard 必须能在无公网连接条件下完成核心检测和本地告警。
+
+### 62.6 防篡改和管理责任
+
+防篡改用于防止安全设置被非授权更改。若站点通过企业管理平台或 Microsoft Defender 管理，应在该平台设置；不要编写绕过防篡改的脚本。
+
+验收要求：
+
+- 普通操作员不能停止实时保护、修改云保护级别或删除关键排除项；
+- 管理员执行安全策略变更也要有变更单；
+- 防篡改状态进入每日健康报告；
+- 若客户域策略与本地 Defender 配置冲突，应明确最终生效来源。
+
+### 62.7 勒索软件恢复演练
+
+恢复演练应至少包含：
+
+1. 使用隔离环境模拟关键文件被非授权程序修改；
+2. 确认受控文件夹访问或 ASR 事件能被日志记录；
+3. 不覆盖原始证据，导出事件和进程信息；
+4. 从离线或不可变副本恢复数据库、配置和安装版本；
+5. 校验数据库 integrity_check、外键、配置哈希和程序签名；
+6. 恢复 NVR 连接并执行一次合成事件；
+7. 记录从宣告到检测恢复的时间；
+8. 轮换演练中暴露或开封的密钥；
+9. 生成客户可读的恢复结论。
+
+### 62.8 恢复判定
+
+| 等级 | 判定 |
+| --- | --- |
+| pass | 所有关键数据从离线/不可变副本恢复，数据库与配置校验通过，服务自动运行 |
+| conditional pass | 非关键历史媒体缺失，但事件、规则、通知和当前检测恢复，客户书面接受 |
+| fail | 无法找到可信副本、备份被同时加密、数据库校验失败或恢复后无法连接 NVR |
+
+备份恢复演练必须按站点真实版本执行，不能只用开发环境的空数据库证明恢复能力。
+
+---
+
+## 63. 崩溃转储分级、符号化分析与缺陷自动关联
+
+可靠系统允许故障发生，但必须保证故障可见、可定位、可恢复。若每次崩溃只看到“程序已停止工作”，没有 dump、版本、调用栈和关联日志，缺陷会反复出现。FactoryGuard 应建立转储采集、安全保存、符号分析、缺陷关联和回归验证闭环。
+
+### 63.1 转储类型和使用场景
+
+| 类型 | 内容 | 适用场景 | 风险/成本 |
+| --- | --- | --- | --- |
+| Mini dump | 线程、模块、异常上下文等基本信息 | 常规空指针、参数错误、调用栈定位 | 体积小，但可能缺少堆数据 |
+| Heap dump | 包含进程堆和更多内存信息 | 复杂状态、对象内容和数据结构问题 | 体积较大，可能含敏感数据 |
+| Full dump | 完整进程地址空间 | 严重难复现缺陷、供应商级深度分析 | 体积最大，隐私和存储要求最高 |
+| No dump | 不生成 | 极高安全或特殊受限环境 | 故障定位能力显著降低，不推荐 |
+
+首版建议生产默认使用 Mini 或带必要堆信息的转储；高等级站点或试点期可临时启用 Heap/Full，问题关闭后恢复默认。
+
+### 63.2 WER 本地转储基线
+
+需要为不同进程角色分别配置：
+
+- FactoryGuardEngine；
+- FactoryGuardInference；
+- FactoryGuardMedia 或独立 FFmpeg 进程；
+- FactoryGuardCtl；
+- Qt UI 进程。
+
+转储目录应位于受控数据盘或 ProgramData 子目录，并设置保留数量。不能无限堆积导致磁盘被占满。
+
+```powershell
+$processNames = @(
+  'FactoryGuardEngine.exe',
+  'FactoryGuardInference.exe',
+  'FactoryGuardMedia.exe',
+  'FactoryGuardUI.exe'
+)
+
+$dumpFolder = 'C:\ProgramData\FactoryGuard\dumps'
+New-Item -ItemType Directory -Path $dumpFolder -Force | Out-Null
+
+foreach ($processName in $processNames) {
+  $keyPath = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$processName"
+  New-Item -Path $keyPath -Force | Out-Null
+  New-ItemProperty -Path $keyPath -Name DumpFolder -PropertyType ExpandString -Value $dumpFolder -Force | Out-Null
+  New-ItemProperty -Path $keyPath -Name DumpType -PropertyType DWord -Value 2 -Force | Out-Null
+  New-ItemProperty -Path $keyPath -Name DumpCount -PropertyType DWord -Value 10 -Force | Out-Null
+}
+
+icacls $dumpFolder /inheritance:r
+icacls $dumpFolder /grant 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' 'NT SERVICE\FactoryGuardEngine:(OI)(CI)W'
+```
+
+DumpType 的具体含义以 Microsoft WER 文档为准；启用 Full dump 前必须确认磁盘和隐私策略。
+
+### 63.3 转储文件命名和生命周期
+
+每个转储应能关联到：
+
+- 进程角色和机器名；
+- 产品版本、提交号和安装包版本；
+- 异常码和故障模块；
+- Windows 事件日志记录；
+- 当时的通道、任务和规则（如果可得）；
+- 是否上传、由谁分析、关联缺陷编号。
+
+生命周期建议：
+
+| 阶段 | 操作 |
+| --- | --- |
+| 新生成 | 服务写入转储目录并生成 Windows 事件 |
+| 自动初筛 | 诊断工具提取异常码、模块和基本调用栈 |
+| 分析中 | 复制到加密分析目录，原文件保留 |
+| 缺陷关联 | 关联缺陷、根因、影响版本和修复版本 |
+| 回归验证 | 修复版本复现操作并确认不再崩溃 |
+| 清理 | 超过保留期或客户授权后删除并写审计 |
+
+普通操作员不能删除 dump；对外发送前必须检查是否包含配置、凭据、人员画面或客户路径。
+
+### 63.4 PDB、源代码和符号服务器
+
+每个发布制品必须保存与之匹配的 PDB 和元数据：
+
+| 元数据 | 要求 |
+| --- | --- |
+| product/version | 与安装包和文件属性一致 |
+| commit | 可追溯到源代码提交 |
+| build profile | Release/RelWithDebInfo |
+| PDB GUID/Age | 能被 WinDbg 自动匹配 |
+| third-party symbols | ONNX Runtime、Qt、FFmpeg 等记录来源版本 |
+| symbol retention | 至少覆盖一个支持窗口或客户合同期 |
+
+不要把 PDB 随机发给客户或与安装包混放；应由内部符号服务器或受控制品库保存。
+
+### 63.5 WinDbg 分析流程
+
+```powershell
+$symbolCache = 'C:\Symbols'
+$internalSymbolServer = 'https://symbols.example.local/download/symbols'
+$dumpFile = 'C:\ProgramData\FactoryGuard\dumps\FactoryGuardEngine.exe.1234.dmp'
+
+New-Item -ItemType Directory -Path $symbolCache -Force | Out-Null
+$env:_NT_SYMBOL_PATH = "srv*$symbolCache*$internalSymbolServer*https://msdl.microsoft.com/download/symbols"
+
+Start-Process -FilePath windbg.exe -ArgumentList @(
+  '-z', $dumpFile
+) -WindowStyle Normal
+```
+
+WinDbg 中建议执行：
+
+```text
+.symfix+ C:\Symbols
+.reload /f
+!analyze -v
+lmv
+.ecxr
+kP
+~* kP
+!handle 0 f
+```
+
+分析记录至少包含：异常码、故障地址、故障模块、调用栈、是否空指针/堆损坏/驱动问题/第三方运行时问题、复现条件和初步责任人。
+
+### 63.6 自动诊断 JSON
+
+```json
+{
+  "dumpReportVersion": "1.0",
+  "dumpFile": "FactoryGuardEngine.exe.1234.dmp",
+  "process": {
+    "role": "engine",
+    "pid": 4820,
+    "productVersion": "1.0.0",
+    "commit": "example"
+  },
+  "exception": {
+    "code": "0xC0000005",
+    "type": "access-violation",
+    "faultingModule": "FactoryGuardEngine.exe",
+    "faultingOffset": "0x0000000000012345",
+    "accessType": "read",
+    "targetAddress": "0x0000000000000000"
+  },
+  "context": {
+    "activeChannels": 16,
+    "recentErrorCode": "MEDIA-FRAME-TIMEOUT",
+    "uptimeSeconds": 18240
+  },
+  "triage": {
+    "probableArea": "event-state",
+    "confidence": "medium",
+    "defectId": null,
+    "needsManualAnalysis": true
+  }
+}
+```
+
+自动诊断只能辅助分流，不能把“疑似模块”直接当根因。堆损坏、驱动崩溃、栈覆盖等场景需要人工确认。
+
+### 63.7 缺陷关联规则
+
+| 条件 | 处理 |
+| --- | --- |
+| 相同异常码、模块、偏移和版本 | 可建议合并到同一缺陷 |
+| 异常码相同但调用栈不同 | 不自动合并 |
+| 第三方模块故障 | 记录模块版本并向供应商资料核对 |
+| 仅发生一次且无 dump | 保留观察，不直接关闭 |
+| 修复后仍出现相同偏移 | 重新打开缺陷并检查修复有效性 |
+| 崩溃来自安全软件/驱动 | 采集版本、配置和兼容性证据 |
+
+缺陷单必须写明影响版本、发现站点、恢复方式、修复版本、回归测试和发布时间。
+
+### 63.8 崩溃演练和验收
+
+```powershell
+$serviceName = 'FactoryGuardEngine'
+$beforePid = (Get-CimInstance Win32_Service -Filter "Name='$serviceName'").ProcessId
+$process = Get-Process -Id $beforePid
+
+taskkill /PID $process.Id /F
+Start-Sleep -Seconds 2
+
+$dump = Get-ChildItem 'C:\ProgramData\FactoryGuard\dumps' -Filter '*.dmp' |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+
+if (-not $dump) { throw 'No crash dump was collected' }
+FactoryGuardCtl.exe diagnostics triage-dump --path $dump.FullName
+```
+
+验收标准：
+
+- 每次强制崩溃至少生成一个 dump 和一个 Windows 事件；
+- SCM/看门狗能恢复服务；
+- dump 与故障时间、进程版本一致；
+- 关键二进制和 PDB 可匹配；
+- 缺陷关联后有修复和回归证据；
+- dump 不会长期占满磁盘；
+- 外发 dump 已通过隐私审查。
+
+---
+
+## 64. 补丁生命周期、驱动基线和更新回归
+
+Windows 可靠性不是“永不更新”，长期不打补丁会积累安全风险；未经测试自动更新也可能破坏 GPU 驱动、媒体组件或工业软件。FactoryGuard 应建立补丁分级、测试环、安装窗口、备份回退和更新后证据链。
+
+### 64.1 补丁分类
+
+| 类型 | 示例 | 风险 |
+| --- | --- | --- |
+| Windows 累积更新 | 月度质量更新、安全修复 | 重启、组件行为变化、兼容性问题 |
+| Defender 更新 | 平台、引擎、安全智能 | 误报、性能或 ASR 行为变化 |
+| .NET/VC++ 运行时 | 运行库安全更新 | 程序启动或依赖加载变化 |
+| GPU 驱动 | NVIDIA/Intel/AMD 驱动 | DirectML、推理性能、超时恢复变化 |
+| 网卡/芯片组 | 厂商驱动 | RTSP 吞吐、连接稳定性变化 |
+| 固件/BIOS | BIOS、UEFI、电源管理 | 启动、虚拟化、硬件兼容变化 |
+| 第三方组件 | FFmpeg、Qt、ONNX Runtime | 由 FactoryGuard 版本发布，不单独现场替换 |
+
+核心原则：操作系统补丁由客户 IT 管控，FactoryGuard 产品组件由产品版本发布；现场不能手工替换单个 DLL 或 FFmpeg 可执行文件后继续声称是已验证版本。
+
+### 64.2 补丁环和节奏
+
+| 环 | 对象 | 观察时间 | 要求 |
+| --- | --- | --- | --- |
+| Canary | 内部测试机/样板站 | 3–7 天 | 覆盖安装、升级、DirectML、RTSP 和故障注入 |
+| Pilot | 低风险客户或单台值守机 | 7–14 天 | 观察真实班次、通知、日志和资源趋势 |
+| Production | 正式站点 | 按维护窗口分批 | 备份、回滚、客户通知和现场支持就绪 |
+| Emergency | 高危漏洞或正在被利用 | 缩短验证但不取消 | 至少完成核心冒烟和恢复预案 |
+
+不能所有站点同一天全部更新。建议保留未更新的参照站点，以便判断问题来自补丁还是产品版本。
+
+### 64.3 更新前状态采集
+
+```powershell
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$preUpdatePath = Join-Path $env:ProgramData "FactoryGuard\patch\$stamp-before"
+New-Item -ItemType Directory -Path $preUpdatePath -Force | Out-Null
+
+Get-HotFix |
+  Sort-Object InstalledOn |
+  Export-Csv -Path (Join-Path $preUpdatePath 'hotfix.csv') -NoTypeInformation -Encoding UTF8
+
+Get-ComputerInfo -Property OsName,OsVersion,OsBuildNumber,WindowsVersion,BiosManufacturer,BiosVersion |
+  ConvertTo-Json -Depth 4 |
+  Set-Content -Encoding UTF8 (Join-Path $preUpdatePath 'computer-info.json')
+
+pnputil /enum-drivers *> (Join-Path $preUpdatePath 'drivers.txt')
+FactoryGuardCtl.exe backup create --output $preUpdatePath
+FactoryGuardCtl.exe diagnostics collect --output $preUpdatePath
+```
+
+更新前必须确认：
+
+- 最近一次数据库备份可恢复；
+- 当前服务处于 RUNNING 或已知维护状态；
+- 回滚安装包、旧版本号和配置基线可用；
+- 磁盘空间、UPS 和维护窗口满足重启要求；
+- 客户已通知值班人员；
+- 高等级站点已确认远程支持可达。
+
+### 64.4 安装 MSU 和控制重启
+
+从 Microsoft Update Catalog 或客户批准的补丁源取得 MSU 后，应记录哈希和来源。示例命令：
+
+```powershell
+param(
+  [Parameter(Mandatory = $true)]
+  [string]$MsuPath
+)
+
+if (-not (Test-Path $MsuPath)) { throw "MSU not found: $MsuPath" }
+$hash = Get-FileHash -Path $MsuPath -Algorithm SHA256
+
+Start-Process -FilePath wusa.exe -ArgumentList @(
+  $MsuPath,
+  '/quiet',
+  '/norestart'
+) -Wait
+
+Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 10
+[pscustomobject]@{
+  UpdateFile = $MsuPath
+  Sha256 = $hash.Hash
+} | Format-List
+```
+
+补丁是否重启应按维护窗口执行，不能让值守电脑在无人确认时随机重启。需要重启时应先确认：
+
+- 当前无未处置 critical 事件或已由客户接受；
+- NVR 连续录像仍在运行；
+- 重启后服务可自动启动；
+- 值班人员知道短暂分析窗口；
+- 重启后有人员或远程计划检查。
+
+### 64.5 Active Hours 和截止时间
+
+```powershell
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' -Name ActiveHoursStart -Value 7
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' -Name ActiveHoursEnd -Value 20
+Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' |
+  Select-Object ActiveHoursStart, ActiveHoursEnd
+```
+
+对于企业环境，应优先通过 Windows Update for Business、组策略或客户管理平台配置质量更新延期、截止时间和宽限期；不要把注册表手工修改作为长期策略。
+
+### 64.6 驱动和固件基线
+
+驱动更新遵循更严格流程：
+
+1. 记录当前驱动版本、提供方、日期和设备 ID；
+2. 从整机或硬件厂商获取兼容版本；
+3. 在样板机验证 RTSP、DirectML、睡眠恢复、GPU 内存释放和断电重启；
+4. 保留旧版驱动安装包或系统恢复点；
+5. 执行 72 小时短周期至少一次关键长稳；
+6. 通过后再推广到生产。
+
+```powershell
+pnputil /enum-drivers
+Get-PnpDevice |
+  Where-Object { $_.Class -in @('Display','Net','System') } |
+  Select-Object Status, Class, FriendlyName, InstanceId
+```
+
+不建议在试点站点启用驱动自动更新。固件升级前必须确认电源稳定，避免升级中断导致主机无法启动。
+
+### 64.7 更新后回归矩阵
+
+| 类别 | 检查项 |
+| --- | --- |
+| 服务 | sc queryex 为 RUNNING，启动类型和失败恢复未漂移 |
+| 进程 | Engine/Inference/Media 数量正确，无孤儿和异常重启 |
+| 媒体 | 所有核心通道在线，RTSP 10 分钟拉流通过 |
+| 推理 | DirectML 初始化成功，推理耗时回到基线 |
+| 数据库 | integrity_check、foreign_key_check、user_version 正常 |
+| 通知 | 至少一条测试通知成功，Outbox 无积压 |
+| 安全 | Defender、ASR、网络保护、防篡改状态符合策略 |
+| 管道 | 命名管道 ACL 未变化，UI 能连接 |
+| 备份 | 更新后备份可创建，恢复演练未受影响 |
+| 日志 | Windows 事件日志无未解释错误 |
+
+### 64.8 补丁失败处理
+
+| 失败 | 处理 |
+| --- | --- |
+| 补丁安装失败 | 保留错误码，检查 CBS/Windows Update 日志，不反复强制重启 |
+| 更新后服务不自启 | 恢复失败动作和配置，必要时卸载补丁/回滚版本 |
+| DirectML 初始化失败 | 检查 GPU 驱动，回退已验证驱动或切换 CPU 临时策略需客户批准 |
+| RTSP 网络异常 | 核对网卡驱动、防火墙和 MTU，恢复旧驱动 |
+| 重启后蓝屏 | 收集系统转储，进入硬件/驱动事件流程 |
+| 安全软件误报 | 通过正式渠道提交样本并记录文件哈希，不长期关闭防护 |
+| 现场无法回滚 | Stop-Work，升级发布/实施负责人 |
+
+### 64.9 补丁报告
+
+```json
+{
+  "patchReportVersion": "1.0",
+  "siteId": "FG-SITE-0001",
+  "window": "2026-10-12T01:00:00+08:00/2026-10-12T03:00:00+08:00",
+  "before": {
+    "osBuild": "example",
+    "defenderPlatform": "example",
+    "gpuDriver": "example"
+  },
+  "installed": [
+    { "kb": "KB0000000", "name": "Security Update", "result": "installed" }
+  ],
+  "postChecks": {
+    "service": "pass",
+    "rtsp": "pass",
+    "directml": "pass",
+    "database": "pass",
+    "notification": "pass"
+  },
+  "restartRequired": true,
+  "restartCompleted": true,
+  "decision": "pass",
+  "rollbackReference": "previous-build-and-backup-id"
+}
+```
+
+没有更新后回归证据的补丁，不应在健康报告中标记为“已完成维护”。
+
+---
+
+## 65. 安全事件响应、证据保全、根因分析和客户公告
+
+FactoryGuard 需要同时处理两类事件：业务入侵告警和系统/安全事件。前者说明厂区可能发生入侵，后者说明平台自身被攻击、误配置、崩溃或失控。两类事件不能混在一起关闭。可靠的平台必须有标准响应流程，保证人员知道先做什么、什么不能做、证据如何保存、何时通知客户。
+
+### 65.1 事件类型和严重级别
+
+| 类型 | 示例 | 初始责任 |
+| --- | --- | --- |
+| 业务安全事件 | 围墙入侵、仓库闯入、危化品区域进入 | 客户值班人员按安防预案处置 |
+| 系统可靠性事件 | 服务崩溃、媒体断流、磁盘满、数据库损坏 | 实施/运维支持恢复检测 |
+| 网络安全事件 | 恶意软件、可疑连接、账号爆破、勒索软件迹象 | 客户 IT/安全负责人牵头 |
+| 数据安全事件 | 证据外泄、误发截图、权限错误配置 | 客户管理与实施方共同处置 |
+| 变更事故 | 升级失败、配置错误、规则未生效 | 变更负责人执行回滚 |
+
+系统内出现的业务高危事件不能被当作普通软件缺陷处理；平台高危安全事件也不能只在运维群里口头说明。
+
+### 65.2 分级矩阵
+
+| 等级 | 判定 | 通知要求 |
+| --- | --- | --- |
+| critical | 核心检测完全中断、疑似勒索、凭据泄露、业务高危入侵未通知 | 立即通知值班负责人和支持负责人 |
+| high | 多通道失效、数据库无法写入、关键通知失败、未授权访问 | 当日响应，持续跟踪到恢复 |
+| medium | 单通道异常、单条通知失败、可恢复文件缺失 | 维护窗口处理并记录 |
+| low | 不影响核心检测的 UI、文档或非关键日志问题 | 进入待办 |
+
+分级用于响应，不等于最终根因严重度；事件复盘后可以调整，但要保留调整原因。
+
+### 65.3 响应前的基本判断
+
+在决定重启、断网或卸载前，先确认：
+
+- 当前 SCM 状态和服务 PID；
+- 核心通道在线数量；
+- NVR 是否仍在连续录像；
+- 最近事件和 Outbox 是否还能写入；
+- 是否存在恶意软件、可疑账户、异常共享和异常网络连接；
+- 最近是否执行补丁、升级、远程支持或人工配置修改；
+- 是否仍有人员正在现场处置入侵。
+
+若客户正在处理真实入侵，首要目标是配合客户处警，不应为了采集系统证据关闭检测服务。
+
+### 65.4 证据采集命令
+
+```powershell
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$incidentRoot = Join-Path $env:ProgramData "FactoryGuard\incidents\$stamp"
+New-Item -ItemType Directory -Path $incidentRoot -Force | Out-Null
+
+Get-MpComputerStatus | ConvertTo-Json -Depth 5 |
+  Set-Content -Encoding UTF8 (Join-Path $incidentRoot 'defender-status.json')
+Get-MpThreatDetection | ConvertTo-Json -Depth 6 |
+  Set-Content -Encoding UTF8 (Join-Path $incidentRoot 'threat-detection.json')
+Get-NetTCPConnection -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 4 |
+  Set-Content -Encoding UTF8 (Join-Path $incidentRoot 'tcp-connections.json')
+Get-SmbConnection -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 4 |
+  Set-Content -Encoding UTF8 (Join-Path $incidentRoot 'smb-connections.json')
+
+wevtutil epl System (Join-Path $incidentRoot 'system.evtx') /ow:true
+wevtutil epl Application (Join-Path $incidentRoot 'application.evtx') /ow:true
+$defenderLog = Join-Path $incidentRoot 'defender.evtx'
+wevtutil epl 'Microsoft-Windows-Windows Defender/Operational' $defenderLog /ow:true
+
+FactoryGuardCtl.exe diagnostics collect --output $incidentRoot
+FactoryGuardCtl.exe database verify --output (Join-Path $incidentRoot 'database-verify.txt')
+```
+
+采集要求：
+
+- 不直接修改原始日志；
+- 复制证据后再分析；
+- 记录每条命令的执行人和时间；
+- 若输出包含手机号、人员图像或密钥，证据包必须脱敏或加密；
+- 证据哈希应进入 Manifest。
+
+### 65.5 遏制措施选择
+
+| 场景 | 推荐措施 | 不建议 |
+| --- | --- | --- |
+| 账号异常登录 | 禁用可疑账号、轮换密码、查看审计 | 直接删除账号导致审计丢失 |
+| 主机疑似感染 | 在客户批准下网络隔离，保留日志 | 未采集证据就重装系统 |
+| 通知凭据泄露 | 轮换 Webhook/短信/电话渠道密钥 | 只删除本地记录 |
+| NVR 密码暴露 | 建立专用新密码并更新受保护凭据 | 继续共用旧密码 |
+| 升级导致检测异常 | 一键回滚，恢复配置和数据库备份 | 在现场手工改 DLL |
+| 勒索迹象 | 隔离可写共享，启用离线副本恢复 | 登录更多主机扩大横向移动 |
+
+网络隔离不应影响 NVR 独立连续录像；操作前应说明哪些链路会断开、值班人员是否仍能查看 NVR。
+
+### 65.6 客户公告模板
+
+```yaml
+customer_notice:
+  incident_id: INC-20261007-001
+  severity: high
+  status: investigating
+  title: FactoryGuard 检测服务异常说明
+  summary: |
+    值守电脑上的 FactoryGuard 核心检测服务出现异常，实施支持已按应急流程介入。
+    NVR 连续录像状态已同步核查，检测恢复时间和影响范围将在确认后更新。
+  known_impact:
+    - partial_or_full_detection_interruption
+    - notification_delay_or_failure
+  actions_taken:
+    - collected_diagnostics
+    - verified_nvr_recording
+    - started_recovery_plan
+  next_update_at: 2026-10-07T11:00:00+08:00
+  contact: site-support-on-call
+```
+
+公告应避免未经确认就宣称“已定位、无影响、已彻底解决”。如果存在数据泄露或高危安全风险，应按客户制度和适用法律法规升级处理。
+
+### 65.7 根因分析流程
+
+1. 建立精确时间线：变更、故障、告警、恢复和人工操作；
+2. 保护原始证据：事件日志、dump、数据库、配置和安全软件记录；
+3. 区分触发因素和根本原因；
+4. 对比基线：服务、文件哈希、ACL、防火墙、Defender 和计划任务；
+5. 判断是代码缺陷、配置错误、外部攻击、硬件故障、第三方组件还是流程失效；
+6. 明确检测能力受影响的开始时间、恢复时间和影响通道；
+7. 制定纠正措施、预防措施和验证方式；
+8. 由独立负责人复核后关闭。
+
+可使用 5 Whys、鱼骨图或故障树，但必须输出责任人、截止日期和证据链接。
+
+### 65.8 Postmortem 报告 Schema
+
+```json
+{
+  "postmortemVersion": "1.0",
+  "incidentId": "INC-20261007-001",
+  "severity": "high",
+  "title": "Detection interruption after configuration change",
+  "impact": {
+    "channels": ["CH-01", "CH-02"],
+    "startedAt": "2026-10-07T02:10:00+08:00",
+    "detectedAt": "2026-10-07T02:12:00+08:00",
+    "recoveredAt": "2026-10-07T02:20:00+08:00"
+  },
+  "timeline": [
+    { "at": "2026-10-07T02:00:00+08:00", "event": "maintenance started" },
+    { "at": "2026-10-07T02:10:00+08:00", "event": "channels stopped" }
+  ],
+  "rootCause": {
+    "category": "change-management",
+    "description": "configuration change entered production without required validation",
+    "confidence": "high"
+  },
+  "contributingFactors": [
+    "rollback test not performed",
+    "baseline comparison was skipped"
+  ],
+  "correctiveActions": [
+    {
+      "id": "CA-001",
+      "owner": "implementation-lead",
+      "dueDate": "2026-10-14",
+      "description": "make pre-change validation mandatory",
+      "status": "open"
+    }
+  ],
+  "decision": "pending-verification"
+}
+```
+
+### 65.9 复盘验收
+
+- 关键事实均有证据，不依赖个人记忆；
+- 影响范围和恢复时间经过数据验证；
+- 纠正措施能防止同类问题再次发生；
+- 修复版本通过故障注入和回归测试；
+- 客户已收到与其职责匹配的说明；
+- 若暴露过凭据或密钥，已轮换；
+- 复盘报告与缺陷、变更和证据包关联。
+
+复盘不是追责大会，但也不能把流程失效描述为“偶发不可抗”。只有纠正措施被验证后，事件才允许最终关闭。
+
+---
+
+## 66. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 62.1 平台与可靠性资料
+### 66.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -6238,6 +6969,13 @@ critical 可靠性门禁不得作为例外跳过，例如无人登录不能自�
 | Microsoft Learn：Service Control Handler / RegisterServiceCtrlHandlerEx | 停止、关机、电源、会话和参数变化控制处理 |
 | Microsoft Learn：ServiceMain | SCM 启动入口、初始化和服务主线程职责 |
 | Microsoft Learn：BitLocker overview | 磁盘静态加密、恢复密钥和备份介质保护边界 |
+| Microsoft Defender：Controlled folder access | 受控文件夹访问、允许应用和勒索软件行为阻断参考 |
+| Microsoft Defender：Attack surface reduction rules | ASR 规则 ID、动作、事件和兼容性审计参考 |
+| Microsoft Defender：Tamper protection | 防止安全设置被非授权修改的管理和适用范围参考 |
+| Microsoft Defender：Network protection | 网络保护启用、事件和恶意连接阻断参考 |
+| Microsoft WinDbg / Public symbol server | 崩溃转储分析、符号路径和调用栈诊断依据 |
+| Windows Update documentation / Microsoft Update Catalog | 补丁来源、更新分类、MSU 和更新生命周期参考 |
+| Microsoft Learn：Waas-restart | 更新重启、通知、计划和重启控制参考 |
 | RFC 5905 Network Time Protocol Version 4 | NTP 时间同步、时间源、偏差和时钟治理参考 |
 | RFC 3550 RTP: A Transport Protocol for Real-Time Applications | RTP 时间戳、实时媒体传输和帧时序诊断参考 |
 | Microsoft Learn：Get-FileHash | 文件 SHA256、证据导出和完整性校验参考 |
@@ -6298,6 +7036,15 @@ critical 可靠性门禁不得作为例外跳过，例如无人登录不能自�
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-registerservicectrlhandlerexw
 - https://learn.microsoft.com/en-us/windows/win32/services/service-servicemain-function
 - https://learn.microsoft.com/en-us/windows/security/operating-system-security/data-protection/bitlocker/
+- https://learn.microsoft.com/en-us/defender-endpoint/controlled-folders
+- https://learn.microsoft.com/en-us/defender-endpoint/attack-surface-reduction-rules-reference
+- https://learn.microsoft.com/en-us/defender-endpoint/prevent-changes-to-security-settings-with-tamper-protection
+- https://learn.microsoft.com/en-us/defender-endpoint/enable-network-protection
+- https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/
+- https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols
+- https://learn.microsoft.com/en-us/windows/deployment/update/
+- https://www.catalog.update.microsoft.com/Home.aspx
+- https://learn.microsoft.com/en-us/windows/deployment/update/waas-restart
 - https://learn.microsoft.com/en-us/powershell/module/defender/add-mppreference
 - https://learn.microsoft.com/en-us/microsoft-365/security/defender-endpoint/configure-exclusions-microsoft-defender-antivirus
 - https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule
@@ -6379,3 +7126,9 @@ critical 可靠性门禁不得作为例外跳过，例如无人登录不能自�
 - **密钥托管**：对备份、BitLocker 和恢复所需密钥进行授权、密封、开封、轮换和审计的流程；
 - **发布授权包**：汇总版本、测试、证据、风险例外和审批结论，用于判断是否允许发布或上线；
 - **追踪矩阵**：把需求、测试、故障注入、证据、责任方和发布门禁关联起来的矩阵。
+- **受控文件夹访问**：Windows Defender 的勒索软件防护能力，用于限制不受信任程序修改受保护文件夹；
+- **攻击面减少（ASR）**：通过规则限制可疑脚本、下载文件、凭据窃取和横向移动等行为；
+- **PDB**：调试符号文件，用于把崩溃转储中的地址映射到函数和源代码位置；
+- **WinDbg**：Windows 调试工具，用于分析崩溃转储、内核或用户态问题；
+- **补丁环**：操作系统和驱动更新按内部、试点、生产分批验证和发布的机制；
+- **复盘报告**：记录事件影响、时间线、根因、纠正措施和验证结果的报告。
