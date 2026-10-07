@@ -1,14 +1,15 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v2.3
+> 文档版本：v2.4
 > 成文日期：2026-10-07
-> 文档状态：立项稿（勒索防护、崩溃分析、补丁治理与安全事件响应增强版）
+> 文档状态：立项稿（应用控制、网络加固、防御式工程与 UI 一致性增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
 > v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
 > v2.1 增补：时间同步和电子证据链、配置漂移与文件完整性、72 小时/30 天长稳压力协议、冷备主机和备件切换机制。
 > v2.2 增补：Windows 服务状态机、通知模板与值班升级、备份加密和密钥托管、需求—测试—证据追踪矩阵及发布授权包。
 > v2.3 增补：勒索软件防护和攻击面减少、崩溃转储符号化、补丁生命周期、安全事件响应、根因分析和客户公告。
+> v2.4 增补：WDAC/AppLocker 应用白名单、可移动介质、SMB/RDP/WinRM 加固、防御式编译/Fuzzing/CI、Qt UI 状态一致性与降级模式。
 
 ---
 
@@ -6904,11 +6905,713 @@ customer_notice:
 
 ---
 
-## 66. 行业资料与标准依据
+## 66. 应用白名单、可移动介质与 AutoRun 控制
+
+FactoryGuard 值守电脑必须坚持一个原则：只有经过批准的程序、脚本和安装器可以运行，普通 U 盘不能成为程序入口或数据外泄通道。应用白名单不是为了让现场使用更麻烦，而是为了降低恶意程序、临时脚本和误操作破坏检测服务的概率。
+
+### 66.1 控制目标
+
+| 目标 | 验收证据 |
+| --- | --- |
+| 未签名或未批准的 EXE/DLL/脚本不能执行 | 白名单策略、拦截事件、非授权程序测试 |
+| FactoryGuard 的程序路径和发布者固定 | 文件哈希、签名、发布者规则、安装目录 ACL |
+| U 盘等可移动介质不会自动运行程序 | AutoRun/AutoPlay 策略、插入测试 |
+| 数据复制需要授权或至少可审计 | 设备安装日志、文件访问审计、客户制度 |
+| 安装器升级不会被白名单意外阻断 | 升级演练、规则更新与回退方案 |
+
+“只允许管理员运行”不等同白名单；管理员双击恶意程序时仍可能执行。也不建议为了方便把 PowerShell、cmd、压缩软件或脚本解释器整体无条件放行。
+
+### 66.2 WDAC 与 AppLocker 的选择
+
+| 方案 | 适用情况 | 注意事项 |
+| --- | --- | --- |
+| WDAC（App Control for Business） | 企业级设备、需要更强的内核支持和可管理策略 | 策略设计、签名和托管要求更高，建议先审计 |
+| AppLocker | 传统域环境、需要按用户/路径快速限制 | 依赖支持的操作系统版本和管理体系 |
+| 仅杀毒拦截 | 不满足白名单目标 | 可作为补充，不能替代白名单 |
+| 人工口头规定 | 不作为控制措施 | 缺少强制和证据 |
+
+同一台主机不建议叠加多套含义冲突的白名单策略。标准站点优先采用 WDAC；若客户已有 AppLocker 体系，则沿用客户体系并把 FactoryGuard 二进制加入变更流程。
+
+### 66.3 WDAC 策略生命周期
+
+1. 在样板机以 Audit 模式启用策略；
+2. 收集正常安装、升级、备份、诊断、远程支持所需程序；
+3. 优先使用发布者签名和文件哈希规则，谨慎使用路径规则；
+4. 明确是否允许管理员交互式脚本；
+5. 试运行至少一个完整升级和备份周期；
+6. 复核无未解释审计事件后切换 Enforce；
+7. 每次产品升级前验证新签名/哈希；
+8. 策略文件和部署脚本进入发布制品清单。
+
+```powershell
+CiTool.exe -lp
+Get-ChildItem 'C:\Windows\System32\CodeIntegrity\CiPolicies\Active' -Filter '*.cip' |
+  Select-Object Name, Length, LastWriteTime |
+  Format-Table -AutoSize
+```
+
+审计阶段应重点检查：
+
+- FactoryGuardEngine、FactoryGuardCtl、FactoryGuardDiagnostics；
+- FFmpeg 或项目封装的媒体进程；
+- ONNX Runtime、Qt 及其他随安装目录发布的 DLL；
+- 客户批准的备份程序；
+- 安装器和升级器；
+- 远程支持工具是否为临时授权，结束后是否撤销。
+
+路径规则只能用于不易被普通用户写入的目录，例如 Program Files；不能把 Temp、Downloads 或可移动盘作为永久信任路径。
+
+### 66.4 AppLocker 基线
+
+```powershell
+$xmlPath = 'C:\ProgramData\FactoryGuard\policies\AppLocker-FactoryGuard.xml'
+Get-AppLockerPolicy -Effective -Xml |
+  Set-Content -Encoding UTF8 '.\applocker-effective.before.xml'
+
+# 正式部署前必须由安全负责人审核 XML；这里只展示应用策略的命令契约。
+if (Test-Path $xmlPath) {
+  Set-AppLockerPolicy -Xml (Get-Content -Raw -Encoding UTF8 $xmlPath) -Merge $true
+  Get-AppLockerPolicy -Effective -Xml |
+    Set-Content -Encoding UTF8 '.\applocker-effective.after.xml'
+} else {
+  Write-Warning "AppLocker policy not found: $xmlPath"
+}
+```
+
+建议规则：
+
+| 程序类型 | 允许规则 | 不建议 |
+| --- | --- | --- |
+| FactoryGuard EXE/DLL | 已签名发布者 + 安装目录 | 允许所有 EXE |
+| 安装器 | 固定版本哈希或发布者规则 | 长期信任 Downloads 目录 |
+| PowerShell | 仅管理员或维护账户执行批准脚本 | 普通操作员任意执行脚本 |
+| 第三方备份工具 | 厂商签名路径 | 把脚本宿主整体放行 |
+| MSI | 批准的产品和运行库安装包 | 任意 MSI 均可安装 |
+
+### 66.5 可移动存储控制
+
+完全离线站点可能必须使用 U 盘导入证据包或安装包，因此不一定要物理禁用全部 USB，但必须做到授权、编号、杀毒、登记和不可自动执行。
+
+```powershell
+$removableKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices'
+New-Item -Path $removableKey -Force | Out-Null
+New-ItemProperty -Path $removableKey -Name Deny_All -PropertyType DWord -Value 0 -Force |
+  Out-Null
+
+$classKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR'
+Get-ItemProperty -Path $classKey |
+  Select-Object Start, DisplayName |
+  Format-List
+```
+
+参数建议：
+
+| 站点模式 | Deny_All / USBSTOR | 使用要求 |
+| --- | --- | --- |
+| 完全托管、可远程维护 | 可禁止可移动存储 | 客户 IT 提供例外流程 |
+| 离线站点 | 不默认全禁，但禁止 AutoRun | 专用介质、病毒扫描、交接登记 |
+| 高安全站点 | 禁用并审计 | 白名单人员审批后临时开放 |
+| 试点开发机 | 可开放但保持审计 | 不把该策略复制到生产 |
+
+如果选择 Deny_All=1，应验证键盘、鼠标、签名狗等非存储 USB 设备不受影响，并提前准备离线升级替代方案。
+
+### 66.6 AutoRun/AutoPlay 和 Shell Hardware Detection
+
+```powershell
+$explorerPolicies = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+New-Item -Path $explorerPolicies -Force | Out-Null
+New-ItemProperty -Path $explorerPolicies -Name NoDriveTypeAutoRun -PropertyType DWord -Value 255 -Force |
+  Out-Null
+
+$service = Get-Service -Name ShellHWDetection -ErrorAction SilentlyContinue
+if ($service) {
+  Stop-Service -Name ShellHWDetection -Force -ErrorAction SilentlyContinue
+  Set-Service -Name ShellHWDetection -StartupType Manual
+}
+```
+
+插入 U 盘后必须确认：
+
+- 不自动执行任何程序；
+- 不自动打开不明脚本；
+- 自动播放窗口若出现，也只提供有限操作；
+- 安装介质内文件需用户通过授权路径手动选择；
+- 事件日志能记录设备接入和卷号。
+
+### 66.7 介质交接流程
+
+专用介质应执行以下流程：
+
+1. 介质编号，例如 FG-USB-001；
+2. 只保存与站点相关的安装包、证据或日志；
+3. 拷贝前在来源机校验哈希并扫描；
+4. 放入密封袋，记录借出人和日期；
+5. 在目标机先扫描再复制；
+6. 使用完成后清理其他客户文件并重新封存；
+7. 丢失、未归还或封条破损立即上报。
+
+不允许实施工程师使用个人 U 盘直接在客户主机运行脚本。
+
+### 66.8 兼容性和回退
+
+- 白名单策略启用前必须先经过至少一次安装、升级、备份、诊断和冷备切换；
+- 阻断合法程序时，先收集事件和路径，再通过审批添加最小规则；
+- 禁止为解决一次阻断而临时关闭整个白名单；
+- 策略回退文件应与安装包一起保存；
+- 若客户域策略覆盖本地策略，以客户平台为最终配置来源并保留证据。
+
+### 66.9 验收测试
+
+| 用例 | 操作 | 预期 |
+| --- | --- | --- |
+| 未签名程序 | 从 Temp 执行测试 EXE | 被阻止或产生审计事件 |
+| 未批准脚本 | 普通操作员运行 PowerShell 脚本 | 被限制，事件可追踪 |
+| 安装器升级 | 使用签名安装包升级 | 程序正常执行，规则允许 |
+| U 盘插入 | 插入含测试文件的 FAT32/NTFS U 盘 | 不自动运行，访问可审计 |
+| 备份工具 | 执行客户批准备份任务 | 被允许，其他非批准程序不被信任 |
+| 策略恢复 | 应用回退策略 | 恢复到变更前状态 |
+
+白名单只有在拦截测试和升级兼容性都通过时，才算正式运行基线的一部分。
+
+---
+
+## 67. SMB/RDP/WinRM/NTLM 网络服务加固
+
+FactoryGuard 的核心链路是厂区内网 RTSP，不需要值守电脑同时承担文件服务器、远程桌面服务器或管理服务器角色。网络服务加固的目标是减少横向移动、弱认证和误暴露面，同时保留必要的运维入口。
+
+### 67.1 服务角色最小化
+
+| 服务/协议 | 默认建议 | 原因 |
+| --- | --- | --- |
+| SMB Client | 保留 | 访问客户批准的备份共享时需要 |
+| SMB Server | 默认不依赖 | FactoryGuard 不需把本机作为文件共享服务器 |
+| SMBv1 | 禁用并移除 | 安全风险高，现代视频和备份系统不应依赖 |
+| RDP | 未需要时关闭；需要时启用 NLA | 远程维护入口必须受控 |
+| WinRM | 默认关闭；由客户管理时才启用 | 避免额外远程命令面 |
+| NetBIOS/LLMNR | 尽量限制 | 降低名称欺骗和中继风险 |
+| NTLM | 保留兼容但限制弱版本 | 厂区旧设备可能仍需兼容 |
+| FTP/Telnet | 不启用 | FactoryGuard 不依赖这些服务 |
+
+任何服务开放都应对应明确维护需求、授权来源、防火墙规则和关闭条件；不能因为“以后可能用”长期开启。
+
+### 67.2 禁用 SMBv1 和不安全来宾访问
+
+```powershell
+Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -Remove -NoRestart
+$workstationKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters'
+New-Item -Path $workstationKey -Force | Out-Null
+New-ItemProperty -Path $workstationKey -Name AllowInsecureGuestAuth -PropertyType DWord -Value 0 -Force | Out-Null
+
+$serverKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+New-Item -Path $serverKey -Force | Out-Null
+New-ItemProperty -Path $serverKey -Name EnableSMB1Protocol -PropertyType DWord -Value 0 -Force | Out-Null
+New-ItemProperty -Path $serverKey -Name EnableSMB2Protocol -PropertyType DWord -Value 1 -Force | Out-Null
+
+Get-SmbServerConfiguration |
+  Select-Object EnableSMB1Protocol, EnableSMB2Protocol, RequireSecuritySignature, EnableSecuritySignature, EnableGuestAccount, AuditSmb1Access |
+  Format-List
+```
+
+如本机不需要提供文件共享，应删除或关闭 FactoryGuard 相关自定义共享：
+
+```powershell
+$shares = Get-SmbShare -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -notmatch '^(ADMIN\$|C\$|IPC\$)' }
+$shares | Select-Object Name, Path, Description | Format-Table -AutoSize
+foreach ($share in $shares) {
+  Remove-SmbShare -Name $share.Name -Force
+}
+```
+
+### 67.3 备份共享访问控制
+
+如果备份到 NAS 共享，应满足：
+
+- 使用专用备份账户，不使用管理员或个人账号；
+- 账户只对 FactoryGuard 备份目录有写入和读取权限；
+- 服务端启用传输保护或在受信内网中使用；
+- 共享不可被 Everyone、Guest 或匿名访问；
+- 备份文件写入临时名称，完成后原子替换；
+- 备份目标启用快照或不可变保留；
+- 定期从该共享执行恢复演练。
+
+不要把 NVR 的 SMB/管理接口与 FactoryGuard 备份共享混用成同一高权限账户。
+
+### 67.4 RDP 加固
+
+RDP不是 FactoryGuard 检测的必要组件。客户若通过 RDP 进行维护，建议：
+
+- 启用网络级别身份验证；
+- 仅允许管理员或维护组访问；
+- 使用防火墙限制管理地址；
+- 不把 3389 暴露到公网；
+- 登录成功、失败和注销进入审计；
+- 使用完毕后关闭或按客户制度保留。
+
+```powershell
+$tsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+$winStationsKey = "$tsKey\WinStations\RDP-Tcp"
+
+# 1 表示关闭 RDP；若客户确认需要，改为 0。
+New-ItemProperty -Path $tsKey -Name fDenyTSConnections -PropertyType DWord -Value 1 -Force | Out-Null
+New-ItemProperty -Path $winStationsKey -Name UserAuthentication -PropertyType DWord -Value 1 -Force | Out-Null
+New-ItemProperty -Path $winStationsKey -Name SecurityLayer -PropertyType DWord -Value 2 -Force | Out-Null
+New-ItemProperty -Path $winStationsKey -Name MinEncryptionLevel -PropertyType DWord -Value 3 -Force | Out-Null
+```
+
+如果启用RDP，还应创建精确防火墙规则：
+
+```powershell
+$managementComputers = @('192.168.10.10','192.168.10.11')
+Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+$rule = Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -Enabled True | Select-Object -First 1
+$rule | Set-NetFirewallRule -RemoteAddress $managementComputers
+```
+
+### 67.5 WinRM 基线
+
+若客户不使用 WinRM 管理值守电脑，应保持禁用：
+
+```powershell
+Disable-PSRemoting -Force
+Set-Service -Name WinRM -StartupType Disabled
+Stop-Service -Name WinRM -Force -ErrorAction SilentlyContinue
+Get-Service WinRM | Select-Object Name, Status, StartType | Format-List
+```
+
+若客户 IT 明确要求启用，则只允许批准的管理地址和安全认证方案：
+
+```powershell
+Set-Service WinRM -StartupType Automatic
+$wsMan = 'WSMan:\localhost'
+Set-Item "$wsMan\Service\Auth\Basic" -Value $false
+Set-Item "$wsMan\Service\Auth\Kerberos" -Value $true
+Set-Item "$wsMan\Client\TrustedHosts" -Value '' -Force
+winrm enumerate winrm/config/listener
+```
+
+不应为了临时支持把 TrustedHosts 设置为 *，也不应长期启用 Basic 认证。
+
+### 67.6 NTLM 和 LM 兼容控制
+
+```powershell
+$lsaKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+New-ItemProperty -Path $lsaKey -Name LmCompatibilityLevel -PropertyType DWord -Value 5 -Force | Out-Null
+New-ItemProperty -Path $lsaKey -Name RestrictAnonymous -PropertyType DWord -Value 1 -Force | Out-Null
+New-ItemProperty -Path $lsaKey -Name EveryoneIncludesAnonymous -PropertyType DWord -Value 0 -Force | Out-Null
+```
+
+这些策略可能影响极旧设备或工业软件。启用前必须确认：
+
+- NVR RTSP 认证是否仍可用；
+- NAS 备份账户是否受影响；
+- 域或客户安全策略是否已经设置；
+- 是否存在只能使用旧认证方式的遗留系统。
+
+若发现旧设备必须依赖弱协议，应形成书面风险、隔离网段和替换计划，而不是把弱认证作为默认长期配置。
+
+### 67.7 名称解析和横向移动
+
+建议在客户 IT 评估后关闭不必要的多播名称解析和旧 NetBIOS 行为；若现场应用依赖该机制，应至少限制其使用范围。验收时应确认：
+
+- 值守电脑没有多块网卡连接不可信网络；
+- 本地名称后缀和 DNS Suffix 正确；
+- 未安装文件共享、P2P 或网盘客户端；
+- 防火墙默认入站阻止；
+- 管理员账户没有用于普通业务登录；
+- Windows 凭据管理器中没有不明的永久凭据。
+
+### 67.8 网络服务验收矩阵
+
+| 测试 | 命令/动作 | 合格标准 |
+| --- | --- | --- |
+| SMBv1 | feature 查询、Get-SmbServerConfiguration | 系统不启用 SMBv1 |
+| Guest SMB | 从未授权共享访问 | 拒绝来宾和匿名访问 |
+| RDP | 未授权地址连接 | 未启用时拒绝；启用时仅管理地址可连接 |
+| WinRM | 未授权远程命令 | 默认关闭，启用时 Basic/TrustedHosts 不安全配置为否 |
+| NTLM | 使用测试账户验证 | 弱 LM 认证禁用，合法 RTSP 不受影响 |
+| 防火墙 | 端口扫描或 Test-NetConnection | 只有批准端口可达 |
+| 备份 | 写入 NAS 并恢复 | 使用最小权限账户，恢复成功 |
+| 日志 | 查询登录和共享事件 | 成功/失败事件可审计 |
+
+### 67.9 与核心检测的隔离要求
+
+网络服务加固不得产生以下副作用：
+
+- 阻断 NVR RTSP over TCP；
+- 阻断 NTP、证书检查或批准的通知端点；
+- 使数据库备份无法写入；
+- 让 UI 与命名管道无法本地通信；
+- 阻止 SCM 在开机后启动服务。
+
+所有网络服务策略启用后，应立即执行一次 RTSP 拉流、通知、备份和服务重启测试。只有这些业务路径均通过，网络加固才允许写入正式基线。
+
+---
+
+## 68. 防御式编程、安全编译、Fuzzing 与 CI 可靠性门禁
+
+Windows 平台的可靠性不能只靠安装后看门狗。若代码中存在未检查返回值、资源泄漏、越界访问、异常穿越进程边界或输入未验证，故障会在现场以随机崩溃、数据损坏和难复现问题出现。必须把可靠性前移到编码、编译、代码评审、静态分析、Fuzzing 和持续集成。
+
+### 68.1 工程原则
+
+| 原则 | 具体要求 |
+| --- | --- |
+| 显式处理失败 | Win32/HRESULT/系统调用/IO/数据库返回值必须检查或转换为错误对象 |
+| 资源获取即初始化 | 文件句柄、进程、线程、管道、锁、内存和数据库语句使用 RAII |
+| 输入不信任 | IPC、配置、几何 JSON、模型输出、文件路径、外部时间均要验证 |
+| 故障边界清楚 | 子进程崩溃不能拖垮 Engine；异常要记录、隔离并转成错误码 |
+| 状态不可猜测 | 服务状态必须由持久化状态、心跳和检查结果共同决定 |
+| 可取消 | 媒体连接、推理、UI 查询和关闭流程必须支持超时/取消 |
+| 可观测 | 关键分支、错误码、重试、状态变化和耗时必须可追踪 |
+| 默认安全 | 默认最小权限、默认安全协议、默认不启用危险调试能力 |
+
+### 68.2 C++ 安全编译基线
+
+```text
+/permissive-
+/W4
+/wd... # 仅允许记录原因的少量兼容例外
+/GS
+/sdl
+/guard:cf
+/DYNAMICBASE
+/HIGHENTROPYVA
+/NXCOMPAT
+/CETCOMPAT
+```
+
+CMake 中应区分 Debug、Release、RelWithDebInfo，并保留匹配 PDB：
+
+```text
+target_compile_options(FactoryGuardEngine PRIVATE
+  /permissive- /W4 /WX /GS /sdl /guard:cf)
+target_link_options(FactoryGuardEngine PRIVATE
+  /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /CETCOMPAT /GUARD:CF)
+```
+
+是否在正式发布中使用 /WX 应按项目策略执行；至少 CI 的警告基线不允许无说明增加。第三方代码产生的警告应单独隔离，不与业务代码混在一起。
+
+### 68.3 句柄和进程安全
+
+- CreateFile、CreateProcess、CreateNamedPipe、CreateJobObject 后立即包装为 RAII；
+- CloseHandle 不能重复调用；无效句柄要显式标记；
+- CreateProcess 必须检查 hProcess、hThread 和返回值；
+- 子进程必须放入 Job Object，父进程退出后由 Job 回收；
+- 管道读写必须有超时、取消和部分写入处理；
+- 进程退出码、等待超时和信号终止要区分；
+- 不允许通过句柄继承把不必要的敏感句柄传给 FFmpeg/Inference。
+
+### 68.4 异常边界
+
+推荐边界：
+
+| 边界 | 规则 |
+| --- | --- |
+| Engine 主循环 | 捕获可恢复异常，记录上下文，隔离任务；不得静默继续未知状态 |
+| Inference 进程 | 模型/推理异常应返回结构化错误，由 Engine 决定重试或禁用通道 |
+| Media 进程 | FFmpeg启动、stderr、退出码和超时统一转换为媒体错误码 |
+| IPC 处理 | 消息格式错误、版本不符、超时请求拒绝并审计 |
+| Qt UI | UI异常只影响 UI，不允许传播到后台服务 |
+
+不应使用空 catch 吞掉异常；也不应在崩溃后继续使用已经不完整的对象。无法保证状态正确时，优先重启组件。
+
+### 68.5 静态分析和代码评审
+
+CI 至少包含：
+
+- MSVC 编译器警告；
+- C++ 静态分析工具；
+- clang-tidy 或等价规则；
+- 格式检查；
+- 未初始化变量、越界、整数溢出、资源泄漏和空指针规则；
+- 危险 API 和禁用函数扫描；
+- 第三方依赖版本及漏洞清单；
+- 配置 Schema 与报告示例校验。
+
+代码评审必须覆盖：
+
+1. 状态机变化；
+2. 进程和句柄生命周期；
+3. 数据库事务边界；
+4. 错误码是否能被运维理解；
+5. 升级和回滚兼容性；
+6. 是否引入未验证的外部依赖；
+7. 是否破坏 UI 与服务隔离。
+
+### 68.6 Fuzzing 输入面
+
+| 输入 | Fuzz 目标 |
+| --- | --- |
+| IPC 消息 | 超长字段、非法 UTF-8、截断帧、重复请求、错误版本 |
+| 配置 YAML | 深层嵌套、错误类型、重复键、非法路径和时间 |
+| 规则几何 | 负数、无穷值、重复点、自相交多边形、坐标越界 |
+| 模型输出 | bbox越界、标签不存在、置信度 NaN、缺失字段 |
+| 文件路径 | UNC 路径、保留设备名、符号链接、路径穿越 |
+| 媒体 stderr | 大量输出、混杂编码、异常片段和非标准行 |
+| JSON Manifest | 重复键、错误哈希、缺失文件和未知扩展字段 |
+
+Fuzz发现崩溃、越界、无限循环或资源未释放时均按缺陷处理；只有复现和回归测试通过后才能关闭。
+
+### 68.7 CI 流水线示例
+
+```yaml
+ci_pipeline:
+  name: factoryguard-windows-reliability
+  triggers: [pull_request, merge_to_develop]
+  jobs:
+    - name: configure-msvc-x64
+      steps: [cmake-configure, validate-options]
+    - name: build-debug
+      gates:
+        no_new_warnings: true
+    - name: build-relwithdebinfo
+      outputs:
+        - binaries
+        - pdb
+    - name: unit-tests
+      timeout_minutes: 20
+    - name: integration-tests
+      scenarios: [rtsp-mock, sqlite-crash, pipe-acl]
+    - name: static-analysis
+      blocking: true
+    - name: fuzz-smoke
+      duration_minutes: 10
+    - name: validate-documentation
+      checks: [powershell, yaml, json, sql, links, numbering]
+    - name: package-not-sign-release
+      outputs: [setup-exe, manifest]
+```
+
+正式签名制品只能在受保护发布阶段生成；开发构建不得伪装成正式稳定版本。
+
+### 68.8 故障注入纳入 CI
+
+轻量 CI 中可自动运行：
+
+- 数据库写入中断模拟；
+- 管道客户端异常断开；
+- 配置校验失败；
+- 重复通知幂等；
+- 媒体进程返回非零；
+- 模型文件哈希不匹配；
+- JSON/几何异常；
+- 超时取消。
+
+完整 72 小时长稳仍在 RC 阶段执行；CI 负责快速阻断明显回归。
+
+### 68.9 代码覆盖率的正确用法
+
+覆盖率用于发现完全未测试的错误路径，而不是追求单一百分比。应优先覆盖：
+
+- 服务状态机；
+- Outbox 和事件事务；
+- 媒体错误映射；
+- 规则确认和冷却；
+- 数据库迁移；
+- 权限拒绝；
+- 崩溃恢复；
+- 配置热更新边界。
+
+覆盖率下降若发生在可靠性模块，必须说明原因；新增错误处理但没有测试，不应视为完整改动。
+
+### 68.10 工程发布红线
+
+以下问题不允许进入 RC：
+
+- 已知内存/句柄/GPU 资源泄漏；
+- 关键路径存在未检查系统调用；
+- 错误配置可能导致服务误报 RUNNING；
+- 数据库迁移不可回退；
+- 安装器未验证签名和哈希；
+- 崩溃不产生事件或 dump；
+- 进程无法可靠取消；
+- 静态分析发现高危且无修复计划；
+- 依赖来源和版本不可追溯。
+
+可靠性工程的结论必须由 CI、测试和现场证据共同支持，而不是只依靠经验判断。
+
+---
+
+## 69. Qt UI 可靠性、本地缓存、只读降级与状态一致性
+
+Qt UI 是可选控制台，不是检测服务的一部分。它必须在服务重启、管道断开、历史查询慢、数据过期、权限不足或 UI 自身崩溃时保持含义清楚，不能让操作员误以为系统仍在正常保护，也不能因为 UI 卡顿影响后台检测。
+
+### 69.1 UI 与服务职责边界
+
+| 能力 | 后台服务 | Qt UI |
+| --- | --- | --- |
+| RTSP 接入和媒体重连 | 是 | 否 |
+| AI 推理和规则确认 | 是 | 否 |
+| 事件持久化和 Outbox | 是 | 否 |
+| 本地状态展示 | 提供数据 | 展示 |
+| 规则编辑 | 校验和持久化 | 提交草稿 |
+| 事件确认/关闭 | 权限验证并写审计 | 发起操作 |
+| 历史查询 | 提供受控接口 | 展示分页结果 |
+| 视频预览 | 可提供有限能力或不提供 | 用户按需打开 |
+
+UI 关闭后检测必须继续；UI 未连接时服务状态不得改变；UI 崩溃后用户重新打开，应读取服务端当前状态而不是恢复本地猜测状态。
+
+### 69.2 UI 启动流程
+
+1. 用户启动 FactoryGuard UI；
+2. UI 通过命名管道连接后台服务；
+3. 提交客户端版本、支持的协议版本和会话信息；
+4. 服务完成身份验证和授权；
+5. UI 获取服务状态、版本、通道摘要和权限；
+6. 若服务 START_PENDING，UI 显示“正在启动”，不能显示 green；
+7. 若管道连接失败，UI 提供只读本地提示和诊断入口；
+8. 若协议版本不匹配，提示升级，不使用未确认兼容模式。
+
+### 69.3 QLocalSocket 和线程模型
+
+```powershell
+# UI 进程检查命令；实际实现使用 QLocalSocket，不通过额外 TCP 端口暴露服务。
+Get-Process FactoryGuardUI -ErrorAction SilentlyContinue |
+  Select-Object ProcessName, Id, StartTime, Responding |
+  Format-Table -AutoSize
+```
+
+UI 线程要求：
+
+- 网络/管道读取不得阻塞主线程；
+- 数据库历史查询和导出必须可取消；
+- 大量截图加载使用分页、缩略图和后台线程；
+- QTimer 只负责刷新触发，不在回调中执行长耗时操作；
+- 所有跨线程结果返回 UI 线程后更新控件；
+- 断开连接时取消未完成请求。
+
+Qt QProcess 可用于启动诊断工具，但不能让 UI 直接长期托管 Engine、Inference 或 FFmpeg；这些进程由服务和 Job Object 管理。
+
+### 69.4 命令幂等和确认语义
+
+每个 UI 命令必须包含 command_id、请求时间、操作资源和幂等键：
+
+| 操作 | 服务端要求 |
+| --- | --- |
+| acknowledge | 校验事件状态和用户权限，重复请求返回当前状态 |
+| close | 必须有关闭原因，写审计 |
+| enable rule | 校验规则版本，防止覆盖他人修改 |
+| save geometry | 验证坐标范围和规则类型 |
+| export | 创建导出任务，返回任务状态，不允许重复并发覆盖 |
+| reload config | 标识可热更新和需重启项 |
+| test notification | 生成测试记录而不是伪装真实事件 |
+
+危险操作必须二次确认：禁用通道、批量修改规则、删除/清理媒体、覆盖配置、关闭高等级事件。
+
+### 69.5 本地缓存策略
+
+允许缓存：
+
+- 用户界面布局；
+- 最近查询条件；
+- 缩略图；
+- 只读事件列表的短期副本；
+- 最近一次服务状态摘要。
+
+不允许缓存：
+
+- NVR/通知渠道明文密钥；
+- 未提交规则作为最终生效规则；
+- 跨用户可读写的导出文件；
+- 用本地缓存替代服务端健康状态；
+- 长期可执行脚本。
+
+缓存必须包含来源版本、时间、过期时间和哈希；过期数据显示为“可能不是最新状态”。
+
+### 69.6 乐观更新的限制
+
+低风险界面状态可乐观更新，例如折叠面板和列宽；业务状态不应先在本地标记成功：
+
+- 事件确认必须等待服务端事务成功；
+- 规则启用必须等待服务端持久化和校验；
+- 关闭事件必须等待审计写入；
+- 导出完成必须以任务状态为准；
+- 通知测试必须等待服务端结果。
+
+请求失败时恢复服务端状态并显示错误，不允许本地保留“已确认”假象。
+
+### 69.7 只读和降级模式
+
+| 场景 | UI 行为 |
+| --- | --- |
+| 服务未运行 | 显示服务状态、启动/诊断入口；不展示伪造 green |
+| 管道被拒绝 | 提示权限或服务启动中，可查看最近只读状态 |
+| 数据库忙 | 查询显示等待/取消，不阻塞检测服务 |
+| 部分通道失败 | 总览显示 degraded，列出失败通道和错误码 |
+| 时间偏差 | 显示时钟告警，提醒事件对应关系可能受影响 |
+| 权限不足 | 操作按钮禁用并说明角色限制 |
+| 截图缺失 | 显示 clip/snapshot 状态和恢复建议 |
+| UI 版本不匹配 | 阻止关键写操作，提示升级 |
+
+只读模式只能查看缓存或导出文件，不能向服务提交危险命令。
+
+### 69.8 视频预览策略
+
+首版不建议 UI 对所有通道建立额外实时预览，以免产生第二套 RTSP 连接、增加网络和 GPU 压力。默认展示事件截图、片段和 NVR 检索线索。若提供单通道预览：
+
+- 必须由用户手动打开并自动超时关闭；
+- 明确使用主/子码流和带宽成本；
+- 不能影响后台分析通道；
+- 预览失败不改变事件状态；
+- NVR 本机客户端仍是连续录像和实时查看的权威入口之一。
+
+### 69.9 UI 崩溃和重启
+
+```powershell
+$ui = Get-Process FactoryGuardUI -ErrorAction SilentlyContinue
+if ($ui) {
+  taskkill /PID $ui.Id /F
+}
+Start-Sleep -Seconds 2
+$engine = Get-Service FactoryGuardEngine
+$engine | Select-Object Name, Status
+if ($engine.Status -ne 'Running') {
+  throw 'Engine state changed after UI crash'
+}
+```
+
+验收要求：
+
+- UI崩溃产生 dump 和事件；
+- 服务、媒体、推理和 Outbox 不受影响；
+- 重启 UI 后重新获取服务端状态；
+- 未提交草稿可恢复但必须提示“尚未生效”；
+- UI 不自动重启服务或子进程，除非用户通过授权 CLI/服务操作执行。
+
+### 69.10 响应性指标
+
+| 指标 | 建议目标 |
+| --- | --- |
+| 普通点击响应 | 100 ms 内有界面反馈 |
+| 事件列表首屏 | 2 秒内返回或显示加载状态 |
+| 历史查询取消 | 500 ms 内生效或显示取消进度 |
+| 状态刷新 | 默认 5–10 秒，不能对服务造成压力 |
+| UI 与服务断线检测 | 10 秒内可见 |
+| 缩略图加载 | 分页和后台加载，不阻塞界面 |
+| 高等级事件提示 | 明显、持续，不能只在角落短暂提示 |
+
+### 69.11 UI 验收矩阵
+
+| 用例 | 操作 | 预期 |
+| --- | --- | --- |
+| 关闭 UI | 正常退出 | 检测继续，事件继续入库 |
+| 强制结束 UI | taskkill | 服务保持 RUNNING，重新打开状态正确 |
+| 服务停止 | 停止后台服务 | UI 显示停止，不伪造在线 |
+| 权限不足 | viewer 尝试确认 | 操作被拒绝并审计 |
+| 慢查询 | 大范围历史查询 | 可取消，UI 不白屏 |
+| 旧缓存 | 断开后查看缓存 | 标记过期，不允许写操作 |
+| 时钟异常 | 制造偏差 | UI 显示时钟告警 |
+| 规则编辑冲突 | 两人先后保存 | 后保存者看到版本冲突 |
+
+UI 的可靠性标准是：操作员始终知道系统真实状态、数据是否过期、动作是否成功、失败后下一步怎么做。
+
+---
+
+## 70. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 66.1 平台与可靠性资料
+### 70.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -6976,6 +7679,14 @@ customer_notice:
 | Microsoft WinDbg / Public symbol server | 崩溃转储分析、符号路径和调用栈诊断依据 |
 | Windows Update documentation / Microsoft Update Catalog | 补丁来源、更新分类、MSU 和更新生命周期参考 |
 | Microsoft Learn：Waas-restart | 更新重启、通知、计划和重启控制参考 |
+| Microsoft Learn：WDAC policy rules and file rules | 应用控制、发布者/哈希/路径规则和策略审计参考 |
+| Microsoft Learn：AppLocker overview | AppLocker 规则、适用版本和应用白名单参考 |
+| Microsoft Learn：SMBv1 not installed by default | SMBv1 禁用、移除和兼容性说明 |
+| Microsoft Learn：Windows Remote Management | WinRM 服务、监听器和远程管理安全边界 |
+| Microsoft Learn：Microsoft NTLM | NTLM/LM 认证、兼容性和弱认证治理参考 |
+| Microsoft Learn：/GS buffer security check | 编译器缓冲区安全检查和栈保护参考 |
+| Microsoft Learn：/SDL additional security checks | 编译期安全开发生命周期检查参考 |
+| Qt Documentation：QProcess / QTimer | UI进程启动、定时刷新和事件循环使用参考 |
 | RFC 5905 Network Time Protocol Version 4 | NTP 时间同步、时间源、偏差和时钟治理参考 |
 | RFC 3550 RTP: A Transport Protocol for Real-Time Applications | RTP 时间戳、实时媒体传输和帧时序诊断参考 |
 | Microsoft Learn：Get-FileHash | 文件 SHA256、证据导出和完整性校验参考 |
@@ -7045,6 +7756,15 @@ customer_notice:
 - https://learn.microsoft.com/en-us/windows/deployment/update/
 - https://www.catalog.update.microsoft.com/Home.aspx
 - https://learn.microsoft.com/en-us/windows/deployment/update/waas-restart
+- https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/design/select-types-of-rules-to-create
+- https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/applocker/applocker-overview
+- https://learn.microsoft.com/en-us/windows-server/storage/file-server/troubleshoot/smbv1-not-installed-by-default-in-windows
+- https://learn.microsoft.com/en-us/windows/win32/winrm/portal
+- https://learn.microsoft.com/en-us/windows/win32/secauthn/microsoft-ntlm
+- https://learn.microsoft.com/en-us/cpp/build/reference/gs-buffer-security-check
+- https://learn.microsoft.com/en-us/cpp/build/reference/sdl-enable-additional-security-checks
+- https://doc.qt.io/qt-6/qprocess.html
+- https://doc.qt.io/qt-6/qtimer.html
 - https://learn.microsoft.com/en-us/powershell/module/defender/add-mppreference
 - https://learn.microsoft.com/en-us/microsoft-365/security/defender-endpoint/configure-exclusions-microsoft-defender-antivirus
 - https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule
@@ -7132,3 +7852,9 @@ customer_notice:
 - **WinDbg**：Windows 调试工具，用于分析崩溃转储、内核或用户态问题；
 - **补丁环**：操作系统和驱动更新按内部、试点、生产分批验证和发布的机制；
 - **复盘报告**：记录事件影响、时间线、根因、纠正措施和验证结果的报告。
+- **WDAC**：Windows 应用控制，通过发布者、哈希和路径等规则限制可执行程序；
+- **AppLocker**：Windows 应用白名单机制，可按用户和程序类型控制 EXE/DLL/脚本/MSI；
+- **RAII**：资源获取即初始化，利用对象生命周期自动释放句柄、内存和锁；
+- **Fuzzing**：向程序持续输入异常数据以发现崩溃、越界、死循环和资源泄漏；
+- **只读降级**：服务不可用或权限不足时，UI 仅展示可标记时间的数据而不执行写操作；
+- **本地缓存**：UI 保存的短期界面或查询数据，必须标记来源、时间和过期状态。
