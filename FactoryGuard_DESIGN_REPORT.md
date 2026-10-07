@@ -1,12 +1,13 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v2.1
+> 文档版本：v2.2
 > 成文日期：2026-10-07
-> 文档状态：立项稿（时间取证、漂移审计、长稳压力与备件切换增强版）
+> 文档状态：立项稿（服务状态机、通知升级、备份密钥与发布追踪增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
 > v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
 > v2.1 增补：时间同步和电子证据链、配置漂移与文件完整性、72 小时/30 天长稳压力协议、冷备主机和备件切换机制。
+> v2.2 增补：Windows 服务状态机、通知模板与值班升级、备份加密和密钥托管、需求—测试—证据追踪矩阵及发布授权包。
 
 ---
 
@@ -5369,11 +5370,814 @@ NVR 始终保持连续录像，FactoryGuard 升级不应要求停止 NVR 或改�
 
 ---
 
-## 58. 行业资料与标准依据
+## 58. Windows 服务状态机、控制请求与停机语义
+
+核心检测以 Windows 服务运行，因此必须精确遵守 Service Control Manager（SCM）契约：什么时候允许报告 RUNNING、停止请求多久内响应、关机时如何持久化、子进程由谁终止、启动失败如何暴露，都必须写成代码和验收项。任何“界面看起来启动了”都不能替代服务真实进入 RUNNING。
+
+### 58.1 服务状态与 FactoryGuard 语义
+
+| SCM 状态 | FactoryGuard 内部阶段 | 必须完成/保证的事项 | 不允许的行为 |
+| --- | --- | --- | --- |
+| STOPPED | 未运行 | 无核心检测进程占用数据库和管道；Job Object 已关闭或随进程销毁 | 留下 FFmpeg/Inference 孤儿进程 |
+| START_PENDING | 基础初始化 | 建立日志、读取配置、检查迁移版本、创建 Job、初始化看门狗 | 长时间不发 checkpoint，或提前打开 UI 入口 |
+| RUNNING | 检测链路就绪 | 核心通道已开始调度，心跳、Outbox、事件日志和媒体监控均工作 | 初始化未完成却报告 RUNNING |
+| STOP_PENDING | 受控停止 | 停止接受新任务，等待/取消工作，冲刷事件，关闭子进程和数据库 | 收到停止后仍无限重连媒体 |
+| PAUSE_PENDING/PAUSED | 首版不实现 | 首版可返回不支持，或保留给未来维护模式 | 半实现导致规则静默但状态不明 |
+| CONTINUE_PENDING | 首版不实现 | 不暴露给操作员，避免误解为恢复检测 | 无日志地恢复部分规则 |
+
+服务只有在“检测循环、心跳、事件持久化、Outbox 调度、健康聚合”均完成启动检查后才能报告 RUNNING。若只有部分通道在线，可在 RUNNING 下以 degraded 表示，但必须记录失败通道和错误码；不能把局部失败隐藏成 green。
+
+### 58.2 启动顺序
+
+推荐启动顺序如下：
+
+1. SCM 启动服务进程，进入 ServiceMain；
+2. 立即向 SCM 报告 START_PENDING，并设置合理 wait hint 和 checkpoint；
+3. 初始化崩溃安全日志和 Windows 事件日志源；
+4. 读取配置并执行 Schema 校验；
+5. 检查数据库可打开、PRAGMA user_version 与程序期望版本一致；
+6. 如果迁移由安装器负责，则服务发现版本不匹配时应失败并给出明确错误，而不是在无人确认时自动迁移；
+7. 创建或打开 Job Object，设置 kill-on-close 和必要资源限制；
+8. 初始化数据库事务、Outbox、规则引擎、健康聚合器和看门狗；
+9. 启动媒体和推理子进程，并绑定进程 ID、角色和重启策略；
+10. 建立命名管道，但在 RUNNING 前对 UI 返回 starting；
+11. 等待核心通道完成首轮取流或达到可解释超时；
+12. 报告 RUNNING，写入启动事件并开始正式健康评分。
+
+启动失败必须区分配置错误、数据库版本错误、权限错误、端口/管道占用、GPU/DirectML 初始化失败和媒体不可达。错误码要进入事件日志和启动诊断，不应只在控制台短暂输出。
+
+### 58.3 ServiceMain 和状态报告命令
+
+```powershell
+$serviceName = 'FactoryGuardEngine'
+
+sc.exe queryex $serviceName
+sc.exe qc $serviceName
+sc.exe qfailure $serviceName
+
+Get-CimInstance Win32_Service -Filter "Name='$serviceName'" |
+  Select-Object Name, State, Status, StartMode, ServiceType, ProcessId, PathName, StartName |
+  Format-List
+```
+
+验收时应核对：
+
+- StartMode 为 Auto；
+- PathName 指向安装目录且路径处理正确；
+- ProcessId 与实际 Engine 进程一致；
+- StartName 为经批准的服务账户；
+- qfailure 中首次、二次失败动作符合恢复策略；
+- queryex 输出的 STATE 为 RUNNING，而不是 UI 进程单独运行。
+
+### 58.4 控制请求处理
+
+控制处理器应明确哪些控制接受、哪些拒绝、哪些只记录并触发内部状态变化：
+
+| 控制 | 首版处理 |
+| --- | --- |
+| SERVICE_CONTROL_STOP | 接受，进入 STOP_PENDING，执行受控停止 |
+| SERVICE_CONTROL_SHUTDOWN | 接受，按系统关机限制快速持久化并停止 |
+| SERVICE_CONTROL_PRESHUTDOWN | 可注册以获得更长准备时间，但必须说明等待时间 |
+| SERVICE_CONTROL_INTERROGATE | 按平台要求刷新状态 |
+| SERVICE_CONTROL_PARAMCHANGE | 触发配置重载或提示需重启，不允许部分未知字段静默生效 |
+| SERVICE_CONTROL_POWEREVENT | 记录电源事件、UPS/休眠变化；首版禁止睡眠 |
+| SERVICE_CONTROL_SESSIONCHANGE | 仅记录登录/注销/锁屏，用于证明 UI 与服务隔离 |
+| 自定义维护/回滚控制 | 必须通过专用 CLI 和审批，不把危险动作暴露给普通调用 |
+
+所有控制都要记录来源、时间、处理结果和耗时。普通用户不能通过 UI 或命名管道直接让服务退出；停止服务属于 Windows 权限操作，应受 SCM 和审计控制。
+
+### 58.5 受控停止顺序
+
+停止时应优先保证已识别事件和 Outbox 的一致性，而不是追求瞬间退出：
+
+1. 报告 STOP_PENDING，持续发送 checkpoint；
+2. 通知调度器进入 stopping，不再启动新通道；
+3. 停止媒体重连，关闭新的规则确认窗口；
+4. 等待短时间内已进入提交流程的事件完成；
+5. 将事件、通知任务和审计记录按事务提交；
+6. 命令 Inference/FFmpeg 子进程退出，必要时由 Job Object 回收；
+7. 关闭命名管道，拒绝新 UI 请求；
+8. 执行 WAL checkpoint 或由维护策略处理，但不在停止路径做长耗时 VACUUM；
+9. 关闭数据库句柄并写入停止事件；
+10. 报告 STOPPED。
+
+停止超时后的动作必须可解释：先记录未完成对象，再按策略终止子进程；不能在没有日志的情况下直接 kill，以免事后无法判断是否丢失事件。
+
+### 58.6 停止和重启验收脚本
+
+```powershell
+$serviceName = 'FactoryGuardEngine'
+$timeoutSeconds = 30
+
+$stopStarted = Get-Date
+Stop-Service -Name $serviceName -Force -NoWait
+$deadline = (Get-Date).AddSeconds($timeoutSeconds)
+
+do {
+  Start-Sleep -Milliseconds 500
+  $service = Get-Service -Name $serviceName
+  $children = Get-Process -Name 'FactoryGuardInference','ffmpeg' -ErrorAction SilentlyContinue
+} while ($service.Status -ne 'Stopped' -and (Get-Date) -lt $deadline)
+
+$stopElapsed = ((Get-Date) - $stopStarted).TotalSeconds
+if ($service.Status -ne 'Stopped') {
+  throw "Service did not stop within $timeoutSeconds seconds"
+}
+if ($children) {
+  throw "Child processes remained after service stopped"
+}
+
+Start-Service -Name $serviceName
+Wait-ServiceStatus.ps1 -ServiceName $serviceName -ExpectedStatus Running -TimeoutSeconds 60
+[pscustomobject]@{
+  ServiceName = $serviceName
+  StopElapsedSeconds = [math]::Round($stopElapsed, 2)
+  RestartedAt = (Get-Date).ToString('o')
+} | Format-List
+```
+
+Wait-ServiceStatus.ps1 可由项目提供，也可以在现场脚本中显式实现轮询；不能使用 Start-Sleep 固定数秒后就假定服务已就绪。
+
+### 58.7 系统关机和开机
+
+系统关机时应证明：
+
+- 服务收到关机或 pre-shutdown 通知；
+- 关键事务在允许时间内落盘；
+- 主机断电不会导致数据库主文件和 WAL 不可恢复；
+- 重新开机后，即使没有用户登录，SCM 也会自动启动服务；
+- UI 未启动时，媒体、推理、事件和通知仍继续运行。
+
+```powershell
+$beforeReboot = Get-Date
+Restart-Computer -Force
+# 机器重新上线后执行：
+$service = Get-Service FactoryGuardEngine
+$explorer = Get-Process explorer -ErrorAction SilentlyContinue
+$service | Select-Object Name, Status, StartType
+if ($service.Status -ne 'Running') { throw 'Service was not running after reboot' }
+if ($explorer) { throw 'This check must be run before interactive logon or with no persisted user session' }
+```
+
+实际无人登录验证可通过启动后远程管理计划任务或串口/远程事件采集完成；不要通过配置无密码自动登录来伪造“开机即用”。
+
+### 58.8 状态机不变量
+
+- 不允许从 START_PENDING 直接进入 STOPPED 后仍保留运行中子进程；
+- 不允许在 RUNNING 前向 UI 返回健康 green；
+- 不允许数据库迁移失败但服务继续使用未知格式；
+- 不允许 STOP_PENDING 中无限等待外部 Webhook；
+- 不允许 UI 关闭导致服务进入 STOPPED；
+- 不允许看门狗把正在启动但合法等待的服务误判为崩溃；
+- 不允许同一角色存在多个未托管的长期子进程；
+- 不允许 SCM 状态为 RUNNING 但内部心跳已经停止。
+
+这些不变量应转换为自动化测试，而不是仅靠代码评审记忆。
+
+### 58.9 服务状态机测试矩阵
+
+| 用例 | 注入 | 预期 |
+| --- | --- | --- |
+| 正常启动 | 冷启动服务 | START_PENDING 后进入 RUNNING，启动事件完整 |
+| 配置错误 | 配置缺少必要字段 | 启动失败，状态回到 STOPPED，错误码和修复建议可见 |
+| 数据库版本不符 | 修改 user_version | 服务不迁移、不写业务数据，报告版本不匹配 |
+| 正常停止 | Stop-Service | STOP_PENDING 后 STOPPED，无孤儿进程 |
+| 停止时外部通知慢 | Webhook 延迟 | 不无限等待，事件和 Outbox 已持久化 |
+| 系统重启 | Restart-Computer | 无人登录自动恢复 RUNNING |
+| 参数变更 | 触发配置重载 | 仅启用可热更新字段，需重启项明确提示 |
+| 心跳卡死 | 阻塞工作线程 | 看门狗发现并按恢复策略处理，SCM 最终恢复 RUNNING |
+| UI 关闭 | 结束 Qt UI | 服务保持 RUNNING，媒体和推理不停止 |
+
+每次发布至少保留 queryex、qc、qfailure、停止耗时、重启后无人登录和子进程清单五类证据。
+
+---
+
+## 59. 告警通知模板、值班升级和确认审计
+
+通知系统的目标不是“每条消息都发出去”这么简单，而是让正确的人在正确时间收到可理解、可执行、可追踪的信息，并在首次通知失败时按升级路径继续推动。通知内容、接收人、排班、去重和确认动作必须经过客户业务负责人确认。
+
+### 59.1 通知策略对象
+
+| 对象 | 字段 |
+| --- | --- |
+| EscalationPolicy | policy_id、site_id、severity、zone、schedule、stages、fallback、enabled |
+| OnCallSchedule | schedule_id、user_ref、role、start/end、holiday_calendar、delegate |
+| MessageTemplate | template_id、language、severity、title、body、fields、privacy_level |
+| NotificationAttempt | channel、recipient_ref、started_at、finished_at、result、provider_ref |
+| Acknowledgement | event_id、acknowledged_by、acknowledged_at、source、signature/session_ref |
+
+首版通知确认以本地 Qt 控制台中的已登录用户操作为准。短信回复、电话按键或外部 IM 回调若要作为确认，需要额外防重放、身份绑定和审计设计，不应在 v1 中默认启用。
+
+### 59.2 严重级别路由
+
+| 级别 | 典型事件 | 初始通道 | 升级建议 |
+| --- | --- | --- | --- |
+| critical | 非工作时间围墙入侵、危化品/配电房入侵、多人闯入 | Webhook + 电话/短信，0 秒发送 | 3 分钟未确认升级值班主管，10 分钟升级项目发起人 |
+| high | 仓库/装卸口夜间入侵、重点区域绊线 | Webhook + 短信，0–10 秒 | 5 分钟未确认升级主管 |
+| medium | 工作时间非授权区域进入、可疑逗留 | Webhook/桌面提醒 | 15 分钟未确认提醒值班员 |
+| low | 已抑制干扰、低置信度提示或重复提示 | 日报/桌面列表 | 不电话打扰，但进入趋势分析 |
+
+阈值和名称应可按客户组织调整，但必须保留“严重事件不能只进入无人查看的软件列表”的原则。
+
+### 59.3 升级策略 YAML
+
+```yaml
+escalation_policy:
+  id: perimeter-night-critical
+  site_id: FG-SITE-0001
+  timezone: Asia/Shanghai
+  applies_to:
+    severities: [critical]
+    zones: [perimeter, warehouse, electrical-room]
+    schedule: outside-business-hours
+  deduplication:
+    same_event_window_seconds: 300
+    include_updates: true
+    max_update_messages: 2
+  stages:
+    - name: duty-officer
+      wait_for_ack_seconds: 180
+      channels: [webhook, sms, phone_call]
+      recipients: [duty-officer-primary]
+    - name: shift-supervisor
+      wait_for_ack_seconds: 420
+      channels: [webhook, phone_call]
+      recipients: [shift-supervisor]
+    - name: site-sponsor
+      wait_for_ack_seconds: 0
+      channels: [phone_call, sms]
+      recipients: [site-sponsor]
+  failure_policy:
+    max_attempts: 8
+    dead_letter_after_minutes: 30
+    require_health_alert: true
+```
+
+### 59.4 消息模板字段
+
+通知消息至少包含：
+
+- 事件级别、事件名称和布防区域；
+- 厂区/站点和通道名称；
+- 发生时间，明确时区；
+- 触发规则和目标类型；
+- 处置入口或值班台位置；
+- 截图或片段链接（受权限控制）；
+- 事件编号，便于在系统中检索；
+- 需要值班员执行的下一步动作。
+
+不建议在普通通知中暴露完整 RTSP 地址、NVR 密码、人员面部特写、完整手机号或可无鉴权访问的截图链接。
+
+### 59.5 中文消息模板
+
+```yaml
+message_templates:
+  critical:
+    title: FactoryGuard 高危入侵告警
+    body: |
+      【FactoryGuard 高危入侵告警】
+      站点：{{site_name}}
+      区域：{{zone_name}} / {{channel_name}}
+      事件：{{rule_name}}
+      时间：{{occurred_at_local}}
+      目标：{{target_label}}，置信度 {{confidence_pct}}%
+      事件编号：{{event_id}}
+      请值班员立即查看画面并按预案处置；若并非本人值守，请立即转交当班负责人。
+    actions:
+      - open-event
+      - call-supervisor
+  high:
+    title: FactoryGuard 安全告警
+    body: |
+      【FactoryGuard 安全告警】{{rule_name}}
+      通道：{{channel_name}}
+      时间：{{occurred_at_local}}
+      事件编号：{{event_id}}
+      请在规定时间内确认；未确认将按升级策略通知主管。
+  medium:
+    title: FactoryGuard 待确认事件
+    body: "{{occurred_at_local}} {{channel_name}} 触发 {{rule_name}}，请在控制台查看。"
+```
+
+### 59.6 模板变量白名单
+
+为避免模板注入或过度暴露数据，模板渲染只允许读取批准变量：
+
+| 变量 | 允许内容 |
+| --- | --- |
+| site_name、zone_name、channel_name | 名称字段 |
+| rule_name、target_label | 规则和目标类型 |
+| occurred_at_local | 本地化发生时间 |
+| confidence_pct | 格式化后的置信度 |
+| event_id | 系统事件编号 |
+| console_url | 受控本地或授权门户地址 |
+| severity_text | 经本地化的级别文本 |
+
+不允许模板直接执行脚本、读取任意数据库字段、拼接 NVR 凭据或访问未脱敏 payload。模板解析失败应退回安全纯文本模板，而不是发送原始异常。
+
+### 59.7 通知可达性周测脚本
+
+```powershell
+$channels = @('webhook', 'sms', 'phone_call')
+$results = foreach ($channel in $channels) {
+  $startedAt = Get-Date
+  FactoryGuardCtl.exe notification test --channel $channel
+  $exitCode = $LASTEXITCODE
+  [pscustomobject]@{
+    Channel = $channel
+    StartedAt = $startedAt.ToString('o')
+    FinishedAt = (Get-Date).ToString('o')
+    ExitCode = $exitCode
+    Result = if ($exitCode -eq 0) { 'pass' } else { 'fail' }
+  }
+}
+
+$results | Format-Table -AutoSize
+$results | Export-Csv -NoTypeInformation -Encoding UTF8 '.\notification-test.csv'
+if ($results.Result -contains 'fail') {
+  throw 'One or more notification channels failed'
+}
+```
+
+### 59.8 去重、合并和更新
+
+同一人员在冷却期内持续触发规则时，通知策略应避免短信/电话轰炸：
+
+- 首次消息包含事件编号和关键信息；
+- 冷却期内只更新 dedup_count、last_occurred_at；
+- 可按策略发送最多 1–2 条状态更新，例如“目标仍在区域内”；
+- 目标离开或事件关闭时是否通知，由客户制度决定；
+- 不同规则或不同通道产生的事件不得仅因时间接近而错误合并；
+- critical 事件的去重不能延迟初始通知。
+
+### 59.9 值班表和例外
+
+值班表必须支持：
+
+- 日常轮班、周末、节假日和临时调班；
+- 主接收人不可用时的代理人；
+- 员工离职后自动或审批式停用；
+- 通知号码变更需二次确认；
+- 通知测试和实际升级使用同一份接收人清单；
+- 客户可导出当前值班表并签字。
+
+如果值班表为空或只有一个长期不变的接收人，系统应在部署验收中提示组织风险。技术系统可以重试通知，但不能替代客户建立值班制度。
+
+### 59.10 确认审计字段
+
+| 字段 | 要求 |
+| --- | --- |
+| event_id | 与事件主记录一致 |
+| acknowledged_by | 用户 ID 和显示名称 |
+| acknowledged_at | 服务端时间，不使用客户端自报时间 |
+| source | qt-ui、web-api、system-job 等 |
+| channel_ref | 哪条通知触达后确认，如可取得 |
+| session_id | UI/IPC 会话标识 |
+| result | success、denied、failure |
+| detail | 备注和脱敏上下文 |
+
+通知已发送、通知已送达、人员已查看、事件已确认是四个不同状态，不能混为一个“已处理”。每次确认和关闭都必须写审计日志。
+
+### 59.11 通知失败矩阵
+
+| 故障 | 现象 | 处理 |
+| --- | --- | --- |
+| Webhook 5xx | 提供方暂时不可用 | 指数退避重试，达到阈值转备用渠道 |
+| DNS 失败 | 域名无法解析 | 保留 Outbox，告警网络/DNS，恢复后补发 |
+| 短信余额不足 | 供应商拒绝 | 立即通知管理员，转电话/备用渠道 |
+| 电话无人接听 | 呼叫完成但无确认 | 按等待时间升级下一接收人 |
+| 接收人离职 | 号码失效或长期无响应 | 停用并要求客户更新值班表 |
+| 重复回执 | 提供方回调重复 | 以 attempt_id 和事件事务幂等处理 |
+| 时间戳异常 | 服务端时间错误 | 使用服务端接收时间记录，不重写事件 occurred_at |
+| 客户点了误报 | 事件关闭为 false_positive | 进入误报治理，不删除事件记录 |
+
+### 59.12 通知验收标准
+
+- critical 初始通知失败时必须自动走备用渠道；
+- 所有通知任务来源于事件同事务创建的 Outbox；
+- 重试次数、最后错误和送达回执可查询；
+- 未确认升级的等待时间与策略一致；
+- 值班员能根据消息在系统中准确定位事件；
+- 通知中不含敏感凭据和未授权外链；
+- 通知失败不会阻塞检测服务主循环；
+- 通知报告和审计日志可导出。
+
+---
+
+## 60. 备份加密、密钥托管、异地副本和隔离恢复
+
+SQLite 在线备份只能证明生成了一个数据库副本，不能证明副本保密、可恢复或不会被勒索软件一起加密。FactoryGuard 应建立“在线备份—离线/异地副本—加密—密钥托管—隔离恢复—周期演练”的完整闭环，并明确哪些数据受 BitLocker 保护，哪些数据需要单独文件级加密。
+
+### 60.1 备份对象和分级
+
+| 对象 | 是否备份 | 风险 |
+| --- | --- | --- |
+| SQLite 数据库 | 必须 | 事件、规则、审计和系统配置丢失 |
+| 配置文件 | 必须，需脱敏或加密 | 恢复后无法重建通道、规则和通知策略 |
+| 模型文件 | 按版本保存或记录可信来源哈希 | 只恢复数据库但模型不匹配 |
+| 安装包清单 | 必须记录版本、签名和哈希 | 无法恢复相同二进制 |
+| 截图/片段 | 按保留策略备份关键事件 | 普通媒体量大，需分层 |
+| 凭据明文 | 绝不写入备份 | 泄露 NVR/通知渠道密钥 |
+| 崩溃转储 | 可选，可能含敏感内存 | 应加密并限制访问 |
+
+备份目录不得与数据库主目录放在同一磁盘单点。若客户暂不提供异地存储，应在交付文件中写明单点风险和补建计划。
+
+### 60.2 备份策略 YAML
+
+```yaml
+backup_policy:
+  id: standard-single-site
+  site_id: FG-SITE-0001
+  timezone: Asia/Shanghai
+  schedule:
+    sqlite_online: daily 02:00
+    config_export: daily 02:05
+    weekly_full_package: Sunday 02:15
+  destinations:
+    - type: local-disk
+      path: D:\FactoryGuardBackups
+      encryption: file-level
+      immutable: false
+    - type: nas-share
+      path: \\backup.example.local\FactoryGuard
+      encryption: transit-and-resting
+      immutable_snapshot_days: 30
+    - type: offline-usb
+      custody: sealed-bag
+      rotation: weekly
+  retention:
+    daily: 14
+    weekly: 12
+    monthly: 12
+    legal_hold_override: true
+  restore:
+    sandbox_directory: C:\FactoryGuardRestoreSandbox
+    require_integrity_check: true
+    require_foreign_key_check: true
+    require_config_validation: true
+    malware_scan_before_import: true
+```
+
+### 60.3 BitLocker 与文件级加密的边界
+
+- BitLocker 主要保护磁盘丢失或被取出后的静态数据，不适合作为同一台机器上普通用户访问控制的唯一手段；
+- 备份到 NAS、U 盘或异地介质时，应使用经过批准的文件级加密容器或客户备份系统的加密能力；
+- 数据库备份即使放在已启用 BitLocker 的磁盘上，复制到其他系统后仍可能暴露内容；
+- 加密密码不能与备份文件放在同一目录，也不能写在自动化脚本中；
+- Windows EFS 依赖证书和用户上下文，恢复复杂；若使用必须备份证书并明确托管流程；
+- 第三方压缩或加密工具必须固定版本、验证哈希并纳入供应链清单。
+
+### 60.4 密钥托管原则
+
+| 密钥类型 | 托管建议 |
+| --- | --- |
+| 备份加密口令 | 不允许单人独占；可使用密封信封 + 两名授权人或客户密码管理系统 |
+| BitLocker 恢复密钥 | 保存到客户批准的密码库、AD/AAD 或受控密钥台账，普通现场人员不得持有明文 |
+| NVR/通知渠道 secret | 通过 DPAPI 或客户密钥系统保护，备份中只保存 secret_ref |
+| 代码签名证书 | 与运行环境隔离，私钥不存放在实施 U 盘或日常办公电脑 |
+| 远程支持凭据 | 单次会话或短期授权，结束后停用/轮换 |
+
+紧急恢复必须能回答：谁持有密钥、如何验证身份、谁批准开封、开封后是否轮换、证据如何记录。
+
+### 60.5 备份创建和验证命令
+
+```powershell
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$backupPath = Join-Path $env:ProgramData "FactoryGuard\backups\$stamp"
+New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+
+FactoryGuardCtl.exe backup create --output $backupPath --encrypt --include-config
+if ($LASTEXITCODE -ne 0) { throw 'Backup creation failed' }
+
+FactoryGuardCtl.exe backup verify --path $backupPath
+if ($LASTEXITCODE -ne 0) { throw 'Backup verification failed' }
+
+$files = Get-ChildItem -Path $backupPath -File | ForEach-Object {
+  $hash = Get-FileHash -Path $_.FullName -Algorithm SHA256
+  [pscustomobject]@{
+    path = $_.Name
+    bytes = $_.Length
+    sha256 = $hash.Hash
+  }
+}
+
+[pscustomobject]@{
+  backupVersion = '1.0'
+  createdAt = (Get-Date).ToString('o')
+  host = $env:COMPUTERNAME
+  files = $files
+} | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 (Join-Path $backupPath 'backup-manifest.json')
+```
+
+### 60.6 备份 Manifest 示例
+
+```json
+{
+  "backupVersion": "1.0",
+  "siteId": "FG-SITE-0001",
+  "createdAt": "2026-10-07T02:00:00+08:00",
+  "productVersion": "1.0.0",
+  "databaseVersion": 16,
+  "encryption": {
+    "algorithm": "approved-file-container",
+    "keyId": "backup-key-2026-q4",
+    "kdf": "approved-kdf"
+  },
+  "files": [
+    { "path": "factoryguard.db.bak", "bytes": 104857600, "sha256": "示例哈希" },
+    { "path": "config-redacted.yaml", "bytes": 8192, "sha256": "示例哈希" }
+  ],
+  "legalHold": false
+}
+```
+
+Manifest 不保存明文口令或可逆恢复的密钥材料；keyId 只用于找到已批准的托管记录。
+
+### 60.7 异地副本和离线轮换
+
+建议至少形成三类位置：
+
+1. 本机或值守电脑附加磁盘，用于短期快速恢复；
+2. 客户 NAS/备份服务器，用于站点级故障恢复；
+3. 离线 USB、离线存储或不可变快照，用于降低勒索软件同时破坏所有副本的风险。
+
+离线介质应编号、密封、签字、记录交接日期；取回和重新封存都要登记。介质中不得包含其他客户数据或无关联的个人文件。
+
+### 60.8 隔离恢复流程
+
+恢复演练不得直接覆盖生产数据库：
+
+1. 将备份复制到隔离沙箱目录；
+2. 检查文件哈希和备份 Manifest；
+3. 使用托管流程取得解密授权；
+4. 解密到沙箱，不把密码写入日志；
+5. 执行只读 integrity_check、foreign_key_check 和 user_version 检查；
+6. 用配置校验工具检查通道、规则和通知策略；
+7. 在只读或隔离服务实例中抽样查询事件和审计；
+8. 记录 RTO/RPO、发现的问题和是否可用于生产恢复；
+9. 演练结束后安全删除沙箱中的敏感文件或继续加密保存。
+
+```powershell
+$backupPath = 'D:\FactoryGuardBackups\latest'
+$sandbox = 'C:\FactoryGuardRestoreSandbox'
+New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
+
+FactoryGuardCtl.exe backup restore --path $backupPath --sandbox $sandbox --read-only-check
+if ($LASTEXITCODE -ne 0) { throw 'Sandbox restore failed' }
+
+FactoryGuardCtl.exe database verify --path (Join-Path $sandbox 'factoryguard.db')
+FactoryGuardCtl.exe config validate --path (Join-Path $sandbox 'FactoryGuard.yaml')
+```
+
+### 60.9 备份失败矩阵
+
+| 故障 | 风险 | 处理 |
+| --- | --- | --- |
+| 备份时数据库繁忙 | 备份不一致或超时 | 在线备份 API + busy_timeout，长事务排查 |
+| 目标磁盘满 | 备份失败、旧副本可能被截断 | 先写临时文件，完成后原子替换，保留上一版本 |
+| 密钥丢失 | 备份不可恢复 | 密钥托管和开封演练，禁止单人保管 |
+| 备份被勒索加密 | 所有在线副本失效 | 离线/不可变副本和隔离恢复 |
+| 恢复版本不匹配 | 旧程序无法读新格式 | 保存安装包和版本兼容矩阵 |
+| 配置含明文密钥 | 备份泄露 | 自动脱敏或加密，发布前扫描 |
+| NAS 权限过宽 | 备份被读取或篡改 | 最小 ACL、传输保护和哈希验证 |
+| 恢复演练未执行 | “可恢复”无证据 | 月度抽查、季度演练作为发布/续费门禁 |
+
+### 60.10 备份恢复验收
+
+- 最近一次在线备份在计划时间成功；
+- 备份文件哈希、Manifest 和加密 keyId 完整；
+- 至少一份副本不在主数据库同一磁盘；
+- 高等级站点具备离线或不可变副本；
+- 密钥托管记录能在演练中找到授权人；
+- 沙箱恢复后 integrity_check=ok、外键检查无异常；
+- 配置校验通过且无明文密码；
+- 恢复时间、丢失窗口和操作人员被记录；
+- 开封或暴露过的密钥按策略轮换。
+
+没有恢复演练证据的备份，只能称为“已生成副本”，不能称为“可恢复备份”。
+
+---
+
+## 61. 需求—测试—证据追踪矩阵与发布授权包
+
+立项报告中的每条可靠性要求都必须能追溯到实现约束、测试方法、证据文件和责任人。否则报告再厚，也可能只是承诺列表。FactoryGuard 应建立统一 Traceability ID，并在开发、测试、安装、试点和发布审批中复用。
+
+### 61.1 追踪对象
+
+| 对象 | 标识前缀 | 示例 |
+| --- | --- | --- |
+| 可靠性需求 | REL | REL-SVC-001 服务必须无人登录自启 |
+| 架构约束 | ARCH | ARCH-PROC-002 UI 关闭不得影响检测 |
+| 测试用例 | TC | TC-SVC-004 重启后验证 RUNNING |
+| 故障注入 | FI | FI-MEDIA-002 杀死 FFmpeg |
+| 证据项 | EVD | EVD-SVC-queryex |
+| 配置/策略项 | CFG | CFG-PIPE-ACL |
+| 已知风险/例外 | RISK | RISK-NO-OFFSITE-BACKUP |
+
+同一个需求在立项、开发、测试、交付和月报中应使用相同编号，避免每个阶段另起名称。
+
+### 61.2 核心追踪矩阵
+
+| Trace ID | 要求 | 测试/证据 | 责任方 | 发布门禁 |
+| --- | --- | --- | --- | --- |
+| REL-SVC-001 | 系统开机后无人登录自动启动核心检测 | 重启演练、sc queryex、事件日志 | 开发/实施 | 必须 |
+| REL-SVC-002 | 初始化未完成不得报告 RUNNING | 启动延迟注入、状态机测试 | 开发/测试 | 必须 |
+| REL-SVC-003 | SCM 失败恢复动作有效 | sc qfailure、杀进程恢复 | 实施/测试 | 必须 |
+| REL-PROC-001 | Engine/Inference/Media/UI 进程隔离 | 进程清单、Job Object 证据 | 开发 | 必须 |
+| REL-PROC-002 | UI 关闭不影响检测和通知 | 关闭 UI 后合成事件 | 测试/客户 | 必须 |
+| REL-JOB-001 | 子进程异常退出后无孤儿 | taskkill、进程轮询 | 开发/测试 | 必须 |
+| REL-MEDIA-001 | RTSP over TCP 长稳拉流 | 10 分钟接入和 72 小时长稳 | 测试/实施 | 必须 |
+| REL-MEDIA-002 | FFmpeg 崩溃后自动恢复 | FI-MEDIA-001、错误码和重启计数 | 开发/测试 | 必须 |
+| REL-MEDIA-003 | 花屏/断流可被识别 | stderr 样本、健康指标 | 开发/测试 | 必须 |
+| REL-AI-001 | 模型版本、哈希、指标可追踪 | 模型注册表、模型文件哈希 | 算法/测试 | 必须 |
+| REL-AI-002 | 误报反馈进入复核闭环 | 误报样本、复核记录 | 产品/算法 | 试点必须 |
+| REL-DB-001 | 事件与 Outbox 同事务 | 崩溃点注入、数据库检查 | 开发/测试 | 必须 |
+| REL-DB-002 | 数据库完整性可验证 | integrity_check、foreign_key_check | 开发/实施 | 必须 |
+| REL-DB-003 | 迁移版本和校验和可追踪 | schema_migrations、user_version | 开发 | 必须 |
+| REL-BACKUP-001 | 备份必须可恢复 | 沙箱恢复演练 | 实施/客户 | 上线必须 |
+| REL-BACKUP-002 | 备份密钥不单人失控 | 密钥托管开封演练 | 客户/实施 | 高等级必须 |
+| REL-SEC-001 | 命名管道 ACL 最小化 | SDDL、低权限连接尝试 | 开发/安全 | 必须 |
+| REL-SEC-002 | Defender/防火墙不被随意关闭 | 基线漂移报告 | 客户 IT/实施 | 必须 |
+| REL-SEC-003 | 安装包和二进制签名有效 | Get-AuthenticodeSignature | 发布经理 | 必须 |
+| REL-OBS-001 | 健康评分和关键指标可见 | 健康日报、事件日志 | 开发/实施 | 必须 |
+| REL-OBS-002 | 崩溃产生 dump 和事件 | dump 注入、WER 配置 | 开发/测试 | 必须 |
+| REL-CHG-001 | 升级失败可回滚 | 一键回滚演练 | 发布/实施 | 必须 |
+| REL-CHG-002 | 配置漂移可见且分级 | 基线对比、漂移 JSON | 实施/客户 IT | 上线必须 |
+| REL-OP-001 | 值班员完成培训和考核 | 培训签到、实操成绩 | 客户/实施 | 上线必须 |
+| REL-OP-002 | 关键通知未确认会升级 | 通知测试、升级时间线 | 客户/测试 | 必须 |
+| REL-HW-001 | UPS/供电满足安全策略 | UPS 测试、负载率记录 | 客户/电工 | 必须 |
+| REL-HW-002 | 备件和冷备可用 | 冷备切换演练 | 客户/实施 | 高等级必须 |
+
+### 61.3 证据关联要求
+
+每个证据文件都应能回答：
+
+- 证明哪个 Trace ID；
+- 由哪个版本构建产生；
+- 在什么站点、机器和时间采集；
+- 命令是什么，输出是否完整；
+- 谁执行、谁复核；
+- 是否通过；失败项是否关联缺陷和变更单；
+- 文件哈希是多少，是否已经脱敏。
+
+证据不要求都手工整理；应优先由 FactoryGuardDiagnostics 自动生成 Manifest。人工签字页可扫描或拍照，但文件命名必须能关联到站点和日期。
+
+### 61.4 发布授权 Dossier 目录
+
+| 路径 | 内容 |
+| --- | --- |
+| release-manifest.json | 版本、提交、制品哈希、SBOM 和发布时间 |
+| requirements-traceability.csv | 需求、测试、证据、责任人和门禁状态 |
+| test-summary/ | 单元、集成、PowerShell/YAML/SQL 校验摘要 |
+| soak/ | 72 小时长稳报告、健康 CSV、故障注入记录 |
+| security/ | 签名、SBOM、管道 ACL、安全基线结果 |
+| migration/ | 迁移脚本、校验和、备份和回退方案 |
+| deployment/ | Run Sheet、客户准备项、Go/No-Go 记录 |
+| pilot/ | 30 天试点结论、误报和客户反馈 |
+| exceptions/ | 已接受风险、责任人和到期日期 |
+| signoff/ | 发布经理、开发、测试、实施、客户授权记录 |
+
+### 61.5 发布授权 JSON
+
+```json
+{
+  "releaseDecision": "go",
+  "product": "FactoryGuard",
+  "version": "1.0.0",
+  "releaseType": "stable",
+  "commit": "example",
+  "semverCompliant": true,
+  "artifacts": [
+    { "name": "FactoryGuard-Setup.exe", "sha256": "示例", "signature": "valid" },
+    { "name": "FactoryGuard-Setup.exe.blockmap", "sha256": "示例", "signature": "not-applicable" }
+  ],
+  "gates": {
+    "requirementsTraceability": "pass",
+    "unitAndIntegrationTests": "pass",
+    "embeddedExamples": "pass",
+    "seventyTwoHourSoak": "pass",
+    "securityReview": "pass",
+    "migrationAndRollback": "pass",
+    "pilotReview": "pass"
+  },
+  "acceptedExceptions": [],
+  "approvals": {
+    "engineering": "approved",
+    "quality": "approved",
+    "security": "approved",
+    "implementation": "approved",
+    "releaseManager": "approved"
+  }
+}
+```
+
+### 61.6 Dossier 自动校验脚本
+
+```powershell
+param(
+  [Parameter(Mandatory = $true)]
+  [string]$DossierPath
+)
+
+$ErrorActionPreference = 'Stop'
+$manifestPath = Join-Path $DossierPath 'release-manifest.json'
+$manifest = Get-Content -Raw -Encoding UTF8 $manifestPath | ConvertFrom-Json
+$failures = @()
+
+if ($manifest.releaseDecision -ne 'go') {
+  $failures += 'Release decision is not go'
+}
+
+foreach ($gate in $manifest.gates.PSObject.Properties) {
+  if ($gate.Value -ne 'pass') {
+    $failures += "Gate did not pass: $($gate.Name) = $($gate.Value)"
+  }
+}
+
+foreach ($artifact in $manifest.artifacts) {
+  $candidate = Join-Path $DossierPath $artifact.name
+  if (-not (Test-Path $candidate)) {
+    $failures += "Missing artifact: $($artifact.name)"
+    continue
+  }
+
+  $hash = Get-FileHash -Path $candidate -Algorithm SHA256
+  if ($artifact.sha256 -ne '示例' -and $hash.Hash -ne $artifact.sha256) {
+    $failures += "Artifact hash mismatch: $($artifact.name)"
+  }
+}
+
+if ($failures.Count -gt 0) {
+  $failures
+  throw 'Release dossier verification failed'
+}
+
+'Release dossier verification passed'
+```
+
+### 61.7 例外和风险接受
+
+任何无法在发布前关闭但仍决定上线的事项，都必须进入 exceptions：
+
+| 字段 | 要求 |
+| --- | --- |
+| risk_id | 稳定编号 |
+| description | 清晰描述影响范围 |
+| severity | low/medium/high/critical |
+| mitigation | 临时控制措施 |
+| owner | 客户或内部责任人 |
+| due_date | 关闭日期 |
+| approver | 有权接受风险的人 |
+| evidence | 审批记录和沟通证据 |
+
+critical 可靠性门禁不得作为例外跳过，例如无人登录不能自启、数据库损坏、关键二进制无签名、升级无法回滚。接受例外的默认前提是不影响核心检测安全。
+
+### 61.8 Stop-Work（停止上线）权限
+
+以下角色都应能触发暂停：
+
+- 发布经理：发现门禁证据不完整；
+- 开发负责人：发现版本或迁移存在高危缺陷；
+- 测试负责人：长稳或故障注入未通过；
+- 安全负责人：发现凭据、签名、ACL 或供应链风险；
+- 实施负责人：客户现场不具备施工准入；
+- 客户项目发起人：业务规则、值班或授权未确认。
+
+触发 Stop-Work 后应保留已采集证据，明确重新评审时间。Stop-Work 不是追责工具，而是防止不可靠版本进入生产。
+
+### 61.9 试点到正式发布的证据链
+
+30 天试点结束时，应至少汇总：
+
+- 通道在线率和媒体重连次数；
+- 真阳性、误报、漏报反馈及趋势；
+- 通知成功率、未确认升级和值班响应时间；
+- 数据库、备份和回滚演练结果；
+- 配置漂移、Windows 更新、Defender/防火墙情况；
+- 培训、人员变更和遗留问题；
+- 客户是否同意进入正式运行；
+- 若延期，阻断项、负责人和下一次评审日期。
+
+### 61.10 追踪矩阵验收
+
+- 所有核心可靠性需求均有唯一 Trace ID；
+- 每个 Must 需求至少有一个测试和一个证据；
+- 证据文件哈希进入 Manifest；
+- 失败测试关联缺陷和修复版本；
+- 已接受风险有责任人和截止日期；
+- critical 门禁不允许例外；
+- 发布 Dossier 可由独立人员复核；
+- 客户签字的规则、培训、部署和试点结论可追溯。
+
+报告中的“可靠”只有在这个闭环中才可被验证；否则只能视为目标陈述。
+
+---
+
+## 62. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 58.1 平台与可靠性资料
+### 62.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -5430,6 +6234,10 @@ NVR 始终保持连续录像，FactoryGuard 升级不应要求停止 NVR 或改�
 | NIST SP 800-53 Rev.5 Security and Privacy Controls | 维护、审计、访问控制和应急控制族参考 |
 | NIST SP 800-61 Rev.2 Incident Handling Guide | 安全事件响应、证据保全和复盘参考 |
 | smartmontools project | SMART 字段、存储健康检查和寿命预警参考 |
+| Microsoft Learn：SetServiceStatus / SERVICE_STATUS | 服务状态、checkpoint、wait hint 和状态机报告契约 |
+| Microsoft Learn：Service Control Handler / RegisterServiceCtrlHandlerEx | 停止、关机、电源、会话和参数变化控制处理 |
+| Microsoft Learn：ServiceMain | SCM 启动入口、初始化和服务主线程职责 |
+| Microsoft Learn：BitLocker overview | 磁盘静态加密、恢复密钥和备份介质保护边界 |
 | RFC 5905 Network Time Protocol Version 4 | NTP 时间同步、时间源、偏差和时钟治理参考 |
 | RFC 3550 RTP: A Transport Protocol for Real-Time Applications | RTP 时间戳、实时媒体传输和帧时序诊断参考 |
 | Microsoft Learn：Get-FileHash | 文件 SHA256、证据导出和完整性校验参考 |
@@ -5484,6 +6292,12 @@ NVR 始终保持连续录像，FactoryGuard 升级不应要求停止 NVR 或改�
 - https://csrc.nist.gov/pubs/sp/800/86/final
 - https://www.isa.org/standards-and-publications/isa-standards/isa-iec-62443-series-of-standards
 - https://learn.microsoft.com/en-us/windows/security/identity-protection/access-control/service-accounts
+- https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-setservicestatus
+- https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_status
+- https://learn.microsoft.com/en-us/windows/win32/services/service-control-handler-function
+- https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-registerservicectrlhandlerexw
+- https://learn.microsoft.com/en-us/windows/win32/services/service-servicemain-function
+- https://learn.microsoft.com/en-us/windows/security/operating-system-security/data-protection/bitlocker/
 - https://learn.microsoft.com/en-us/powershell/module/defender/add-mppreference
 - https://learn.microsoft.com/en-us/microsoft-365/security/defender-endpoint/configure-exclusions-microsoft-defender-antivirus
 - https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule
@@ -5560,3 +6374,8 @@ NVR 始终保持连续录像，FactoryGuard 升级不应要求停止 NVR 或改�
 - **配置漂移**：当前系统状态与已批准基线不一致且没有对应变更记录；
 - **冷备主机**：预先安装、验证并封存，可在生产主机故障时按流程启用的备用主机；
 - **72 小时长稳**：在标准负载和计划故障注入下连续运行 72 小时的 RC 发布门禁。
+- **服务状态机**：FactoryGuard 与 Windows SCM 约定的启动、运行、停止、关机和失败恢复状态转换；
+- **值班升级**：初始通知未确认或失败时，按策略通知更高层级或备用接收人的机制；
+- **密钥托管**：对备份、BitLocker 和恢复所需密钥进行授权、密封、开封、轮换和审计的流程；
+- **发布授权包**：汇总版本、测试、证据、风险例外和审批结论，用于判断是否允许发布或上线；
+- **追踪矩阵**：把需求、测试、故障注入、证据、责任方和发布门禁关联起来的矩阵。
