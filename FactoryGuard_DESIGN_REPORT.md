@@ -1,8 +1,8 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v2.8
+> 文档版本：v2.9
 > 成文日期：2026-10-07
-> 文档状态：立项稿（主机资源治理、网络链路、RTSP 会话与启动就绪增强版）
+> 文档状态：立项稿（日志证据、主机资源、网络链路与启动就绪增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
 > v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
@@ -14,6 +14,7 @@
 > v2.6 增补：数据盘身份、GPT/NTFS、簇大小、分区对齐、盘符持久化、容量边界，以及服务依赖最小化、启动顺序、就绪确认和冷启动竞态治理。
 > v2.7 增补：网卡/VLAN/MTU/交换机端口治理、网络质量连续指标、RTSP/ONVIF 会话状态机、认证锁定、重连退避、Keepalive 和媒体新鲜度检测。
 > v2.8 增补：CPU/内存/提交量/句柄/线程/磁盘 I/O/GPU 连续监测、资源预算、Job Object 硬限制、泄漏判定、资源降级和故障注入。
+> v2.9 增补：结构化 JSONL、序列号、日志背压、审计写入、日志滚动、脱敏、诊断包 manifest、证据哈希和导出失败演练。
 
 ---
 
@@ -1300,36 +1301,34 @@ ffmpeg
 ### 25.1 标准目录布局
 
 ```text
-C:\ProgramData\FactoryGuard
+V:\FactoryGuard
 ├── db\
 │   ├── factoryguard.db
 │   ├── factoryguard.db-wal
 │   └── factoryguard.db-shm
 ├── models\
-├── snapshots\YYYY\MM\DD\
-├── clips\YYYY\MM\DD\
-├── segments\event-id\
-├── tmp\
+├── media\
+│   ├── snapshots\YYYY\MM\DD\
+│   └── clips\YYYY\MM\DD\
+├── spool\
 │   ├── events\event-id\
 │   └── install\transaction-id\
 ├── logs\
 │   ├── service\
 │   ├── engine\
-│   ├── installer\
-│   └── diagnostics\
-├── backups\
-│   ├── db\
-│   ├── config\
-│   └── rollback\
+│   ├── inference\
+│   └── media\
+├── exports\
 ├── diagnostics\
 │   └── bags\YYYY-MM-DD\
 ├── reports\
 │   ├── daily\
 │   └── weekly\
+├── backups-local\
 └── quarantine\
 ```
 
-安装目录只放签名二进制和只读资源；所有可变数据必须写入 ProgramData。用户级缓存写入 LocalAppData，不能让不同用户共享缓存中的敏感画面。
+安装目录只放签名二进制和只读资源；活跃业务数据必须写入独立固定数据盘。系统盘只保留有界 bootstrap 日志和少量安装基础信息；用户级缓存写入 LocalAppData，不能让不同用户共享缓存中的敏感画面。
 
 ### 25.2 文件状态机
 
@@ -9194,9 +9193,387 @@ $processors = Get-CimInstance Win32_Processor |
 
 ---
 
-## 77. 数据盘初始化、盘符持久化与文件系统验收
+## 77. 日志可靠性、诊断证据链与脱敏导出
 
-### 77.1 为什么数据盘必须作为可靠性对象治理
+### 77.1 日志必须先于故障发生而可靠
+
+FactoryGuard 的可靠性不能仅依赖进程退出码。很多关键故障不会立刻产生崩溃，例如 RTSP 静默无帧、GPU 首次成功后连续超时、SQLite WAL 锁等待、配置重载后对象未释放、交换机端口错误计数缓慢增长。若日志系统本身可能丢行、阻塞、泄密或滚动失败，故障发生后就无法回答：
+
+- 第一个异常从什么时间、哪个进程、哪个通道开始；
+- 系统是否执行了降级、熔断、重启或补偿；
+- 旧进程何时退出、新进程何时启动，二者是否重叠；
+- 事件时间戳、PTS、本地接收时间和 trace_id 是否连续；
+- 恢复动作是否真正成功，还是只是界面被刷新成“正常”；
+- 证据包是否完整、未被篡改且已完成脱敏。
+
+因此，v1.0 将日志视为独立可靠性子系统：日志写入必须有 schema、序列号、容量上限、失败降级、脱敏和校验；诊断包必须能离线阅读，并通过 manifest 证明文件完整性。
+
+### 77.2 日志分层和标准位置
+
+活跃业务日志写入独立固定数据盘，不与程序目录混用；系统启动极早期、数据盘尚未完成身份确认前，只能在系统盘保留有界 bootstrap 日志，数据盘可用后进行索引关联。
+
+| 日志 | 标准位置 | 内容 | 留存基线 |
+| --- | --- | --- | --- |
+| Bootstrap | C:\ProgramData\FactoryGuard\bootstrap-logs\ | SCM 启动、配置最小读取、数据盘身份确认前事件 | 7 天，硬上限，例如 100 MB |
+| Service | V:\FactoryGuard\logs\service\ | ServiceMain、SCM 控制、启动/停止、服务状态机 | 90～180 天 |
+| Engine | V:\FactoryGuard\logs\engine\ | 通道调度、Job Object、帧队列、进程恢复 | 90 天 |
+| Inference | V:\FactoryGuard\logs\inference\ | 模型加载、GPU/CPU、推理耗时、张量错误 | 90～180 天 |
+| Media | V:\FactoryGuard\logs\media\ | FFmpeg、RTSP、PTS、stderr、帧新鲜度 | 90 天 |
+| Audit | V:\FactoryGuard\logs\audit\ | 登录、配置修改、规则修改、证据导出、权限变化 | 至少 1 年或按客户制度 |
+| Installer | V:\FactoryGuard\logs\installer\ | 安装、升级、迁移、回滚、卸载 | 至少 1 年 |
+| UI | 当前用户 LocalAppData | UI 渲染、页面错误、本地缓存和用户会话问题 | 30～90 天 |
+| Diagnostics | V:\FactoryGuard\diagnostics\bags\ | 一键诊断包和导出索引 | 最近 20 个或按合同 |
+
+原则：
+
+1. 审计日志和安全事件不能只写普通文本文件，还必须进入 SQLite 审计表；
+2. bootstrap 日志只承载启动早期待恢复证据，不承载截图、片段、模型或数据库；
+3. UI 日志不保存视频帧、凭据或其他用户可随意修改的运行状态；
+4. 数据盘不可用时，核心服务不能把活跃数据库和媒体切换到系统盘，只能保留有界 bootstrap 证据；
+5. 日志目录 ACL 应只允许 SYSTEM、管理员和 FactoryGuard 服务账户访问。
+
+### 77.3 结构化日志 Schema
+
+普通运行日志采用 UTF-8 JSON Lines：一行一个 JSON 对象，行尾使用 LF；文件不得依赖 BOM 才能解析。每条日志必须包含：
+
+| 字段 | 类型 | 必填 | 用途 |
+| --- | --- | --- | --- |
+| ts | string | 是 | 本地 ISO 8601 时间戳，带时区 |
+| monotonic_ms | number | 是 | 进程启动后的单调时钟毫秒值，用于识别系统时间跳变 |
+| seq | number | 是 | 单进程、单日志流内严格递增序列号 |
+| level | string | 是 | debug、info、warning、error、critical |
+| logger | string | 是 | service、engine、inference、media、audit、installer |
+| process_role | string | 是 | 产生日志的进程角色 |
+| pid | number | 是 | Windows 进程 ID |
+| event | string | 是 | 稳定事件名，使用小写下划线 |
+| stable_code | string | 条件必填 | 异常或恢复事件必须包含稳定错误码 |
+| trace_id | string | 条件必填 | 跨模块链路事件必须携带 |
+| channel_id | string | 条件必填 | 通道相关事件必须携带 |
+| state_before / state_after | string | 条件必填 | 状态迁移时必须携带 |
+| duration_ms | number | 否 | 操作耗时 |
+| detail | object | 否 | 脱敏后的上下文 |
+
+示例：
+
+```json
+{"ts":"2026-10-07T12:10:00+08:00","monotonic_ms":845231,"seq":1842,"level":"warning","logger":"media","process_role":"media-worker","pid":2310,"event":"rtsp_frame_stale","stable_code":"FG-MEDIA-1204","trace_id":"trace-20261007-000831","channel_id":"ch-001","state_before":"Playing","state_after":"Frozen","duration_ms":8012,"detail":{"stale_seconds":8,"reconnect_attempt":2}}
+```
+
+日志对象应保持扁平、小体积；大对象只放引用 ID，不把完整图片、模型张量或长堆栈塞进每一行。堆栈可作为单独字段，但必须限制长度并去除路径中的用户名。
+
+### 77.4 写入路径、背压和失败降级
+
+日志写入不能阻塞核心检测线程，也不能无限制占用内存。建议路径：
+
+1. 业务线程生成不可变日志事件；
+2. 进入有界日志队列，队列以条数和字节数双重限制；
+3. 后台 writer 批量写入当前 JSONL 文件；
+4. 普通日志按策略 Flush；审计、安全和关键状态迁移事件必须显式持久化；
+5. 写入结果更新序列号和落盘偏移；
+6. 失败时进入日志降级模式并输出 Windows Event Log 告警。
+
+队列满时不能让业务线程无限等待。处理顺序：
+
+- 优先保留 audit、critical、服务状态迁移、核心检测和事件事务日志；
+- 丢弃或采样 debug、性能明细、重复心跳和非关键 UI 事件；
+- 被丢弃的日志必须计数，不能假装全部写入；
+- 连续写入失败时，日志子系统应产生独立故障状态；
+- 磁盘恢复后，不尝试补发所有被丢弃的普通日志，只补送审计和关键状态摘要。
+
+审计事件如果无法持久化，应阻止对应的高风险配置变更生效。例如修改规则、导出证据、更改账户和清除事件等操作，在审计写入失败时必须回滚操作。
+
+### 77.5 序列号、缺口和时钟异常
+
+每个进程的每类日志流维护独立 seq。seq 可用于发现：
+
+- 日志行被外部删除；
+- writer 写入失败但业务继续；
+- 文件滚动时丢失边界记录；
+- 进程异常重启造成新旧日志混读；
+- 磁盘扇区或文件系统异常导致行缺失。
+
+分析时不能要求崩溃前所有 seq 都连续到最后一刻，但必须能解释缺口：
+
+| 缺口类型 | 期望证据 |
+| --- | --- |
+| 文件滚动边界 | 旧文件 footer、新文件 header 和 manifest 记录 |
+| 队列溢出丢弃 | dropped_log_events 计数、原因和时间窗口 |
+| 进程崩溃 | WER、SCM、bootstrap 和重启日志关联 |
+| 磁盘不可写 | Windows Event Log 或 bootstrap 中的写入错误 |
+| 外部清理 | 清理审计、策略 ID 和操作者 |
+| 无法解释 | 不能作为通过，需要进入缺陷调查 |
+
+单调时钟用于识别系统时间回拨或跳变。若 wall clock 与 monotonic 推算不一致，日志应保留两个时间并标记 clock_anomaly。
+
+### 77.6 文件滚动、留存和容量上限
+
+日志滚动采用“时间 + 大小 + 总量”三重条件：
+
+- 默认每 24 小时或单文件达到 100 MB 时滚动；
+- 文件名包含 logger、日期、PID、起始 seq；
+- 日志总量达到目录预算时，从最低优先级且无 legal_hold 的旧文件清理；
+- audit、installer 和安全事件不得按普通日志自动覆盖；
+- 清理动作本身写入审计日志或清理 manifest；
+- 数据盘进入容量保护时，优先压缩或清理非关键日志，不能删除数据库和核心证据。
+
+建议日志目录独立预算，例如数据盘 5～10%，并设置绝对值上限。若客户制度要求更长期保存，应通过归档到受控备份或客户日志平台完成，而不是无限增加活跃数据盘占用。
+
+### 77.7 日志级别、采样和噪声控制
+
+| 级别 | 使用场景 |
+| --- | --- |
+| debug | 开发和临时诊断，默认生产关闭 |
+| info | 正常生命周期、启动、连接、恢复完成 |
+| warning | 可恢复异常、短时降级、重试和接近阈值 |
+| error | 操作失败、单路链路中断、恢复动作失败 |
+| critical | 核心检测、数据安全、审计或服务级红线被破坏 |
+
+高频正常事件必须采样，例如每 5 秒保存聚合摘要，而不是每个心跳写一行。错误事件要合并相同 stable_code 和对象，但保留 first_seen_at、last_seen_at、count 和影响范围，避免告警期间日志风暴反过来掩盖根因。
+
+### 77.8 脱敏和敏感信息扫描
+
+日志写入前必须经过结构化 redactor，而不是事后靠人工检查。处理规则：
+
+- RTSP URL 中的 username/password 移除或替换为 secret_ref；
+- Webhook URL 中的 token、签名查询参数替换；
+- Authorization、Cookie、Set-Cookie、代理凭据禁止落日志；
+- 手机号、邮箱、身份证号等按客户制度脱敏；
+- Windows 用户目录名、共享路径、内部 IP 按证据包级别决定是否保留；
+- 崩溃堆栈和命令行参数执行二次扫描；
+- 第三方 stderr 先进入缓冲，完成敏感模式替换后再写入。
+
+脱敏不能破坏排障所需语义。例如可以保留认证方式、主机端口、错误码和用户名引用，但不能保留明文密码。
+
+### 77.9 Windows Event Log 与文件日志的关系
+
+Windows Event Log 适合记录服务级、系统级和需要管理员集中查询的事件；JSONL 适合保存详细上下文。二者不能互相完全替代。
+
+设计要求：
+
+- 服务启动/停止、SCM 恢复、Job Object 兜底、审计写入失败进入 Windows Event Log；
+- 普通帧统计、详细推理耗时和每路重连明细保留在 JSONL；
+- 两边事件通过时间、PID、stable_code、trace_id 和 seq 关联；
+- Windows Event Log 写入失败时，不允许普通配置变更静默成功；应记录到本地关键日志并显示健康异常；
+- 自定义事件日志设置最大容量和溢出策略，不能无限占用系统盘。
+
+生产实现可使用 Report Event、ETW EventWrite 或等价受支持 API。无论采用哪种实现，都必须在安装、升级和卸载时正确注册或清理事件源。
+
+### 77.10 诊断包目录结构
+
+建议诊断包名称：FactoryGuard-Diagnostics-站点编号-YYYYMMDD-HHMMSS。
+
+| 路径 | 内容 |
+| --- | --- |
+| 00-manifest.json | 文件清单、大小、哈希、采集器、脱敏规则和保留策略 |
+| 01-summary.json | 当前服务、通道、推理、媒体、存储、通知的健康摘要 |
+| 10-service/ | sc qc、Win32_Service、SCM 恢复配置和服务依赖 |
+| 20-processes/ | 进程树、PID、启动时间、CPU、内存、句柄和线程 |
+| 30-network/ | 网卡、IP、路由、DNS、MTU、端口和网络质量摘要 |
+| 40-storage/ | 磁盘身份、分区、卷、SMART、容量、I/O 和挂载证据 |
+| 50-events/ | FactoryGuard/System/Application 事件导出 |
+| 60-database/ | integrity_check、foreign_key_check、user_version、迁移摘要 |
+| 70-logs/ | 最近日志窗口和滚动文件索引 |
+| 80-security/ | Defender、防火墙、白名单、补丁和签名状态 |
+| 90-media/ | 通道能力、PTS、码率、帧新鲜度、错误码摘要 |
+| README.txt | 采集范围、打开方式、敏感级别和联系信息 |
+
+导出完成前不得把文件标记为完整。只有所有文件关闭、哈希计算、manifest 原子写入完成后，诊断包状态才可改为 Ready。
+
+### 77.11 JSONL 校验脚本
+
+```powershell
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory = $true)]
+  [string]$Path
+)
+
+$ErrorActionPreference = 'Stop'
+$errors = @()
+$lineNumber = 0
+$expectedSeq = 1
+$seenTimestamps = @{}
+
+foreach ($line in [System.IO.File]::ReadLines($Path)) {
+  $lineNumber++
+  if ([string]::IsNullOrWhiteSpace($line)) {
+    continue
+  }
+
+  try {
+    $event = $line | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    $errors += "Line ${lineNumber}: invalid JSON: $($_.Exception.Message)"
+    continue
+  }
+
+  foreach ($requiredField in @('ts','monotonic_ms','seq','level','logger','process_role','pid','event')) {
+    if ($null -eq $event.$requiredField -or [string]::IsNullOrWhiteSpace([string]$event.$requiredField)) {
+      $errors += "Line ${lineNumber}: missing required field $requiredField"
+    }
+  }
+
+  if ($null -ne $event.seq) {
+    if ([int64]$event.seq -ne [int64]$expectedSeq) {
+      $errors += "Line ${lineNumber}: expected seq $expectedSeq, got $($event.seq)"
+    }
+    $expectedSeq = [int64]$event.seq + 1
+  }
+
+  if ($null -ne $event.ts) {
+    try {
+      $parsedTime = [DateTimeOffset]::Parse([string]$event.ts)
+      $key = $parsedTime.ToString('O')
+      $timestampCount = 0`n      if ($seenTimestamps.ContainsKey($key)) {`n        $timestampCount = [int]$seenTimestamps[$key]`n      }`n      $seenTimestamps[$key] = $timestampCount + 1
+    } catch {
+      $errors += "Line ${lineNumber}: invalid timestamp $($event.ts)"
+    }
+  }
+}
+
+"Validated lines: $lineNumber"
+if ($errors.Count) {
+  $errors
+  exit 1
+}
+'JSONL schema and sequence checks passed'
+```
+
+该校验用于单个连续日志流。跨文件滚动时，应从 manifest 获取每个文件的起始和结束 seq，再检查整体边界。
+
+### 77.12 诊断包导出脚本
+
+以下脚本只导出经批准的事件和日志范围。实际产品应将操作人、审批 ID、客户站点和留存策略写入 manifest。
+
+```powershell
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory = $true)]
+  [string]$OutputRoot,
+
+  [int]$EventAgeDays = 7
+)
+
+$ErrorActionPreference = 'Stop'
+$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$bag = Join-Path $OutputRoot "FactoryGuard-Diagnostics-$timestamp"
+$eventDirectory = Join-Path $bag '50-events'
+$logDirectory = Join-Path $bag '70-logs'
+New-Item -ItemType Directory -Path $eventDirectory,$logDirectory -Force | Out-Null
+
+$milliseconds = $EventAgeDays * 24 * 60 * 60 * 1000
+$query = "*[System[TimeCreated[timediff(@SystemTime) <= $milliseconds]]]"
+
+& wevtutil.exe epl FactoryGuard (Join-Path $eventDirectory 'factoryguard.evtx') "/q:$query" /ow:true
+if ($LASTEXITCODE -ne 0) { throw 'FactoryGuard event export failed' }
+
+& wevtutil.exe epl System (Join-Path $eventDirectory 'system-scm.evtx') "/q:*[System[Provider[@Name='Service Control Manager'] and TimeCreated[timediff(@SystemTime) <= $milliseconds]]]" /ow:true
+if ($LASTEXITCODE -ne 0) { throw 'System SCM event export failed' }
+
+Get-ChildItem -Path 'V:\FactoryGuard\logs' -Recurse -File -ErrorAction Stop |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 100 |
+  Copy-Item -Destination $logDirectory -Force
+
+$files = Get-ChildItem -Path $bag -Recurse -File
+$manifestFiles = foreach ($file in $files) {
+  $hash = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256
+  [pscustomobject]@{
+    Path = $file.FullName.Substring($bag.Length + 1)
+    Bytes = $file.Length
+    Sha256 = $hash.Hash
+  }
+}
+
+$manifest = [pscustomobject]@{
+  manifestVersion = '1.0'
+  collectedAt = (Get-Date).ToString('o')
+  eventAgeDays = $EventAgeDays
+  files = $manifestFiles
+  redactions = @('rtsp-userinfo','webhook-secret','authorization-header')
+}
+
+$manifestPath = Join-Path $bag '00-manifest.json'
+$manifest | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 $manifestPath
+$manifestPath
+```
+
+导出后应重新打开至少一个 evtx 和若干 JSONL 文件做冒烟验证。若 manifest 中文件哈希与实际文件不一致，诊断包不得标记为 Ready。
+
+### 77.13 日志故障注入矩阵
+
+| 测试 | 注入方式 | 通过标准 |
+| --- | --- | --- |
+| 日志盘只读 | 将测试目录权限改为拒绝写入或让卷进入只读状态 | 关键故障进入 bootstrap/Windows Event Log，服务状态明确 |
+| 日志盘满 | 用独立测试目录填满到配额 | 低优先级日志被清理或采样，审计和核心状态不损坏 |
+| writer 崩溃 | 终止日志 writer 进程 | 队列和序列号可恢复，重复日志不影响业务 |
+| 队列积压 | 阻塞 writer 并产生大量事件 | 背压计数、丢弃计数和优先级策略生效 |
+| 滚动失败 | 让目标文件名被占用或目录权限异常 | 当前日志状态可见，不产生无限重试 |
+| 时间回拨 | 在测试环境改变系统时间 | monotonic 与 wall clock 差异被标记 |
+| 外部删除日志 | 删除一个非审计日志文件 | manifest 和校验脚本报缺口，审计记录删除动作 |
+| 敏感 stderr | 向模拟 stderr 注入密码和 token | 落盘内容已脱敏，secret_ref 可追踪 |
+| 诊断包中断 | 导出过程中终止进程 | 半成品目录标记为 partial，不被当作完整包 |
+| manifest 篡改 | 修改导出包中任一文件 | 哈希校验失败，诊断包不可作为正式证据 |
+| Event Log 失败 | 模拟事件源不可用 | 健康状态降级，高风险配置变更被阻止 |
+| 数据盘延迟出现 | 开机后延迟挂载数据盘 | bootstrap 日志可关联后续日志，业务数据不写入系统盘 |
+
+### 77.14 诊断包 Manifest JSON
+
+```json
+{
+  "manifestVersion": "1.0",
+  "siteId": "FG-SITE-0001",
+  "collector": {
+    "name": "FactoryGuard Diagnostics",
+    "version": "1.0.0"
+  },
+  "collectedAt": "2026-10-07T12:30:00+08:00",
+  "scope": {
+    "eventAgeDays": 7,
+    "maxLogFiles": 100,
+    "includeDatabaseVerification": true,
+    "includeFullMediaFiles": false
+  },
+  "redactions": [
+    "rtsp-userinfo",
+    "webhook-query-token",
+    "authorization-header",
+    "cookie-header"
+  ],
+  "files": [
+    {
+      "path": "50-events/factoryguard.evtx",
+      "bytes": 1048576,
+      "sha256": "example-sha256"
+    },
+    {
+      "path": "70-logs/media-20261007.jsonl",
+      "bytes": 262144,
+      "sha256": "example-sha256"
+    }
+  ],
+  "approval": {
+    "requestedBy": "site-operator",
+    "approvedBy": "site-owner",
+    "ticketId": "SUP-20261007-001"
+  }
+}
+```
+
+### 77.15 发布门禁
+
+- 每类日志必须具备 schema、seq、滚动策略、容量上限和失败计数；
+- 审计事件落盘失败时，高风险操作必须回滚；
+- 日志目录、bootstrap 目录和 UI 日志目录必须分离并使用最小 ACL；
+- 诊断包必须完成脱敏、哈希、manifest 原子写入和打开冒烟；
+- 日志盘只读、写满、writer 崩溃、manifest 篡改和敏感数据注入必须完成演练；
+- 任何无法解释的 seq 缺口都不得在发布验收中忽略。
+
+---
+
+## 78. 数据盘初始化、盘符持久化与文件系统验收
+
+### 78.1 为什么数据盘必须作为可靠性对象治理
 
 FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告警前后片段、临时片段、日志、诊断包和本地备份副本。若这些数据直接散落在系统盘、U 盘、网络共享或未验收卷上，即使检测进程本身正常，也可能出现以下失效：
 
@@ -9212,7 +9589,7 @@ FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告�
 
 因此，v1.0 不允许安装器在启动时自动寻找“看起来容量最大”的磁盘并格式化。数据盘必须经过勘察、身份确认、审批、初始化、验收和登记。系统上线后，服务每次启动都要核验磁盘身份；身份不符时只能进入安全模式并告警，不能静默改写磁盘或切换到系统盘。
 
-### 77.2 v1.0 标准文件系统决策
+### 78.2 v1.0 标准文件系统决策
 
 | 项目 | v1.0 标准决策 | 说明 |
 | --- | --- | --- |
@@ -9230,7 +9607,7 @@ FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告�
 
 结论很明确：**新项目首版默认“固定数据盘 + GPT + NTFS + 4K 簇 + 固定盘符 + 显式身份登记”**。ReFS 的完整性流、块克隆和弹性能力值得关注，但不同 Windows 版本和使用场景的能力边界不同；在没有完成现场兼容性验证前，不应为了追求单一特性而更换默认文件系统。
 
-### 77.3 磁盘身份识别与防误格式化
+### 78.3 磁盘身份识别与防误格式化
 
 磁盘编号可能因为插拔顺序、控制器和 BIOS 设置变化，不能作为唯一身份。实施时至少记录以下字段：
 
@@ -9244,7 +9621,7 @@ FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告�
 
 初始化脚本必须通过 \`UniqueId\` 或序列号精确选择磁盘，并再次确认该磁盘不是启动盘、系统盘，且没有分区。任何“按容量自动匹配”“只有一块空盘所以直接格式化”的逻辑都不允许进入生产安装器。
 
-### 77.4 数据目录与容量边界
+### 78.4 数据目录与容量边界
 
 以盘符 \`V\` 为例，标准布局如下：
 
@@ -9270,7 +9647,7 @@ FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告�
 
 数据库所在目录应保留独立最小空间，例如 5 GB 或按现场通道数计算的上限。媒体清理不能通过删除数据库文件、WAL 文件或尚未完成取证审批的证据来换取空间。
 
-### 77.5 受控初始化脚本示例
+### 78.5 受控初始化脚本示例
 
 以下脚本默认只执行 WhatIf 预演；只有传入 \`-Commit\` 才会真正初始化。生产交付时应把同等校验逻辑固化到签名安装器，并把命令输出存入部署证据包。
 
@@ -9394,7 +9771,7 @@ if ($Commit) {
 }
 ```
 
-### 77.6 只读盘点与对齐核验脚本
+### 78.6 只读盘点与对齐核验脚本
 
 以下脚本只读不写，用于部署前和每次大版本升级前采集证据：
 
@@ -9443,7 +9820,7 @@ $ntfsInfo = & fsutil fsinfo ntfsinfo "$DriveLetter`:"
 
 验收时必须确认目标分区的 \`AlignedTo1MiB\` 为 true，文件系统为 NTFS，簇大小为 4096，且剩余容量符合容量规划。若 \`fsutil\` 返回权限或路径错误，应在提权命令行中重新执行并保存原始输出。
 
-### 77.7 NTFS 与 ReFS 的工程选择
+### 78.7 NTFS 与 ReFS 的工程选择
 
 | 维度 | NTFS | ReFS |
 | --- | --- | --- |
@@ -9457,7 +9834,7 @@ $ntfsInfo = & fsutil fsinfo ntfsinfo "$DriveLetter`:"
 
 不能把 ReFS 宣传成“永远不会损坏”。文件系统只能提高某些故障的检测和恢复能力，无法替代 UPS、断电写入测试、数据库事务、备份和物理磁盘健康监测。
 
-### 77.8 写入持久性和原子重命名演练
+### 78.8 写入持久性和原子重命名演练
 
 初始化完成后不能只验证“能创建文件”，还应验证显式 Flush、崩溃和重命名语义。
 
@@ -9499,7 +9876,7 @@ Get-ChildItem -LiteralPath $probeDirectory |
 
 重启后检查：最终文件可读取；临时文件可被启动恢复任务识别并清理；数据库不会引用不存在的媒体文件；没有半个文件被标记为“已发布”。
 
-### 77.9 数据盘异常处理矩阵
+### 78.9 数据盘异常处理矩阵
 
 | 异常 | 期望检测 | 系统动作 |
 | --- | --- | --- |
@@ -9514,7 +9891,7 @@ Get-ChildItem -LiteralPath $probeDirectory |
 | 空间不足 | 容量水位越界 | 按分级策略清理和降级，保留核心告警 |
 | SMART 警告 | 健康状态或可靠性计数器异常 | 提前更换磁盘并执行迁移，不等待完全失效 |
 
-### 77.10 验收记录 JSON
+### 78.10 验收记录 JSON
 
 ```json
 {
@@ -9566,7 +9943,7 @@ Get-ChildItem -LiteralPath $probeDirectory |
 }
 ```
 
-### 77.11 发布门禁
+### 78.11 发布门禁
 
 - 安装器不得提供“一键自动格式化所有空盘”功能；
 - 没有磁盘序列号、UniqueId、客户审批和现场照片，不得执行初始化；
@@ -9579,9 +9956,9 @@ Get-ChildItem -LiteralPath $probeDirectory |
 
 ---
 
-## 78. Windows 服务依赖、启动顺序与就绪确认
+## 79. Windows 服务依赖、启动顺序与就绪确认
 
-### 78.1 SCM 能保证什么，不能保证什么
+### 79.1 SCM 能保证什么，不能保证什么
 
 Windows Service Control Manager 可以根据服务配置、服务依赖和加载顺序组安排服务进程启动。Microsoft 对 \`CreateService\` 的 \`lpDependencies\` 参数定义为：系统必须在当前服务之前启动的服务或加载顺序组；依赖一个组只表示该组至少一个成员在尝试启动后处于运行状态。
 
@@ -9595,7 +9972,7 @@ Windows Service Control Manager 可以根据服务配置、服务依赖和加载
 
 因此，FactoryGuard 必须同时管理两层顺序：第一层是 SCM 的进程和系统服务启动顺序；第二层是 FactoryGuard 内部的资源就绪顺序。不能把 SCM 依赖当成摄像机、模型、数据库或 NVR 的健康监控。
 
-### 78.2 默认依赖最小化原则
+### 79.2 默认依赖最小化原则
 
 v1.0 的默认核心服务采用：
 
@@ -9622,7 +9999,7 @@ v1.0 的默认核心服务采用：
 
 依赖关系应服务于“没有它进程不应该启动”的场景，而不是为了让配置表看起来完整。
 
-### 78.3 内部启动阶段
+### 79.3 内部启动阶段
 
 FactoryGuard 的 \`ServiceMain\` 应按以下阶段推进，并及时向 SCM 报告 \`SERVICE_START_PENDING\`、checkpoint 和 wait hint：
 
@@ -9642,7 +10019,7 @@ FactoryGuard 的 \`ServiceMain\` 应按以下阶段推进，并及时向 SCM 报
 
 启动阶段必须周期性更新 checkpoint。任何一个阶段可能超过 SCM 的默认等待窗口时，都不能让主线程无提示阻塞；应每 5～10 秒报告一次仍在启动，并说明当前阶段。
 
-### 78.4 “运行中”的业务定义
+### 79.4 “运行中”的业务定义
 
 只有在下面条件满足后，才能对外部显示为完整 Running：
 
@@ -9661,7 +10038,7 @@ FactoryGuard 的 \`ServiceMain\` 应按以下阶段推进，并及时向 SCM 报
 
 单路摄像机不可达、某一个 Webhook 超时或 GPU 不可用，不应导致整个 Windows 服务停留在 Start Pending。服务可以进入 Running，但健康面板必须明确列出降级项。
 
-### 78.5 依赖配置脚本示例
+### 79.5 依赖配置脚本示例
 
 安装器权威实现应调用 \`CreateService\` 或 \`ChangeServiceConfig\`。命令行脚本只用于复核或现场诊断。
 
@@ -9707,7 +10084,7 @@ if ($LASTEXITCODE -ne 0) {
 
 依赖名称必须使用服务键名，而不是显示名称。多个依赖以正斜杠分隔。若要清除依赖，应在安装器中实现单独的显式操作并保存变更记录，不应在普通诊断脚本中隐式清空。
 
-### 78.6 自动启动与延迟启动选择
+### 79.6 自动启动与延迟启动选择
 
 | 启动方式 | 适用对象 | FactoryGuard 结论 |
 | --- | --- | --- |
@@ -9718,7 +10095,7 @@ if ($LASTEXITCODE -ne 0) {
 
 延迟启动不能保证在某个网络服务、交换机链路或 GPU 初始化完成之后执行，也不能替代内部就绪检查。对安防系统而言，开机后数分钟不能检测是实质性风险。若现场存在开机风暴，应优先优化启动阶段、分批复连摄像机、限制启动时全量扫描，而不是简单把核心服务改为 delayed-auto。
 
-### 78.7 冷启动证据采集脚本
+### 79.7 冷启动证据采集脚本
 
 ```powershell
 [CmdletBinding()]
@@ -9772,7 +10149,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 
 冷启动证据应能回答：服务是否自动启动、启动类型是否被改变、依赖是什么、开机后多久进入 Running、数据盘是否准时出现、网络是否就绪、时钟是否可信、是否出现 SCM 超时或崩溃恢复。
 
-### 78.8 冷启动竞态与重试策略
+### 79.8 冷启动竞态与重试策略
 
 | 竞态 | 典型表现 | FactoryGuard 策略 |
 | --- | --- | --- |
@@ -9788,7 +10165,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 
 所有重试都必须有次数、间隔、超时、日志和最终状态，避免无限 busy loop。核心链路的重试间隔应短于非核心链路，非关键导出、诊断和更新检查应延后。
 
-### 78.9 启动测试矩阵
+### 79.9 启动测试矩阵
 
 | 测试 | 操作 | 通过标准 |
 | --- | --- | --- |
@@ -9805,7 +10182,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | 依赖缺失 | 可选依赖服务禁用 | 若非硬依赖，核心服务仍能启动并报告降级 |
 | SCM 恢复 | 连续触发服务失败 | 恢复动作、退避和事件计数符合配置 |
 
-### 78.10 发布门禁
+### 79.10 发布门禁
 
 - 核心检测服务必须为自动启动，不能依赖用户登录；
 - 不允许把 Qt UI 或远程支持工具配置为核心服务的前置条件；
@@ -9818,11 +10195,11 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 
 ---
 
-## 79. 行业资料与标准依据
+## 80. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 79.1 平台与可靠性资料
+### 80.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -9838,6 +10215,9 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | Microsoft Defender：Add-MpPreference / Configure custom exclusions | Defender 状态检查和精确排除策略 |
 | NetSecurity：New-NetFirewallRule / Set-NetFirewallProfile | 防火墙 Profile、入站阻止和出站白名单 |
 | Microsoft Learn：Event Logging / New-EventLog / wevtutil | 自定义事件日志、事件源、日志查询和保留策略 |
+| Windows Event Log：EvtExportLog / EvtArchiveExportedLog | 按查询导出事件、归档 EVTX 和诊断包事件导出依据 |
+| Windows ETW：EventWrite / Writing an instrumentation manifest | 结构化 ETW 事件、提供者清单和系统级日志写入依据 |
+| Windows Event Log：ReportEventW | 经典事件日志写入和服务级告警参考 |
 | NSIS Users Manual / Scripting Reference | 安装页面、Section、静默安装和提权级别 |
 | Microsoft Learn：SignTool / Get-AuthenticodeSignature | 安装包和二进制签名校验 |
 | Microsoft Learn：System Error Codes | 平台错误码和上游错误映射参考 |
@@ -9935,7 +10315,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | ONVIF Profile S Specification | IP 视频设备、媒体配置和 GetStreamUri 能力参考 |
 | ISA/IEC 62443 series | 工业控制系统安全分区、供应商和运维安全参考 |
 
-### 79.2 视频与设备协议资料
+### 80.2 视频与设备协议资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -9945,7 +10325,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | GB/T 28181 相关公共安全视频监控联网标准 | 二期平台级联和协议扩展预研 |
 | GA/T 1400 相关公共安全视频图像信息系统标准 | 二期视图库、事件对象和平台对接预研 |
 
-### 79.3 主要链接
+### 80.3 主要链接
 
 - https://learn.microsoft.com/en-us/windows/win32/services/service-programs
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w
@@ -10016,6 +10396,12 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 - https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule
 - https://learn.microsoft.com/en-us/powershell/module/netsecurity/set-netfirewallprofile
 - https://learn.microsoft.com/en-us/windows/win32/eventlog/event-logging
+- https://learn.microsoft.com/en-us/windows/win32/eventlog/reporting-an-event
+- https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-reporteventw
+- https://learn.microsoft.com/en-us/windows/win32/wes/writing-an-instrumentation-manifest
+- https://learn.microsoft.com/en-us/windows/win32/api/evntprov/nf-evntprov-eventwrite
+- https://learn.microsoft.com/en-us/windows/win32/api/winevt/nf-winevt-evtexportlog
+- https://learn.microsoft.com/en-us/windows/win32/api/winevt/nf-winevt-evtarchiveexportedlog
 - https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/new-eventlog
 - https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/wevtutil
 - https://nsis.sourceforge.io/Docs/
@@ -10123,6 +10509,14 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 - **句柄泄漏（Handle Leak）**：文件、线程、套接字、管道等内核对象未及时关闭，导致句柄数持续增长。
 - **磁盘 I/O 延迟**：读/写请求从提交到完成所经历的时间，是判断磁盘响应能力的重要指标。
 - **资源硬限制**：通过 Job Object 等机制设置的进程内存、CPU 或活动进程上限，用于故障兜底。
+
+
+- **JSON Lines（JSONL）**：每行一个独立 JSON 对象的数据格式，适合结构化日志追加写入和逐行读取。
+- **日志序列号（Log Sequence Number）**：单个日志流内单调递增的序号，用于发现日志缺失和滚动边界问题。
+- **Bootstrap 日志**：系统服务启动极早期、独立数据盘尚未就绪时写入系统盘的小容量启动证据。
+- **日志背压**：当日志产生速度超过写入能力时，通过有界队列、采样和丢弃计数阻止内存无限增长。
+- **诊断包 Manifest**：记录诊断包文件范围、哈希、脱敏规则、采集时间和审批信息的清单文件。
+- **脱敏（Redaction）**：移除或替换日志、配置和诊断材料中的密码、令牌、Cookie、联系方式等敏感信息。
 
 ## 附录：术语
 
