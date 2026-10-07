@@ -1,8 +1,8 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v1.2
+> 文档版本：v1.3
 > 成文日期：2026-10-07
-> 文档状态：立项稿（Windows 可靠性与行业资料增强版）
+> 文档状态：立项稿（Windows 可靠性、配置基线与交付验收增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练和一键诊断为 v1.0 发布红线。
 
@@ -842,9 +842,598 @@ factoryguard/
 
 ---
 
-## 20. 交付物、运维手册与责任边界
+## 20. 配置 Schema 与校验规则
 
-### 20.1 交付文档包
+### 20.1 配置管理原则
+
+生产环境的权威配置保存在 SQLite 中，导出文件仅用于备份、评审和实施交接。任何配置变更必须经过“草案生成 → Schema 校验 → 业务预检 → 事务提交 → 审计记录”五个步骤，禁止直接手工修改运行中数据库。
+
+| 原则 | 要求 |
+| --- | --- |
+| 显式版本 | 每份配置包含 config_version 和 application_version |
+| 最小可用 | 未通过网络、码流、模型、存储预检的配置不能标记为 active |
+| 密钥分离 | JSON/YAML 导出文件中只保留 secret_ref，不导出明文密码 |
+| 可回滚 | 每次启用新配置前保存上一 active 版本，回滚也需要审计 |
+| 环境一致 | 通道、规则、通知中的 ID 必须能互相引用，不允许悬空 ID |
+| 可观测 | 配置变更后立即执行健康检查，并在 UI 展示预检结果 |
+
+### 20.2 顶层配置对象
+
+| 字段 | 类型 | 必填 | 校验规则 | 说明 |
+| --- | --- | --- | --- | --- |
+| config_version | integer | 是 | 当前为 1；只允许递增 | 配置 Schema 版本 |
+| application_version | string | 是 | SemVer，如 1.0.0 | 生成配置的软件版本 |
+| exported_at | string(date-time) | 是 | ISO 8601，带时区 | 导出时间 |
+| site | object | 是 | 站点名称不能为空 | 厂区基础信息 |
+| service | object | 是 | 服务账户、启动类型合法 | Windows 服务策略 |
+| ntp | object | 是 | 至少一个时间源或明确为手动对时 | 时间同步策略 |
+| storage | object | 是 | 路径存在、NTFS、配额合法 | 数据库、事件片段和日志目录 |
+| logging | object | 是 | 日志级别和保留大小合法 | 结构化日志与诊断 |
+| security | object | 是 | 密码策略、会话策略合法 | 本地安全策略 |
+| nvrs | array<NvrDevice> | 是 | 0～4 台；ID 唯一 | NVR 设备 |
+| channels | array<Channel> | 是 | 1～32 路；ID/通道号唯一 | 视频通道 |
+| models | array<DetectionModel> | 是 | 至少一个 mock 或 ONNX 模型 | 检测模型 |
+| rules | array<Rule> | 是 | 几何、时间表、目标类型合法 | 区域入侵规则 |
+| schedules | array<Schedule> | 是 | 时间段不得重叠冲突 | 布防时间表 |
+| notifications | array<NotificationChannel> | 否 | Webhook URL、密钥引用合法 | 企微/钉钉等渠道 |
+| health_policy | object | 是 | 心跳、阈值、降级策略合法 | 健康监测策略 |
+
+### 20.3 Site / Service / NTP 对象
+
+```yaml
+site:
+  id: 8f2c1d6e-2a84-4a31-9d5a-3d4a1a2b3c01
+  name: 华东一号厂区
+  address: 客户现场地址
+  timezone: Asia/Shanghai
+  contact_name: 客户安全管理员
+  contact_phone_ref: secret://contacts/site-admin
+
+service:
+  name: FactoryGuard
+  display_name: FactoryGuard 厂区智防服务
+  start_type: automatic
+  account: "NT Service\\FactoryGuard"
+  enable_desktop_interaction: false
+  recovery:
+    first_failure: restart
+    second_failure: restart
+    subsequent_failure: restart
+    reset_period_seconds: 86400
+    restart_delay_seconds: 10
+
+ntp:
+  mode: domain_or_manual
+  servers:
+    - time.windows.com
+    - ntp.aliyun.com
+  warning_offset_ms: 2000
+  critical_offset_ms: 10000
+  resync_interval_hours: 1
+```
+
+校验重点：
+
+- 服务不能启用交互式桌面；核心业务不能运行在用户登录会话；
+- start_type 仅允许 manual、automatic、disabled，生产 active 配置必须是 automatic；
+- critical_offset_ms 必须大于 warning_offset_ms，且均为正数；
+- 站点时区必须是 IANA 时区标识，中国现场默认 Asia/Shanghai。
+
+### 20.4 Storage / Logging / Security 对象
+
+```yaml
+storage:
+  install_dir: C:\Program Files\FactoryGuard
+  data_dir: C:\ProgramData\FactoryGuard
+  user_cache_dir: ${LOCALAPPDATA}\FactoryGuard
+  database_path: C:\ProgramData\FactoryGuard\db\factoryguard.db
+  snapshot_dir: C:\ProgramData\FactoryGuard\snapshots
+  clip_dir: C:\ProgramData\FactoryGuard\clips
+  temp_dir: C:\ProgramData\FactoryGuard\tmp
+  require_ntfs: true
+  min_free_gb: 20
+  watermarks:
+    notice_percent: 80
+    cleanup_percent: 90
+    protect_core_percent: 95
+  retention:
+    events_days: 180
+    snapshots_days: 90
+    clips_days: 90
+    diagnostic_bags_count: 20
+
+logging:
+  level: info
+  format: jsonl
+  dir: C:\ProgramData\FactoryGuard\logs
+  max_file_mb: 50
+  max_total_mb: 500
+  retain_days: 30
+  enable_windows_event_log: true
+  enable_wer_local_dumps: true
+
+security:
+  lockout_threshold: 5
+  lockout_minutes: 15
+  session_idle_minutes: 10
+  require_local_admin_for_setup: true
+  allow_diagnostic_export_without_admin: false
+  password_min_length: 10
+```
+
+文件系统预检必须验证：路径所在卷为 NTFS、服务账户具备读写权限、路径不是可移动磁盘、剩余空间不低于 min_free_gb、临时目录与片段目录在同一卷或具备足够复制空间。
+
+### 20.5 NVR 与通道配置
+
+```yaml
+nvrs:
+  - id: nvr-001
+    name: 主控 NVR
+    brand: hikvision
+    host: 10.10.20.10
+    rtsp_port: 554
+    username: factoryguard_ro
+    secret_ref: secret://nvr/nvr-001
+    channel_count: 16
+    firmware_version: "V4.74"
+    connect_timeout_ms: 5000
+    read_timeout_ms: 8000
+    transport: tcp
+
+channels:
+  - id: ch-east-wall-01
+    nvr_id: nvr-001
+    channel_no: 3
+    name: 东围墙北段
+    region_id: region-east-wall
+    stream_profile: sub
+    path_template: /Streaming/Channels/{channel:02d}02
+    enabled: true
+    ai_enabled: true
+    expected:
+      codec: h264
+      width: 640
+      height: 360
+      fps_min: 5
+      fps_max: 15
+```
+
+通道校验规则：
+
+- nvr_id 必须存在；同一 NVR 下 channel_no 不得重复；
+- path_template 必须只包含允许变量：channel、width、height、stream；
+- 禁止在路径或日志中拼接密码；凭据由凭据存储统一处理；
+- expected.fps_min 不得大于 expected.fps_max；首版分析通道建议宽度 352～1280；
+- 通道能力探测结果与 expected 不一致时，可保存为 blocked 或 degraded，但不能显示 Ready。
+
+### 20.6 模型配置
+
+```yaml
+models:
+  - id: model-people-v1
+    name: Person Detection ONNX
+    runtime: onnxruntime
+    execution_policy:
+      preferred: directml
+      fallback: cpu
+    path: C:\ProgramData\FactoryGuard\models\person_detect_v1.onnx
+    checksum_sha256: 由发布系统生成
+    labels:
+      - person
+    input_size: [640, 640]
+    confidence_threshold: 0.45
+    nms_iou_threshold: 0.5
+    warmup_required: true
+    max_batch_size: 4
+```
+
+模型文件发布前必须记录来源、版本、许可证、校验和、输入尺寸、标签、预处理参数和后处理参数。模型 Warmup 失败、标签缺失、校验和不一致时不得进入生产 Ready。
+
+### 20.7 规则几何 Schema
+
+```yaml
+rules:
+  - id: rule-east-wall-intrusion
+    name: 东围墙夜间入侵
+    channel_id: ch-east-wall-01
+    type: polygon
+    enabled: true
+    target_labels: [person]
+    schedule_id: schedule-night-weekend
+    sensitivity: medium
+    confirm_frames: 3
+    cooldown_seconds: 60
+    geometry:
+      coordinate_space:
+        width: 640
+        height: 360
+      points:
+        - [82, 40]
+        - [300, 36]
+        - [318, 286]
+        - [66, 302]
+      direction: enter
+```
+
+| 规则类型 | 必填几何字段 | 校验规则 |
+| --- | --- | --- |
+| polygon | points，至少 3 点 | 多边形不得自交；点必须落在画面坐标内 |
+| tripwire | start、end、allowed_directions | 线段长度大于 0；方向仅允许 left_to_right、right_to_left、both |
+| schedule-only | 无几何 | 仅用于临时布撤防，不产生检测事件 |
+
+几何坐标使用归一化或像素坐标均可，但必须显式声明 coordinate_space。通道实际分辨率变化时，规则需要重新映射并经过人工确认，不能静默按比例拉伸。
+
+### 20.8 布防时间表
+
+```yaml
+schedules:
+  - id: schedule-night-weekend
+    name: 夜间与周末
+    time_zone: Asia/Shanghai
+    entries:
+      - days: [mon, tue, wed, thu, fri]
+        start: "22:00"
+        end: "06:00"
+      - days: [sat, sun]
+        start: "00:00"
+        end: "23:59"
+    holidays:
+      - 2026-10-01
+      - 2026-10-02
+    exceptions:
+      - date: 2026-10-07
+        mode: disarm
+        reason: 临时加班
+```
+
+时间表达式必须处理跨零点、节假日、夏令时数据异常和重复星期。中国现场不实行夏令时，但若系统导入异常日历，仍以本地时区和明确日期优先。
+
+### 20.9 通知渠道配置
+
+```yaml
+notifications:
+  - id: notify-wecom-security
+    type: wecom_webhook
+    name: 企业微信安全群
+    enabled: true
+    base_url_ref: secret://notify/wecom-security-url
+    signing_secret_ref: secret://notify/wecom-security-secret
+    timeout_ms: 5000
+    retry_policy:
+      intervals_seconds: [60, 300, 900, 3600]
+    escalation:
+      after_unacknowledged_minutes: 10
+      target_id: notify-backup-manager
+```
+
+通知预检应发送测试消息，但测试消息必须标识“测试”且不进入正式事件统计。URL 和签名密钥必须作为敏感数据处理。
+
+### 20.10 配置启用前预检清单
+
+| 预检项 | 通过标准 | 失败处理 |
+| --- | --- | --- |
+| Schema 校验 | 无类型、必填、枚举、范围错误 | 阻止保存 active |
+| ID 引用完整性 | NVR、通道、规则、时间表、通知引用均存在 | 列出悬空 ID |
+| 网络连通 | 每个 NVR IP 可达，RTSP 端口可连接 | 标记 blocked |
+| 凭据检查 | 认证成功且权限满足只读取流 | 标记 auth_failed |
+| 码流探测 | 编码、分辨率、帧率、PTS 符合预期 | 标记 degraded/blocked |
+| 模型检查 | 文件校验和、Warmup、GPU/CPU 均通过 | 禁止布防或进入 mock 模式 |
+| 存储检查 | NTFS、ACL、容量、保留策略有效 | 阻止启用 |
+| 通知检查 | 测试消息返回成功 | 允许布防但通知状态为 degraded |
+| 服务检查 | SCM、恢复策略、Job Object 可用 | 阻止发布 |
+
+---
+
+## 21. NVR 品牌兼容矩阵
+
+### 21.1 兼容策略
+
+品牌模板只能提高配置效率，不能替代现场探测。任何模板在未通过“端口连接、认证、子码流、编码、分辨率、帧率、PTS、断流恢复”八项检查前，兼容状态只能标记为 unknown，不得标记为 certified。
+
+| 状态 | 定义 |
+| --- | --- |
+| Certified | 至少一个明确型号和固件版本通过完整发布矩阵，并形成测试记录 |
+| Compatible | 现场流可接入，但未完成全部长稳或故障注入项目 |
+| Degraded | 可接入但需要降帧、改编码、关闭部分能力 |
+| Blocked | 认证、取流或并发能力不满足首版要求 |
+| Unknown | 仅有模板，未完成现场或实验室测试 |
+
+### 21.2 RTSP 地址模板
+
+| 品牌 | 主码流模板 | 子码流模板 | 备注 |
+| --- | --- | --- | --- |
+| Hikvision/海康体系 | /Streaming/Channels/{channel:02d}01 | /Streaming/Channels/{channel:02d}02 | 海康支持资料给出 101 为主码流、102 为子码流；大小写和端口以现场设备为准 |
+| Dahua/大华体系 | /cam/realmonitor?channel={channel}&subtype=0 | /cam/realmonitor?channel={channel}&subtype=1 | 部分设备 subtype=2 表示第三码流；需按固件确认 |
+| Uniview/宇视体系 | /media/video1 | /media/video2 | 部分设备存在 video3；NVR 与直连摄像机路径可能不同 |
+| ONVIF 通用设备 | 由 GetStreamUri 返回 | 由 GetStreamUri 指定子码流配置返回 | 不应猜测固定路径，适合作为二期增强 |
+| 自定义 RTSP | 用户填写 | 用户填写 | 必须完成路径变量和安全字符校验 |
+
+URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把用户名和密码拼接到日志、诊断包或错误消息中。
+
+### 21.3 品牌兼容记录表
+
+| 字段 | 示例 | 记录要求 |
+| --- | --- | --- |
+| vendor | Hikvision | 品牌名称 |
+| product_type | NVR / IPC | 明确设备类型 |
+| model | DS-79xxN-R4 | 完整型号 |
+| firmware | V4.74.x | 固件完整版本 |
+| channels_supported | 16 | 实测可接入通道数 |
+| max_analyzed_channels | 16 | 满足 AI 延迟要求的通道数 |
+| substream_codec | H.264 | H.264/H.265/AAC 等实测结果 |
+| substream_resolution | 640×360 | 子码流分辨率 |
+| substream_fps | 5～15 | 实测帧率 |
+| rtsp_transport | TCP | 首版默认 TCP |
+| auth_mechanism | digest/basic | 记录设备实际协商方式 |
+| restart_recovery_seconds | 35 | NVR 重启后批量恢复完成时间 |
+| limitations | 子码流需手动开启 | 所有限制必须说明 |
+| test_evidence | report-2026-xx | 关联测试记录、截图或自动化报告 |
+
+### 21.4 品牌准入测试
+
+| 测试项 | 通过标准 |
+| --- | --- |
+| 端口与认证 | 错误密码能明确返回认证失败；正确密码 5 秒内建立连接 |
+| 主/子码流 | 主、子码流均可探测；分析默认使用子码流 |
+| 编码兼容 | H.264 必须支持；H.265 按实际软件解码能力确认 |
+| PTS 连续性 | 5 分钟内无异常倒退、重复、大幅跳变；若设备本身跳变，系统能识别 |
+| 并发连接 | 在设备允许范围内同时取流不锁定账号 |
+| NVR 重启 | 重启后按退避策略恢复，不形成连接风暴 |
+| 单路中断 | 单路 kill 后自动重连，不影响其他通道 |
+| 长稳 | 至少 24 小时无未恢复错误；认证等级需覆盖 168 小时 |
+| 时间同步 | NVR 时间与 Windows 偏差可读取或可人工记录，超过阈值有处置流程 |
+
+### 21.5 常见现场限制与规避
+
+| 限制 | 风险 | 规避方案 |
+| --- | --- | --- |
+| 子码流未启用 | AI 只能取高清主码流，网络和算力压力升高 | 实施前启用子码流；无法启用时重新评估硬件和路数 |
+| NVR 匿名/访客账号权限过宽 | 安全风险 | 使用最小权限只读账号，关闭不必要公网访问 |
+| 多客户端取流许可有限 | FactoryGuard 接入后影响其他客户端 | 记录并发限制，必要时分批分析或直连摄像机子网 |
+| 固件版本过旧 | URL、认证、编码兼容性不确定 | 升级经客户确认的稳定固件；升级前后均做检查 |
+| H.265 子码流兼容差异 | 解码或渲染异常 | 优先配置 H.264 子码流；H.265 需单独测试 |
+| 设备时间错误 | 事件无法对齐 NVR 取证 | 校正 NTP，事件记录双时间和偏差 |
+| OEM 品牌路径相似但行为不同 | 误套用模板导致失败 | 以设备实际品牌、型号、固件和探测结果为准 |
+
+---
+
+## 22. 现场部署验收表
+
+### 22.1 项目基础信息
+
+| 项目 | 记录值 | 验收要求 |
+| --- | --- | --- |
+| 客户名称 |  | 必填 |
+| 厂区名称 |  | 必填 |
+| 部署地址 |  | 必填 |
+| 客户负责人 |  | 必填 |
+| 实施人员 |  | 必填 |
+| 部署日期 |  | 与系统日期一致 |
+| 软件版本 |  | 与安装包版本一致 |
+| License 类型 | MIT | 确认 LICENSE 已随软件提供 |
+| 计划接入通道数 |  | 1～32 |
+| 实际接入通道数 |  | 与配置和设备一致 |
+
+### 22.2 值守电脑硬件检查
+
+| 检查项 | 记录值 | 通过标准 |
+| --- | --- | --- |
+| CPU 型号 |  | 不低于最小配置 |
+| 内存 |  | 最小 16GB，32 路建议 32GB |
+| 系统盘类型 |  | SSD/NVMe，不使用机械盘承载数据库 |
+| 可用磁盘 |  | ≥20GB，建议按事件保留量重新测算 |
+| 网卡 |  | 千兆及以上，链路速率正确 |
+| GPU |  | 无独显时需完成 CPU 降帧测试 |
+| 显存 |  | GPU 模式满足模型加载 |
+| 电源与散热 |  | 无高温、无异常断电记录 |
+
+### 22.3 Windows 系统检查
+
+| 检查项 | 记录值/结果 | 通过标准 |
+| --- | --- | --- |
+| 操作系统版本 |  | Windows 10/11 x64 支持版本 |
+| 系统架构 |  | 64 位 |
+| 文件系统 |  | 数据盘 NTFS |
+| Windows Update |  | 安装当前必要更新 |
+| 电源策略 |  | 高性能，禁用睡眠和硬盘休眠 |
+| 显示器关闭策略 |  | 可关闭显示，主机不能睡眠 |
+| 时区 |  | Asia/Shanghai 或客户明确时区 |
+| NTP 状态 |  | 偏差小于 2 秒；超过则记录处置 |
+| 用户账户 |  | 安装管理员、日常值班用户分离 |
+| 服务账户 ACL |  | 服务账户仅获得必要目录权限 |
+| 安全软件 |  | 数字签名后可运行，文件锁定有记录 |
+
+### 22.4 网络与 NVR 检查
+
+| 检查项 | 结果 | 通过标准 |
+| --- | --- | --- |
+| 网络拓扑图 |  | 已归档，标明 VLAN/网段 |
+| NVR IP |  | 固定 IP 或保留地址 |
+| RTSP 端口 |  | 默认 554 或自定义端口 |
+| NVR 网关/路由 |  | 值守电脑可稳定访问 |
+| 丢包/延迟 |  | 5 分钟采样无持续高丢包 |
+| NVR 固件 |  | 记录完整版本 |
+| NVR 时间 |  | 与 Windows 偏差小于阈值 |
+| 只读账号 |  | 权限最小化，密码已安全保存 |
+| 子码流 |  | 所有分析通道具备可用子码流 |
+| 公网端口 |  | 不映射 RTSP/管理端口到公网 |
+
+### 22.5 通道与规则验收
+
+| 通道编号 | 通道名称 | 区域 | 子码流 | 规则类型 | 目标 | 时间表 | 确认帧 | 结果 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 |  |  | 通过/失败 |  | person |  | 3 | Pass/Fail |
+| 2 |  |  | 通过/失败 |  |  |  | 3 | Pass/Fail |
+
+规则验收必须至少完成：无入侵基线、人员进入、人员未进入仅靠近、目标进入后离开、冷却期重复触发、临时布撤防。关键区域应逐条验收，不允许用“全部正常”代替。
+
+### 22.6 通知与处警验收
+
+| 检查项 | 通过标准 | 结果 |
+| --- | --- | --- |
+| 企业微信/钉钉测试消息 | 5 秒内返回成功或明确渠道状态 | Pass/Fail |
+| 正式事件通知 | 包含通道、时间、规则、截图或截图失败说明 | Pass/Fail |
+| 通知失败重试 | Outbox 状态按策略更新 | Pass/Fail |
+| 未确认升级 | 超时后通知备用联系人或明确未配置 | Pass/Fail |
+| 事件确认 | 值班员可确认真警并记录说明 | Pass/Fail |
+| 误报标记 | 可标记误报并保留审计 | Pass/Fail |
+| 事件关闭 | 关闭后仍可查询，不被物理删除 | Pass/Fail |
+
+### 22.7 故障注入签收项
+
+| 故障注入 | 操作方式 | 通过标准 | 结果 |
+| --- | --- | --- | --- |
+| UI 关闭/崩溃 | 关闭 UI 或结束 UI 进程 | 后台继续检测，重开后状态一致 | Pass/Fail |
+| FFmpeg 崩溃 | 结束单路 ffmpeg 进程 | 自动重连，无孤儿 | Pass/Fail |
+| Engine 崩溃 | 结束 Engine Worker | 60 秒内恢复 | Pass/Fail |
+| Inference 崩溃 | 结束推理进程 | 模型重载，降级可见 | Pass/Fail |
+| 网络断开 | 禁用网卡或拔线 | 离线状态准确，恢复后自动重连 | Pass/Fail |
+| NVR 重启 | 经客户允许重启 NVR | 分组退避恢复，无连接风暴 | Pass/Fail |
+| 磁盘水位 | 模拟或使用预留卷测试 | 清理策略生效，数据库不损坏 | Pass/Fail |
+| 系统重启 | 重启 Windows，不登录用户 | 服务自动启动并恢复布防 | Pass/Fail |
+
+### 22.8 培训与遗留问题
+
+| 项目 | 记录 |
+| --- | --- |
+| 已培训值班员 | 姓名、日期、培训内容 |
+| 已培训管理员 | 账号、规则、通知、诊断操作 |
+| 交付资料 | 安装手册、操作手册、应急手册、拓扑图、验收报告 |
+| 遗留问题编号 |  |
+| 严重级别 | Sev2/Sev3/Sev4；不得遗留 Sev1 |
+| 计划修复日期 |  |
+| 客户签字 |  |
+| 实施签字 |  |
+
+---
+
+## 23. 每日健康报表格式
+
+### 23.1 报表用途
+
+试点期间每日生成健康报表，用于判断系统是否真正持续可用。报表不能只给“正常/异常”结论，必须包含可复核的原始指标、降级时段、事件数量、通知状态和处置人。
+
+### 23.2 JSON 报表 Schema
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| report_id | string(uuid) | 报表 ID |
+| site_id / site_name | string | 厂区标识与名称 |
+| report_date | string(date) | 报表日期，使用现场时区 |
+| generated_at | string(date-time) | 生成时间 |
+| software_version | string | 软件版本 |
+| config_version | integer | 当前配置版本 |
+| overall_state | string | Ready/Degraded/Offline/Stopped |
+| availability | object | 当天可用秒数、不可用秒数、可用率 |
+| channels | object | 总数、Ready、Degraded、Offline、Disabled |
+| processes | array | 各进程重启次数、心跳、退出码 |
+| resources | object | CPU、内存、GPU、磁盘、网络峰值和均值 |
+| events | object | 真警、误报、待处理、关闭事件数量 |
+| latency | object | 告警延迟 P50/P95/P99 |
+| notifications | object | 成功、失败、重试、升级数量 |
+| degraded_periods | array | 降级开始/结束、原因、影响范围、恢复动作 |
+| ntp | object | 最大偏差、平均偏差、时间同步状态 |
+| storage | object | 片段数量、存储增长、剩余空间、清理结果 |
+| action_items | array | 待处理问题、负责人、截止时间 |
+| report_hash | string | 报表内容哈希，用于归档校验 |
+
+### 23.3 每日报表示例
+
+```json
+{
+  "report_id": "31d8a946-9c98-4d10-a78f-39ad01e3f701",
+  "site_name": "华东一号厂区",
+  "report_date": "2026-10-07",
+  "generated_at": "2026-10-08T00:05:00+08:00",
+  "software_version": "1.0.0-rc.1",
+  "config_version": 3,
+  "overall_state": "Degraded",
+  "availability": {
+    "planned_service_seconds": 86400,
+    "unavailable_seconds": 420,
+    "degraded_seconds": 1800,
+    "availability_rate": 0.99514
+  },
+  "channels": {
+    "total": 16,
+    "ready": 15,
+    "degraded": 0,
+    "offline": 1,
+    "disabled": 0
+  },
+  "events": {
+    "confirmed": 0,
+    "false_positive": 1,
+    "pending": 0,
+    "closed": 1
+  },
+  "latency_ms": {
+    "p50": 3200,
+    "p95": 7600,
+    "p99": 11200
+  },
+  "notifications": {
+    "success": 1,
+    "failed": 0,
+    "retrying": 0,
+    "escalated": 0
+  },
+  "ntp": {
+    "max_offset_ms": 820,
+    "state": "ready"
+  },
+  "storage": {
+    "free_gb": 173.4,
+    "clips_added": 1,
+    "bytes_added_mb": 3.2,
+    "cleanup_executed": false
+  },
+  "degraded_periods": [
+    {
+      "started_at": "2026-10-07T02:10:00+08:00",
+      "ended_at": "2026-10-07T02:17:00+08:00",
+      "reason": "NVR restart",
+      "affected_channels": [1, 2, 3],
+      "recovery_action": "staggered reconnect"
+    }
+  ],
+  "action_items": [
+    {
+      "severity": "Sev3",
+      "description": "CH16 夜间 02:40 离线超过 7 分钟，需检查网线和交换机端口",
+      "owner": "现场管理员",
+      "due_date": "2026-10-08"
+    }
+  ]
+}
+```
+
+### 23.4 巡检结论规则
+
+- 任一关键通道 Offline 且没有恢复记录，overall_state 不得为 Ready；
+- P95 延迟超过 10 秒，必须给出队列、GPU、CPU、网络或通知渠道原因；
+- 存在待处理 Sev1/Sev2，报表必须置顶显示，不允许被普通统计淹没；
+- 通知失败但 Outbox 仍重试时，应显示 Degraded；重试耗尽应显示 Offline 或严重告警；
+- 可用率不能只按服务进程存活计算，应按布防策略、通道在线、检测链路和通知链路综合计算；
+- 报表归档后不得修改；如更正，应生成带 correction_of 字段的新版本。
+
+### 23.5 试点周报汇总
+
+周报应汇总每日报表并回答：
+
+1. 是否出现未恢复故障；
+2. 是否有漏报告警或证据不足；
+3. 误报主要集中在哪些通道、规则和时间段；
+4. 资源峰值是否接近硬件上限；
+5. 通知延迟是否持续升高；
+6. 是否需要调整摄像机角度、规则几何、确认帧数、采样率或通知策略；
+7. 是否满足进入正式发布或继续延长试点的条件。
+
+---
+
+## 24. 交付物、运维手册与责任边界
+
+### 24.1 交付文档包
 
 | 文档 | 内容 | 责任方 |
 | --- | --- | --- |
@@ -857,7 +1446,7 @@ factoryguard/
 | 应急处置手册 | 离线、误报激增、磁盘满、GPU 失败、通知失败、服务无法启动 | 售后 |
 | 验收报告 | 安装、剧本、故障注入、长稳、安全检查、遗留问题和签字项 | 项目经理/客户 |
 
-### 20.2 日常运行 Runbook
+### 24.2 日常运行 Runbook
 
 | 场景 | 一线动作 | 升级条件 |
 | --- | --- | --- |
@@ -869,7 +1458,7 @@ factoryguard/
 | 磁盘空间不足 | 检查保留策略、异常日志、片段数量和诊断包 | 达到 90% 水位或清理失败 |
 | 服务无法启动 | 检查 SCM、账户权限、ProgramData ACL、端口和事件日志 | 自动恢复策略失败 |
 
-### 20.3 事件严重级别
+### 24.3 事件严重级别
 
 | 级别 | 定义 | 响应要求 |
 | --- | --- | --- |
@@ -878,7 +1467,7 @@ factoryguard/
 | Sev3 | 单通道非关键故障、少量误报、可自动恢复问题 | 纳入日常巡检和版本修复 |
 | Sev4 | 咨询、样式、非关键文档或低影响优化 | 按Backlog处理 |
 
-### 20.4 责任矩阵（RACI）
+### 24.4 责任矩阵（RACI）
 
 | 工作 | 客户负责人 | 客户管理员 | 实施/售后 | FactoryGuard 团队 |
 | --- | --- | --- | --- | --- |
@@ -890,7 +1479,7 @@ factoryguard/
 | 故障诊断与补丁 | I | C | R/A | R |
 | 验收签字 | A | C | R | I |
 
-### 20.5 备份与恢复演练
+### 24.5 备份与恢复演练
 
 - 每次正式验收前至少完成一次数据库恢复演练，验证 schema_version、事件数量、配置和 Outbox 状态。
 - 每次大版本升级前生成升级前快照，至少包含配置、SQLite、许可证信息和当前版本号。
@@ -899,11 +1488,15 @@ factoryguard/
 
 ---
 
-## 21. 立项检查清单（Kickoff Checklist）
+## 25. 立项检查清单（Kickoff Checklist）
 
-- [ ] 本报告 v1.2 评审通过并冻结 v1.0 需求范围
+- [ ] 本报告 v1.3 评审通过并冻结 v1.0 需求范围
 - [x] 建立 master/develop 分支策略：master 只保留 README、LICENSE，开发在 develop 完成
 - [x] 采用 MIT License，并在 master/develop 均保留 LICENSE
+- [x] 完成配置 Schema、密钥分离和启用前预检规则设计
+- [x] 完成 NVR 品牌兼容状态、RTSP 模板和准入测试矩阵设计
+- [x] 完成现场部署验收表、故障注入签收项和培训交接项设计
+- [x] 完成试点期间每日健康报表、周报汇总和降级判定规则设计
 - [ ] 完成 Windows 服务监督器 Rust/C# 与 pywin32 方案的技术决策
 - [ ] 搭建 Windows Runner：单元测试、架构自检、模拟剧本和故障注入
 - [ ] 准备 Windows 10/11 干净虚拟机和 16 路演示值守电脑基线
@@ -916,11 +1509,11 @@ factoryguard/
 
 ---
 
-## 22. 行业资料与标准依据
+## 26. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 22.1 平台与可靠性资料
+### 26.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -932,8 +1525,12 @@ factoryguard/
 | ONNX Runtime：DirectML Execution Provider | DirectML 推理提供程序和 Windows GPU 加速 |
 | SQLite：Write-Ahead Logging | SQLite WAL、事务与读写并发设计 |
 | SQLite：How To Corrupt An SQLite Database File | 数据库损坏原因和文件写入风险规避 |
+| Hikvision Support：How do I get my RTSP stream? | 海康 RTSP 地址、101/102 主/子码流模板 |
+| Dahua Wiki：Remote Access/RTSP via VLC | 大华 RTSP realmonitor 地址模板参考 |
+| CCTV Database：Uniview RTSP URL | 宇视 media/video1、media/video2 路径汇总；实施时仍以厂商手册和实测为准 |
+| Microsoft Learn：Powercfg command-line options | 电源策略、睡眠状态与现场电源诊断参考 |
 
-### 22.2 视频与设备协议资料
+### 26.2 视频与设备协议资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -943,7 +1540,7 @@ factoryguard/
 | GB/T 28181 相关公共安全视频监控联网标准 | 二期平台级联和协议扩展预研 |
 | GA/T 1400 相关公共安全视频图像信息系统标准 | 二期视图库、事件对象和平台对接预研 |
 
-### 22.3 主要链接
+### 26.3 主要链接
 
 - https://learn.microsoft.com/en-us/windows/win32/services/service-programs
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w
@@ -958,8 +1555,14 @@ factoryguard/
 - https://www.rfc-editor.org/rfc/rfc7826
 - https://ffmpeg.org/ffmpeg-protocols.html#rtsp
 - https://www.onvif.org/profiles/specifications/
+- https://supportusa.hikvision.com/support/solutions/articles/17000129064-how-do-i-get-my-rtsp-stream-
+- https://dahuawiki.com/Remote_Access/RTSP_via_VLC
+- https://www.cctv-database.com/rtsp/uniview/
+- https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/powercfg-command-line-options
 
----## 附录：术语
+---
+
+## 附录：术语
 
 - **NVR**：网络硬盘录像机，负责摄像机视频接入与连续录像；
 - **RTSP**：实时流传输协议，本项目首版取流协议；
