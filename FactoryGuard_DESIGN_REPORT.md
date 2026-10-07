@@ -1,8 +1,8 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v1.3
+> 文档版本：v1.4
 > 成文日期：2026-10-07
-> 文档状态：立项稿（Windows 可靠性、配置基线与交付验收增强版）
+> 文档状态：立项稿（Windows 服务、ACL、数据库恢复与交付运维增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练和一键诊断为 v1.0 发布红线。
 
@@ -842,9 +842,384 @@ factoryguard/
 
 ---
 
-## 20. 配置 Schema 与校验规则
+## 20. Windows 服务安装与生命周期操作手册
 
-### 20.1 配置管理原则
+### 20.1 安装边界
+
+v1.0 的安装、升级和服务注册允许提权；服务启动后的日常预览、布撤防、处警和诊断导出不得要求管理员权限。安装器应直接调用 Windows SCM API 完成服务创建、恢复策略和权限配置；下列命令用于实施人员复核、实验室演练和故障处置。
+
+| 对象 | 建议值 |
+| --- | --- |
+| 服务名称 | FactoryGuard |
+| 显示名称 | FactoryGuard 厂区智防服务 |
+| 进程类型 | SERVICE_WIN32_OWN_PROCESS |
+| 启动类型 | Automatic |
+| 服务账户 | NT Service\FactoryGuard |
+| 安装目录 | C:\Program Files\FactoryGuard |
+| 数据目录 | C:\ProgramData\FactoryGuard |
+| 本地操作员组 | FactoryGuard Operators |
+| 本地管道 | \\\\.\\pipe\\FactoryGuard-v1 |
+
+### 20.2 安装前置检查
+
+```powershell
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$os = Get-CimInstance Win32_OperatingSystem
+$cs = Get-CimInstance Win32_ComputerSystem
+$sysDrive = Get-Volume -DriveLetter $env:SystemDrive.TrimEnd(':')
+[pscustomobject]@{
+  Caption = $os.Caption
+  Version = $os.Version
+  OSArchitecture = $os.OSArchitecture
+  TotalMemoryGB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+  SystemDriveFreeGB = [math]::Round($sysDrive.SizeRemaining / 1GB, 1)
+  IsSystemDriveNTFS = $sysDrive.FileSystemType -eq 'NTFS'
+} | Format-List
+```
+
+阻断条件：非 x64、非 Windows 10/11 支持版本、系统盘非 NTFS、可用空间不足、当前账户无管理员权限、安装包签名校验失败。
+
+### 20.3 创建本地操作员组与目录 ACL
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$groupName = 'FactoryGuard Operators'
+$dataDir = 'C:ProgramDataFactoryGuard'
+$group = Get-LocalGroup -Name $groupName -ErrorAction SilentlyContinue
+if ($null -eq $group) {
+  $group = New-LocalGroup -Name $groupName -Description 'FactoryGuard 授权值班操作员'
+}
+# 仅将经过客户确认的值班账户加入该组，不添加 Users 或 Everyone。
+# Add-LocalGroupMember -Group $groupName -Member 'DOMAIN或计算机名值班账户'
+$subDirs = @('db','snapshots','clips','tmp','logs','backups','diagnostics','models')
+foreach ($dir in $subDirs) {
+  New-Item -ItemType Directory -Force -Path (Join-Path $dataDir $dir) | Out-Null
+}
+$aclArgs = @(
+  $dataDir,
+  '/inheritance:r',
+  '/grant:r',
+  'NT AUTHORITYSYSTEM:(OI)(CI)F',
+  'BUILTINAdministrators:(OI)(CI)F',
+  'NT SERVICEFactoryGuard:(OI)(CI)F'
+)
+& icacls @aclArgs
+if ($LASTEXITCODE -ne 0) { throw 'FactoryGuard 数据目录 ACL 配置失败' }
+```
+
+设计说明：UI 需要的截图、片段和状态由服务通过命名管道授权传输，因此不向普通用户直接开放 ProgramData 事件文件。操作员不应因为能登录 Windows 就自动获得视频数据访问权。
+
+### 20.4 注册 Windows 服务
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$serviceName = 'FactoryGuard'
+$bin = '"C:Program FilesFactoryGuardactoryguard-supervisor.exe" --service'
+$existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+if ($null -ne $existing) {
+  throw "服务 $serviceName 已存在，请按升级流程处理，不得重复创建"
+}
+$createArgs = @(
+  $serviceName,
+  'type=', 'own',
+  'start=', 'auto',
+  'binPath=', $bin,
+  'obj=', 'NT ServiceFactoryGuard',
+  'password=', '',
+  'DisplayName=', 'FactoryGuard 厂区智防服务'
+)
+& sc.exe @createArgs
+if ($LASTEXITCODE -ne 0) { throw '服务创建失败' }
+& sc.exe description $serviceName '提供 FactoryGuard 视频接入、AI 检测、规则判定、事件存储和通知服务'
+if ($LASTEXITCODE -ne 0) { throw '服务说明配置失败' }
+
+# 服务创建后虚拟服务账户才可稳定解析，再授予数据目录权限。
+$grantArgs = @($dataDir, '/grant:r', 'NT SERVICE\FactoryGuard:(OI)(CI)F')
+& icacls @grantArgs
+if ($LASTEXITCODE -ne 0) { throw 'FactoryGuard 服务账户数据目录授权失败' }
+```
+
+注意：PowerShell 中 "sc" 是 Set-Content 的别名，必须使用完整的 "sc.exe"。生产安装器应以 CreateService/ChangeServiceConfig2 API 作为权威实现，命令仅用于复核。
+
+### 20.5 配置 SCM 失败恢复策略
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$serviceName = 'FactoryGuard'
+$failureArgs = @(
+  $serviceName,
+  'reset=', '86400',
+  'actions=', 'restart/10000/restart/10000/restart/10000'
+)
+& sc.exe @failureArgs
+if ($LASTEXITCODE -ne 0) { throw '服务恢复策略配置失败' }
+$configArgs = @($serviceName, 'start=', 'auto')
+& sc.exe @configArgs
+if ($LASTEXITCODE -ne 0) { throw '服务启动类型配置失败' }
+Get-CimInstance Win32_Service -Filter "Name='FactoryGuard'" |
+  Select-Object Name, State, StartMode, StartName, PathName |
+  Format-List
+```
+
+恢复策略要求：服务进程异常退出后 10 秒重启；24 小时无故障后重置失败计数；监督器再通过 Job Object 管理所有 Engine、Inference 和 FFmpeg 子进程。SCM 只负责服务主进程，不能替代应用层看门狗。
+
+### 20.6 首次启动与验收
+
+```powershell
+$ErrorActionPreference = 'Stop'
+& sc.exe start FactoryGuard
+if ($LASTEXITCODE -ne 0) { throw '服务启动失败' }
+& sc.exe queryex FactoryGuard
+if ($LASTEXITCODE -ne 0) { throw '服务状态查询失败' }
+Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = (Get-Date).AddMinutes(-10) } |
+  Where-Object { $_.ProviderName -in @('Service Control Manager','FactoryGuard') } |
+  Select-Object TimeCreated, ProviderName, Id, LevelDisplayName, Message |
+  Format-List
+```
+
+首次启动必须满足：服务 Running；无用户登录时重启仍能自动运行；模型 Warmup 完成；通道按配置连接；健康状态为 Ready 或明确 Degraded；Windows 事件日志中无重复启动/停止风暴。
+
+### 20.7 停止、重启、升级流程
+
+| 阶段 | 动作 | 安全要求 |
+| --- | --- | --- |
+| 升级前 | 导出当前配置摘要，完成数据库 Online Backup | 备份通过 integrity_check |
+| 停止服务 | sc.exe stop；等待 STOPPED | Job Object 清理所有子进程 |
+| 文件替换 | 仅替换 Program Files 下签名文件 | 不修改 ProgramData，除非迁移要求 |
+| 数据迁移 | 执行前向迁移 | 单事务、版本记录、失败自动回滚 |
+| 启动验证 | 服务启动、Warmup、通道连接、通知检查 | 健康状态和版本号正确 |
+| 交付确认 | 保存升级记录和测试证据 | 客户/实施双方确认 |
+
+### 20.8 回滚流程
+
+1. 停止新版本服务并确认无残留子进程；
+2. 将 Program Files 二进制恢复到升级前版本；
+3. 恢复升级前数据库备份到临时路径并执行完整性检查；
+4. 校验 schema_version、config_version、事件数、Outbox 待办和 ACL；
+5. 通过原子替换切换数据库，再启动旧版本服务；
+6. 在审计中记录回滚原因、RTO、RPO、缺失事件和后续修复版本。
+
+### 20.9 常见服务异常判定
+
+| 现象 | 可能原因 | 首要证据 |
+| --- | --- | --- |
+| 服务立即停止 | 命令行错误、配置损坏、权限不足 | System 事件日志、服务退出码 |
+| 服务 Running 但通道全 Offline | 网络/NVR/凭据问题 | 健康样本、通道错误码 |
+| 服务周期性重启 | 主进程崩溃或依赖加载失败 | WER dump、重启计数、应用日志 |
+| 重启后不启动 | 启动类型、组策略或账户权限变化 | Win32_Service、SCM 日志 |
+| 停止时间过长 | 子进程未退出、队列阻塞、数据库未刷新 | Job Object 进程树、队列水位 |
+
+---
+
+## 21. 命名管道与本地通信安全
+
+### 21.1 通信边界
+
+服务运行在 Session 0，UI 运行在已登录用户会话，二者通过本地命名管道通信。管道只服务本机，不监听额外 TCP/UDP 端口，不使用远程桌面映射，也不允许匿名访问。
+
+| 项目 | 值 |
+| --- | --- |
+| 管道名 | \\\\.\\pipe\\FactoryGuard-v1 |
+| 服务端 | FactoryGuard Service |
+| 客户端 | FactoryGuard UI / 本地诊断工具 |
+| 数据格式 | JSON Lines；request_id 关联请求和响应 |
+| 单消息上限 | 1 MiB；截图和片段按分块或流式传输 |
+| 远程客户端 | 使用 PIPE_REJECT_REMOTE_CLIENTS 拒绝 |
+
+### 21.2 管道 ACL/SDDL
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$groupName = 'FactoryGuard Operators'
+$groupSid = (Get-LocalGroup -Name $groupName).SID.Value
+# 仅 SYSTEM、Administrators 和 FactoryGuard Operators 可访问；不向 Users、Everyone、Anonymous Logon 授权。
+$pipeSddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;$groupSid)"
+$pipeSddl
+```
+
+SDDL 语义：
+
+| ACE | 权限 | 含义 |
+| --- | --- | --- |
+| SY | GA | SYSTEM 完全控制 |
+| BA | GA | 本机 Administrators 完全控制 |
+| FactoryGuard Operators | GR/GW | 授权操作员读取状态、写入命令 |
+| Users/Everyone/Anonymous | 无 ACE | 默认拒绝 |
+
+服务端应使用 ConvertStringSecurityDescriptorToSecurityDescriptor 校验 SDDL；配置失败时不得创建开放 ACL 的管道。
+
+### 21.3 服务端创建要求
+
+CreateNamedPipe 的关键配置：
+
+- PIPE_ACCESS_DUPLEX；
+- PIPE_TYPE_BYTE + PIPE_READMODE_BYTE 或统一的消息模式；
+- PIPE_WAIT；
+- 不使用 PIPE_UNLIMITED_INSTANCES 放任实例增长，建议设置明确最大实例数；
+- PIPE_REJECT_REMOTE_CLIENTS；
+- 默认超时、缓冲区大小和单消息大小均设置上限；
+- 管道安全描述符使用第 21.2 节 SDDL。
+
+服务端必须在接受客户端后调用 GetNamedPipeClientProcessId/GetNamedPipeClientSessionId，打开客户端进程令牌并复核：账户是否启用、是否属于授权组、会话是否为本地交互会话、是否被锁定或禁用。ACL 是第一道门，应用层令牌检查是第二道门。
+
+### 21.4 消息帧与幂等规则
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "b81621e6-7eb9-4579-bc08-c96e75c2b001",
+  "type": "ArmCommand",
+  "issued_at": "2026-10-07T21:59:30+08:00",
+  "payload": {
+    "scope": "channel",
+    "channel_id": "ch-east-wall-01",
+    "armed": true,
+    "reason": "夜间布防"
+  }
+}
+```
+
+规则：
+
+- 每个命令必须有 request_id；重试时复用同一 request_id，服务端按幂等键处理；
+- UI 发送配置修改、布撤防、事件处置时必须携带操作者和原因；
+- 服务端对 JSON Schema、资源版本、权限、ID 引用和状态流进行校验；
+- 无效消息、超长消息、无法解析消息应关闭当前连接并审计，不能导致服务线程崩溃；
+- HealthSnapshot 可主动推送，其他请求按 request_id 匹配响应。
+
+### 21.5 连接生命周期
+
+1. 服务启动后创建管道实例；
+2. UI 发起连接，非 Ready 阶段允许连接但只能读取启动/降级状态；
+3. 服务校验客户端令牌和本地会话；
+4. 建立连接后 UI 请求 HealthSnapshot；
+5. 服务持续推送健康变化；连接断开后 UI 可按短退避重连；
+6. 用户注销、锁屏、UI 退出时关闭连接，后台检测不中断。
+
+### 21.6 必测安全矩阵
+
+| 测试 | 通过标准 |
+| --- | --- |
+| Operator 组成员连接 | 可读取授权通道并执行授权动作 |
+| 非 Operator 普通用户连接 | 连接被拒绝或命令被拒绝，并写入审计 |
+| 远程 SMB 管道访问 | 被 PIPE_REJECT_REMOTE_CLIENTS/防火墙策略拒绝 |
+| 匿名或空身份 | 拒绝 |
+| 超大消息 | 连接关闭，服务内存不持续增长 |
+| 半条 JSON/非法 JSON | 当前连接关闭，其他客户端不受影响 |
+| 禁用操作员组成员 | 既有连接被关闭或后续命令被拒绝 |
+| UI 重连风暴 | 客户端退避，服务线程和句柄数恢复 |
+
+---
+
+## 22. SQLite 迁移、备份与恢复手册
+
+### 22.1 数据库连接基线
+
+每个连接必须显式设置以下 PRAGMA，不依赖系统默认值：
+
+```sql
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=5000;
+PRAGMA synchronous=FULL;
+PRAGMA temp_store=MEMORY;
+```
+
+v1.0 对事件、Outbox、审计等关键数据采用 synchronous=FULL，优先保证提交后的持久性；性能优化不得绕过事务边界。SchemaMigration 记录版本、校验和、执行时间、结果和回滚信息。
+
+### 22.2 迁移原则
+
+| 原则 | 要求 |
+| --- | --- |
+| 前向迁移 | 每次只升级到相邻版本，不跳版本 |
+| 先备份 | 迁移前自动创建 Online Backup |
+| 版本明确 | user_version 或独立 SchemaMigration 表记录版本 |
+| 事务提交 | 单版本迁移失败即回滚，不允许半升级状态 |
+| 应用兼容 | 新版本启动前验证最低 schema_version；旧版本拒绝打开过新数据库 |
+| 证据完整 | 迁移日志包含旧版本、新版本、耗时、校验和、操作者 |
+
+迁移清单应避免不可逆删除；确需删除字段或数据时，先保留过渡表或备份，并在发布说明中明确 RPO。
+
+### 22.3 迁移命令契约
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$serviceExe = 'C:Program FilesFactoryGuardactoryguard-supervisor.exe'
+$dbPath = 'C:ProgramDataFactoryGuarddbactoryguard.db'
+& $serviceExe db migrate --database $dbPath --target 3
+if ($LASTEXITCODE -ne 0) { throw '数据库迁移失败，应按输出提示执行回滚' }
+```
+
+### 22.4 在线备份
+
+生产环境只允许使用 SQLite Online Backup API 或产品封装命令；不要在 WAL 存在时直接复制主数据库文件作为唯一备份。
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$serviceExe = 'C:Program FilesFactoryGuardactoryguard-supervisor.exe'
+$dbPath = 'C:ProgramDataFactoryGuarddbactoryguard.db'
+$backupPath = 'C:ProgramDataFactoryGuardackupsactoryguard-before-upgrade.db'
+& $serviceExe db backup --database $dbPath --target $backupPath --verify
+if ($LASTEXITCODE -ne 0) { throw '数据库备份或校验失败' }
+```
+
+备份验证至少包含：文件可读、journal mode 正确、integrity_check 返回 ok、foreign_key_check 无结果、应用版本和 schema 版本匹配、备份 ACL 与数据目录一致。
+
+### 22.5 恢复流程
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$serviceName = 'FactoryGuard'
+$serviceExe = 'C:Program FilesFactoryGuardactoryguard-supervisor.exe'
+$restoreSource = 'C:ProgramDataFactoryGuardackupsactoryguard-known-good.db'
+$restoreTarget = 'C:ProgramDataFactoryGuarddbactoryguard.restored.db'
+& sc.exe stop $serviceName
+if ($LASTEXITCODE -ne 0) { throw '服务停止失败' }
+& $serviceExe db restore --from $restoreSource --to $restoreTarget --verify
+if ($LASTEXITCODE -ne 0) { throw '数据库恢复或校验失败' }
+# 校验通过后，仅允许在同一卷进行原子替换；原数据库移动到 quarantine，不直接覆盖删除。
+& sc.exe start $serviceName
+if ($LASTEXITCODE -ne 0) { throw '恢复后服务启动失败' }
+```
+
+恢复完成后必须核对：服务版本、schema_version、最近事件、Outbox 待发通知、审计连续号、片段引用状态、文件 ACL 和系统时间。恢复造成的 RPO 必须写入验收/故障报告。
+
+### 22.6 损坏诊断矩阵
+
+| 现象 | 判定 | 处理 |
+| --- | --- | --- |
+| integrity_check 返回 ok | 未发现结构损坏 | 可继续排查应用错误 |
+| quick_check 报错 | 可能存在页或索引损坏 | 立即备份现状并准备恢复 |
+| database disk image is malformed | 数据库结构损坏 | 进入恢复流程，保留损坏文件 |
+| WAL 文件异常增长 | 检查点失败、长事务或备份未结束 | 停止写入任务，安全 checkpoint，不能删除 WAL |
+| database is locked 持续出现 | 长事务或 busy_timeout 配置问题 | 查看锁等待和事务耗时，必要时重启 Worker |
+| 恢复后片段引用缺失 | 数据库与文件目录不一致 | 标记 clip_status，按保留目录修复或提示 NVR 取证 |
+
+### 22.7 停止服务后的只读检查
+
+```sql
+PRAGMA user_version;
+PRAGMA integrity_check;
+PRAGMA foreign_key_check;
+PRAGMA wal_checkpoint(TRUNCATE);
+```
+
+这些操作仅限排障窗口。生产运行中需要检查时，应使用产品封装的只读诊断命令，避免人工执行语句改变业务状态。
+
+### 22.8 备份恢复演练要求
+
+- 每次验收前执行一次恢复到临时库的演练；
+- 每季度或每个大版本升级前执行一次完整恢复启动演练；
+- 记录备份耗时、恢复耗时、RPO、完整性结果、失败项和处理人；
+- 备份文件不得比正式数据目录拥有更宽 ACL；
+- “每日备份成功”不能替代“从备份成功启动服务”的验证。
+
+---
+
+## 23. 配置 Schema 与校验规则
+
+### 23.1 配置管理原则
 
 生产环境的权威配置保存在 SQLite 中，导出文件仅用于备份、评审和实施交接。任何配置变更必须经过“草案生成 → Schema 校验 → 业务预检 → 事务提交 → 审计记录”五个步骤，禁止直接手工修改运行中数据库。
 
@@ -857,7 +1232,7 @@ factoryguard/
 | 环境一致 | 通道、规则、通知中的 ID 必须能互相引用，不允许悬空 ID |
 | 可观测 | 配置变更后立即执行健康检查，并在 UI 展示预检结果 |
 
-### 20.2 顶层配置对象
+### 23.2 顶层配置对象
 
 | 字段 | 类型 | 必填 | 校验规则 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -878,7 +1253,7 @@ factoryguard/
 | notifications | array<NotificationChannel> | 否 | Webhook URL、密钥引用合法 | 企微/钉钉等渠道 |
 | health_policy | object | 是 | 心跳、阈值、降级策略合法 | 健康监测策略 |
 
-### 20.3 Site / Service / NTP 对象
+### 23.3 Site / Service / NTP 对象
 
 ```yaml
 site:
@@ -919,7 +1294,7 @@ ntp:
 - critical_offset_ms 必须大于 warning_offset_ms，且均为正数；
 - 站点时区必须是 IANA 时区标识，中国现场默认 Asia/Shanghai。
 
-### 20.4 Storage / Logging / Security 对象
+### 23.4 Storage / Logging / Security 对象
 
 ```yaml
 storage:
@@ -963,7 +1338,7 @@ security:
 
 文件系统预检必须验证：路径所在卷为 NTFS、服务账户具备读写权限、路径不是可移动磁盘、剩余空间不低于 min_free_gb、临时目录与片段目录在同一卷或具备足够复制空间。
 
-### 20.5 NVR 与通道配置
+### 23.5 NVR 与通道配置
 
 ```yaml
 nvrs:
@@ -1006,7 +1381,7 @@ channels:
 - expected.fps_min 不得大于 expected.fps_max；首版分析通道建议宽度 352～1280；
 - 通道能力探测结果与 expected 不一致时，可保存为 blocked 或 degraded，但不能显示 Ready。
 
-### 20.6 模型配置
+### 23.6 模型配置
 
 ```yaml
 models:
@@ -1029,7 +1404,7 @@ models:
 
 模型文件发布前必须记录来源、版本、许可证、校验和、输入尺寸、标签、预处理参数和后处理参数。模型 Warmup 失败、标签缺失、校验和不一致时不得进入生产 Ready。
 
-### 20.7 规则几何 Schema
+### 23.7 规则几何 Schema
 
 ```yaml
 rules:
@@ -1063,7 +1438,7 @@ rules:
 
 几何坐标使用归一化或像素坐标均可，但必须显式声明 coordinate_space。通道实际分辨率变化时，规则需要重新映射并经过人工确认，不能静默按比例拉伸。
 
-### 20.8 布防时间表
+### 23.8 布防时间表
 
 ```yaml
 schedules:
@@ -1088,7 +1463,7 @@ schedules:
 
 时间表达式必须处理跨零点、节假日、夏令时数据异常和重复星期。中国现场不实行夏令时，但若系统导入异常日历，仍以本地时区和明确日期优先。
 
-### 20.9 通知渠道配置
+### 23.9 通知渠道配置
 
 ```yaml
 notifications:
@@ -1108,7 +1483,7 @@ notifications:
 
 通知预检应发送测试消息，但测试消息必须标识“测试”且不进入正式事件统计。URL 和签名密钥必须作为敏感数据处理。
 
-### 20.10 配置启用前预检清单
+### 23.10 配置启用前预检清单
 
 | 预检项 | 通过标准 | 失败处理 |
 | --- | --- | --- |
@@ -1124,9 +1499,9 @@ notifications:
 
 ---
 
-## 21. NVR 品牌兼容矩阵
+## 24. NVR 品牌兼容矩阵
 
-### 21.1 兼容策略
+### 24.1 兼容策略
 
 品牌模板只能提高配置效率，不能替代现场探测。任何模板在未通过“端口连接、认证、子码流、编码、分辨率、帧率、PTS、断流恢复”八项检查前，兼容状态只能标记为 unknown，不得标记为 certified。
 
@@ -1138,7 +1513,7 @@ notifications:
 | Blocked | 认证、取流或并发能力不满足首版要求 |
 | Unknown | 仅有模板，未完成现场或实验室测试 |
 
-### 21.2 RTSP 地址模板
+### 24.2 RTSP 地址模板
 
 | 品牌 | 主码流模板 | 子码流模板 | 备注 |
 | --- | --- | --- | --- |
@@ -1150,7 +1525,7 @@ notifications:
 
 URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把用户名和密码拼接到日志、诊断包或错误消息中。
 
-### 21.3 品牌兼容记录表
+### 24.3 品牌兼容记录表
 
 | 字段 | 示例 | 记录要求 |
 | --- | --- | --- |
@@ -1169,7 +1544,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | limitations | 子码流需手动开启 | 所有限制必须说明 |
 | test_evidence | report-2026-xx | 关联测试记录、截图或自动化报告 |
 
-### 21.4 品牌准入测试
+### 24.4 品牌准入测试
 
 | 测试项 | 通过标准 |
 | --- | --- |
@@ -1183,7 +1558,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | 长稳 | 至少 24 小时无未恢复错误；认证等级需覆盖 168 小时 |
 | 时间同步 | NVR 时间与 Windows 偏差可读取或可人工记录，超过阈值有处置流程 |
 
-### 21.5 常见现场限制与规避
+### 24.5 常见现场限制与规避
 
 | 限制 | 风险 | 规避方案 |
 | --- | --- | --- |
@@ -1197,9 +1572,9 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 
 ---
 
-## 22. 现场部署验收表
+## 25. 现场部署验收表
 
-### 22.1 项目基础信息
+### 25.1 项目基础信息
 
 | 项目 | 记录值 | 验收要求 |
 | --- | --- | --- |
@@ -1214,7 +1589,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | 计划接入通道数 |  | 1～32 |
 | 实际接入通道数 |  | 与配置和设备一致 |
 
-### 22.2 值守电脑硬件检查
+### 25.2 值守电脑硬件检查
 
 | 检查项 | 记录值 | 通过标准 |
 | --- | --- | --- |
@@ -1227,7 +1602,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | 显存 |  | GPU 模式满足模型加载 |
 | 电源与散热 |  | 无高温、无异常断电记录 |
 
-### 22.3 Windows 系统检查
+### 25.3 Windows 系统检查
 
 | 检查项 | 记录值/结果 | 通过标准 |
 | --- | --- | --- |
@@ -1243,7 +1618,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | 服务账户 ACL |  | 服务账户仅获得必要目录权限 |
 | 安全软件 |  | 数字签名后可运行，文件锁定有记录 |
 
-### 22.4 网络与 NVR 检查
+### 25.4 网络与 NVR 检查
 
 | 检查项 | 结果 | 通过标准 |
 | --- | --- | --- |
@@ -1258,7 +1633,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | 子码流 |  | 所有分析通道具备可用子码流 |
 | 公网端口 |  | 不映射 RTSP/管理端口到公网 |
 
-### 22.5 通道与规则验收
+### 25.5 通道与规则验收
 
 | 通道编号 | 通道名称 | 区域 | 子码流 | 规则类型 | 目标 | 时间表 | 确认帧 | 结果 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -1267,7 +1642,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 
 规则验收必须至少完成：无入侵基线、人员进入、人员未进入仅靠近、目标进入后离开、冷却期重复触发、临时布撤防。关键区域应逐条验收，不允许用“全部正常”代替。
 
-### 22.6 通知与处警验收
+### 25.6 通知与处警验收
 
 | 检查项 | 通过标准 | 结果 |
 | --- | --- | --- |
@@ -1279,7 +1654,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | 误报标记 | 可标记误报并保留审计 | Pass/Fail |
 | 事件关闭 | 关闭后仍可查询，不被物理删除 | Pass/Fail |
 
-### 22.7 故障注入签收项
+### 25.7 故障注入签收项
 
 | 故障注入 | 操作方式 | 通过标准 | 结果 |
 | --- | --- | --- | --- |
@@ -1292,7 +1667,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | 磁盘水位 | 模拟或使用预留卷测试 | 清理策略生效，数据库不损坏 | Pass/Fail |
 | 系统重启 | 重启 Windows，不登录用户 | 服务自动启动并恢复布防 | Pass/Fail |
 
-### 22.8 培训与遗留问题
+### 25.8 培训与遗留问题
 
 | 项目 | 记录 |
 | --- | --- |
@@ -1307,13 +1682,13 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 
 ---
 
-## 23. 每日健康报表格式
+## 26. 每日健康报表格式
 
-### 23.1 报表用途
+### 26.1 报表用途
 
 试点期间每日生成健康报表，用于判断系统是否真正持续可用。报表不能只给“正常/异常”结论，必须包含可复核的原始指标、降级时段、事件数量、通知状态和处置人。
 
-### 23.2 JSON 报表 Schema
+### 26.2 JSON 报表 Schema
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -1337,7 +1712,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | action_items | array | 待处理问题、负责人、截止时间 |
 | report_hash | string | 报表内容哈希，用于归档校验 |
 
-### 23.3 每日报表示例
+### 26.3 每日报表示例
 
 ```json
 {
@@ -1408,7 +1783,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 }
 ```
 
-### 23.4 巡检结论规则
+### 26.4 巡检结论规则
 
 - 任一关键通道 Offline 且没有恢复记录，overall_state 不得为 Ready；
 - P95 延迟超过 10 秒，必须给出队列、GPU、CPU、网络或通知渠道原因；
@@ -1417,7 +1792,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 - 可用率不能只按服务进程存活计算，应按布防策略、通道在线、检测链路和通知链路综合计算；
 - 报表归档后不得修改；如更正，应生成带 correction_of 字段的新版本。
 
-### 23.5 试点周报汇总
+### 26.5 试点周报汇总
 
 周报应汇总每日报表并回答：
 
@@ -1431,9 +1806,9 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 
 ---
 
-## 24. 交付物、运维手册与责任边界
+## 27. 交付物、运维手册与责任边界
 
-### 24.1 交付文档包
+### 27.1 交付文档包
 
 | 文档 | 内容 | 责任方 |
 | --- | --- | --- |
@@ -1446,7 +1821,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | 应急处置手册 | 离线、误报激增、磁盘满、GPU 失败、通知失败、服务无法启动 | 售后 |
 | 验收报告 | 安装、剧本、故障注入、长稳、安全检查、遗留问题和签字项 | 项目经理/客户 |
 
-### 24.2 日常运行 Runbook
+### 27.2 日常运行 Runbook
 
 | 场景 | 一线动作 | 升级条件 |
 | --- | --- | --- |
@@ -1458,7 +1833,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | 磁盘空间不足 | 检查保留策略、异常日志、片段数量和诊断包 | 达到 90% 水位或清理失败 |
 | 服务无法启动 | 检查 SCM、账户权限、ProgramData ACL、端口和事件日志 | 自动恢复策略失败 |
 
-### 24.3 事件严重级别
+### 27.3 事件严重级别
 
 | 级别 | 定义 | 响应要求 |
 | --- | --- | --- |
@@ -1467,7 +1842,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | Sev3 | 单通道非关键故障、少量误报、可自动恢复问题 | 纳入日常巡检和版本修复 |
 | Sev4 | 咨询、样式、非关键文档或低影响优化 | 按Backlog处理 |
 
-### 24.4 责任矩阵（RACI）
+### 27.4 责任矩阵（RACI）
 
 | 工作 | 客户负责人 | 客户管理员 | 实施/售后 | FactoryGuard 团队 |
 | --- | --- | --- | --- | --- |
@@ -1479,7 +1854,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | 故障诊断与补丁 | I | C | R/A | R |
 | 验收签字 | A | C | R | I |
 
-### 24.5 备份与恢复演练
+### 27.5 备份与恢复演练
 
 - 每次正式验收前至少完成一次数据库恢复演练，验证 schema_version、事件数量、配置和 Outbox 状态。
 - 每次大版本升级前生成升级前快照，至少包含配置、SQLite、许可证信息和当前版本号。
@@ -1488,15 +1863,18 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 
 ---
 
-## 25. 立项检查清单（Kickoff Checklist）
+## 28. 立项检查清单（Kickoff Checklist）
 
-- [ ] 本报告 v1.3 评审通过并冻结 v1.0 需求范围
+- [ ] 本报告 v1.4 评审通过并冻结 v1.0 需求范围
 - [x] 建立 master/develop 分支策略：master 只保留 README、LICENSE，开发在 develop 完成
 - [x] 采用 MIT License，并在 master/develop 均保留 LICENSE
 - [x] 完成配置 Schema、密钥分离和启用前预检规则设计
 - [x] 完成 NVR 品牌兼容状态、RTSP 模板和准入测试矩阵设计
 - [x] 完成现场部署验收表、故障注入签收项和培训交接项设计
 - [x] 完成试点期间每日健康报表、周报汇总和降级判定规则设计
+- [x] 完成 Windows 服务安装、SCM 恢复、目录 ACL 和升级回滚操作设计
+- [x] 完成命名管道 SDDL、令牌复核、本地连接和拒绝远程访问设计
+- [x] 完成 SQLite 在线备份、迁移、损坏诊断和恢复演练流程设计
 - [ ] 完成 Windows 服务监督器 Rust/C# 与 pywin32 方案的技术决策
 - [ ] 搭建 Windows Runner：单元测试、架构自检、模拟剧本和故障注入
 - [ ] 准备 Windows 10/11 干净虚拟机和 16 路演示值守电脑基线
@@ -1509,11 +1887,11 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 
 ---
 
-## 26. 行业资料与标准依据
+## 29. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 26.1 平台与可靠性资料
+### 29.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -1525,12 +1903,19 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | ONNX Runtime：DirectML Execution Provider | DirectML 推理提供程序和 Windows GPU 加速 |
 | SQLite：Write-Ahead Logging | SQLite WAL、事务与读写并发设计 |
 | SQLite：How To Corrupt An SQLite Database File | 数据库损坏原因和文件写入风险规避 |
+| Microsoft Learn：Service Accounts in Windows Server | Windows 服务账户类型、虚拟账户和最小权限设计参考 |
+| Microsoft Learn：sc.exe config | 服务启动类型、二进制路径和账户配置复核 |
+| Microsoft Learn：icacls | 目录 ACL 配置和权限继承管理 |
+| Microsoft Learn：Named Pipes / CreateNamedPipe | 本地命名管道、通信模式和实例创建 |
+| Microsoft Learn：Named Pipe Security and Access Rights | 管道访问权限和安全边界 |
+| Microsoft Learn：SDDL / ConvertStringSecurityDescriptor | 管道安全描述符字符串和校验 |
+| SQLite：Backup API / integrity_check / user_version | 在线备份、完整性检查和 Schema 版本管理 |
 | Hikvision Support：How do I get my RTSP stream? | 海康 RTSP 地址、101/102 主/子码流模板 |
 | Dahua Wiki：Remote Access/RTSP via VLC | 大华 RTSP realmonitor 地址模板参考 |
 | CCTV Database：Uniview RTSP URL | 宇视 media/video1、media/video2 路径汇总；实施时仍以厂商手册和实测为准 |
 | Microsoft Learn：Powercfg command-line options | 电源策略、睡眠状态与现场电源诊断参考 |
 
-### 26.2 视频与设备协议资料
+### 29.2 视频与设备协议资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -1540,7 +1925,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | GB/T 28181 相关公共安全视频监控联网标准 | 二期平台级联和协议扩展预研 |
 | GA/T 1400 相关公共安全视频图像信息系统标准 | 二期视图库、事件对象和平台对接预研 |
 
-### 26.3 主要链接
+### 29.3 主要链接
 
 - https://learn.microsoft.com/en-us/windows/win32/services/service-programs
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w
@@ -1559,6 +1944,17 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 - https://dahuawiki.com/Remote_Access/RTSP_via_VLC
 - https://www.cctv-database.com/rtsp/uniview/
 - https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/powercfg-command-line-options
+- https://learn.microsoft.com/en-us/windows/security/identity-protection/access-control/service-accounts
+- https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/sc-config
+- https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls
+- https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipes
+- https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createnamedpipea
+- https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights
+- https://learn.microsoft.com/en-us/windows/win32/secauthz/security-descriptor-definition-language
+- https://learn.microsoft.com/en-us/windows/win32/api/sddl/nf-sddl-convertstringsecuritydescriptortosecuritydescriptora
+- https://www.sqlite.org/backup.html
+- https://www.sqlite.org/pragma.html#pragma_integrity_check
+- https://www.sqlite.org/pragma.html#pragma_user_version
 
 ---
 
@@ -1579,4 +1975,3 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 - **RTO/RPO**：恢复时间目标 / 恢复点目标；
 - **Mock 检测器**：按剧本返回检测结果的模拟引擎；
 - **处警闭环**：事件从产生到确认、误报或关闭的完整流程。
-
