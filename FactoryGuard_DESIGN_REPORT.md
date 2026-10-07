@@ -1,10 +1,11 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v1.9
+> 文档版本：v2.0
 > 成文日期：2026-10-07
-> 文档状态：立项稿（画面质量、模型生命周期、变更连续性与客户成功增强版）
+> 文档状态：立项稿（现场勘察、数据库 Schema、证据验收与长期运维增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
-> 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练和一键诊断为 v1.0 发布红线。
+> 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
+> v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
 
 ---
 
@@ -3764,11 +3765,981 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 
 ---
 
-## 50. 行业资料与标准依据
+## 50. 现场勘察、网络测绘与施工准入
+
+现场勘察不是“到现场看一眼摄像机”，而是把客户组织、摄像机/NVR、网络、供电、物理环境、值班流程和责任边界一次性测绘清楚。FactoryGuard 的可靠性必须从报价和施工前开始控制：凡是现场不满足接入、供电、网络或取证条件的情况，必须在安装日前形成书面偏差、报价项和 Go/No-Go 结论，不能把现场风险留到试运行阶段解释。
+
+### 50.1 两阶段勘察机制
+
+| 阶段 | 触发时间 | 核心目标 | 必要输出 |
+| --- | --- | --- | --- |
+| 售前轻勘察 | 报价或合同签署前 | 判断是否具备接入基础、是否需要摄像机/网络/UPS 改造 | 风险清单、适配假设、报价备注 |
+| 实施详勘察 | 安装日前 3–10 个工作日 | 固化设备、网络、规则、通知、窗口和施工责任 | 详勘报告、施工准入结论、变更/补料清单 |
+
+详勘必须由客户项目发起人授权，确保安防、IT、电工、车间或仓储负责人参加。只拿到一个 NVR 密码但无法确认网络和摄像机画面，不视为具备施工条件。
+
+### 50.2 人员、资料和现场走查
+
+实施方至少要取得以下资料：
+
+- 厂区平面图、CAD 图、车间分布图或手绘示意图；
+- 围墙、大门、仓库、危化品区、配电房、办公区、装卸口、车辆通道、员工通道的位置；
+- NVR 品牌、型号、序列号、管理地址、固件版本和管理员联系人；
+- 交换机、路由器、防火墙、UPS、弱电箱和机柜位置；
+- 排班表、布防/撤防时间、夜班巡逻路线、允许人员活动范围；
+- 通知接收人、升级联系人和值班电话；
+- 现场施工窗口、动火/登高/停电审批要求和陪同人员。
+
+现场走查时应按“从外到内、从入口到重点区域、从 NVR 到每个摄像机”的顺序拍照。照片必须包含全景、摄像机安装位置、NVR 系统信息、交换机端口、UPS 铭牌、插座/接地和电缆路径，不建议只保存局部画面。
+
+### 50.3 摄像机与 NVR 测绘字段
+
+| 字段 | 记录要求 | 不合格迹象 |
+| --- | --- | --- |
+| NVR 品牌/型号/固件 | 系统页面拍照，记录准确型号和版本 | 固件过旧、无法确认是否支持 RTSP/ONVIF |
+| 通道数量 | 实际在线数与授权/许可证数量 | NVR 标称 16 路但部分通道掉线 |
+| 摄像机型号 | 逐通道记录，不允许只写“品牌枪机” | 型号不明、焦距不明、夜间补光不明 |
+| 分辨率/编码/帧率 | 主码流和子码流分别记录 | 子码流未启用、H.265 但首版基线未验证 |
+| 码率和关键帧间隔 | 记录平均码率、I 帧间隔和音频开关 | 码率波动过大、关键帧间隔过长 |
+| RTSP 路径 | 使用实际模板验证，不只凭文档猜测 | 需要特殊 URL、厂商二次鉴权或 URL 过期 |
+| 认证方式 | 摘要认证/基本认证/免鉴权 | 弱密码、多人共用、无法建立专用账号 |
+| 时间同步 | NVR 和摄像机时间源、时区、NTP 状态 | 与值守电脑偏差超过 1 秒 |
+| 连续录像策略 | 录像计划、保存天数、盘组状态 | NVR 本身录像异常或磁盘告警 |
+
+FactoryGuard 不得改变 NVR 作为连续录像权威的地位。若客户希望同时调整 NVR 录像计划、移动摄像机或更换硬盘，应列为独立施工项，不应混入 AI 平台安装。
+
+### 50.4 网络链路测绘和测试
+
+需要绘制最小网络拓扑：摄像机/NVR 所在交换机、FactoryGuard 值守电脑接入端口、网关、VLAN、防火墙、是否跨三层、是否有多条默认路由。首版推荐 NVR 与值守电脑位于同一受管厂区内网或同一安全 VLAN；若必须跨网段，必须明确路由、ACL、MTU 和防火墙责任。
+
+```powershell
+$targets = @(
+  @{ Name = 'NVR'; Address = '192.168.10.20'; Port = 554 },
+  @{ Name = 'Gateway'; Address = '192.168.10.1'; Port = 0 }
+)
+
+$report = foreach ($target in $targets) {
+  $ping = Test-Connection -ComputerName $target.Address -Count 20 -ErrorAction SilentlyContinue
+  $received = @($ping).Count
+  $result = [pscustomobject]@{
+    Name = $target.Name
+    Address = $target.Address
+    Sent = 20
+    Received = $received
+    LossPct = [math]::Round((20 - $received) * 5, 2)
+    AverageLatencyMs = [math]::Round(($ping | Measure-Object ResponseTime -Average).Average, 2)
+  }
+  if ($target.Port -gt 0) {
+    $port = Test-NetConnection -ComputerName $target.Address -Port $target.Port -WarningAction SilentlyContinue
+    $result | Add-Member -NotePropertyName TcpPort -NotePropertyValue $target.Port
+    $result | Add-Member -NotePropertyName TcpTestSucceeded -NotePropertyValue $port.TcpTestSucceeded
+  }
+  $result
+}
+
+$report | Format-Table -AutoSize
+$report | Export-Csv -NoTypeInformation -Encoding UTF8 '.\network-probe.csv'
+```
+
+媒体链路还应执行 ffprobe 与至少 10 分钟实流拉取：
+
+```powershell
+$streamPath = '/Streaming/Channels/102'
+$probeFile = '.\channel-01-ffprobe.json'
+ffprobe -v error -rtsp_transport tcp -show_streams -show_format -of json $streamPath |
+  Set-Content -Encoding UTF8 $probeFile
+if ($LASTEXITCODE -ne 0) { throw 'ffprobe failed; RTSP path, authentication or network must be checked' }
+
+ffmpeg -hide_banner -loglevel info -rtsp_transport tcp -i $streamPath -t 600 -an -f null -
+if ($LASTEXITCODE -ne 0) { throw 'Ten-minute RTSP soak test failed' }
+```
+
+建议准入阈值如下：
+
+- 20 个 ICMP 探测丢包率为 0，平均延迟稳定；工业网络中偶发 1 次丢包也必须复测并解释；
+- 10 分钟 RTSP over TCP 拉流无重连、无花屏、无异常退出；
+- 链路双工/速率确认，不允许不明半双工或大量端口错误计数；
+- 分析高峰期仍保留不少于 30% 的网络余量；
+- NVR、值守电脑均使用静态地址或静态 DHCP 保留；
+- 不建议值守电脑同时连接未受控 Wi‑Fi、访客网或双网卡。
+
+### 50.5 供电、机柜与物理环境
+
+| 检查项 | 最低要求 | 证据 |
+| --- | --- | --- |
+| UPS | 值守电脑、NVR/交换机供电方案明确，电池续航满足安全关机或客户停电策略 | UPS 铭牌、负载率、电池测试记录 |
+| 插座和接地 | 插座可靠、接地规范，不使用劣质插线板串接 | 照片、电工确认 |
+| 机柜空间 | 散热、走线、维护空间充足，不堵塞通风口 | 机柜正面/背面照片 |
+| 温湿度 | 避免高温、潮湿、粉尘、油污和凝露 | 现场读数和风险说明 |
+| 防雷和浪涌 | 弱电设备有与现场等级匹配的浪涌保护 | 物料和电工签字 |
+| 物理安全 | 值守电脑不能被无关人员随意关机、拔线或复制数据 | 机房/办公室门锁和访问控制 |
+
+核心检测是 Windows 后台服务，不需要值班员保持登录；因此不应为了“开机后自动启动软件”而配置无密码自动登录。服务在系统启动后由 SCM 启动，UI 仅在需要查看和处置时打开。
+
+### 50.6 规则、排班和通知确认
+
+每个候选点位都要回答以下问题：
+
+1. 要防范人员从哪里进入，方向是否重要；
+2. 合法人员在什么时间段、沿什么路线活动；
+3. 是否存在保安巡逻、清洁工、外协司机、装卸人员等例外；
+4. 是否有动物、树叶、灯光、车辆、雨雪、反光、虫鸟等干扰；
+5. 告警后谁先看、多久确认、误报如何标记、严重事件通知谁；
+6. 短信、电话、Webhook、企业微信/钉钉等渠道失败时如何升级；
+7. 节假日、临时施工、盘点、夜班调班如何调整布防日历。
+
+规则确认必须有业务负责人签字。仅有实施工程师在图上画线、客户没有确认合法活动范围，不能作为最终规则。
+
+### 50.7 详勘报告示例
+
+```yaml
+survey_version: 1
+site:
+  id: FG-SITE-0001
+  name: 示例制造厂
+  address: 中国江苏省某市工业园区
+  sponsor: 厂务安全负责人
+  timezone: Asia/Shanghai
+nvr:
+  brand: Hikvision
+  model: DS-7916N-R4
+  firmware: V4.x
+  endpoint: 192.168.10.20
+  rtsp_port: 554
+  channels_total: 16
+  channels_online: 16
+  continuous_recording_days: 30
+  time_source: 192.168.10.1
+guard_host:
+  hostname: FG-ANALYZER-01
+  endpoint: 192.168.10.30
+  os: Windows 11 IoT Enterprise LTSC 2024
+  cpu: x64 8 cores
+  memory_gb: 16
+  gpu: DirectML-compatible discrete adapter
+  ups_backed: true
+network:
+  vlan_id: 10
+  gateway: 192.168.10.1
+  rtsp_transport: tcp
+  nvr_ping_loss_pct: 0
+  rtsp_soak_minutes: 10
+  rtsp_reconnects: 0
+rule_workshop:
+  business_hours:
+    - Monday-Friday 08:00-18:00
+  after_hours_zones:
+    - warehouse-fence
+    - loading-gate
+    - main-entrance
+  known_interferences:
+    - night-insects-near-lamp
+    - branch-motion-near-perimeter
+go_no_go:
+  decision: go
+  score: 92
+  blockers: []
+  follow_ups:
+    - install operator phone escalation tree
+    - replace one UPS battery before pilot
+  approvals:
+    customer_sponsor: pending-signature
+    it_owner: pending-signature
+    implementation_owner: pending-signature
+```
+
+### 50.8 Go/No-Go 判定
+
+以下任一情况属于硬性阻断：
+
+- NVR 连续录像不正常，或客户希望用 FactoryGuard 替代 NVR 录像；
+- 无法取得合法、可审计的专用访问账号；
+- 子码流不可用且主码流分析未完成容量和兼容性验证；
+- RTSP 10 分钟拉取不稳定且原因未定位；
+- 值守电脑没有可靠供电、散热或物理安全条件；
+- 客户未确认合法活动范围、布防时间和通知责任人；
+- 摄像机画面不满足目标像素密度、视角或夜间检测要求，且没有改造计划；
+- 客户网络管理方拒绝出具必要的路由、防火墙或 VLAN 配合确认。
+
+建议总分 90 分及以上为 Go，80–89 分为带条件 Go，80 分以下为 No-Go。带条件 Go 必须列出阻断项、负责人、完成日期和复验方式；安装日仍未关闭阻断项时，应暂停部署而不是降低验收标准。
+
+---
+
+## 51. SQLite 生产级逻辑 Schema、DDL 与索引
+
+第 8 章给出了核心实体，本章给出可直接作为开发基线的 SQLite 逻辑 Schema。设计目标不是“能建表”即可，而是在崩溃、重启、升级、备份、并发读写、长期保留和审计场景下保持含义清楚、约束可执行、索引可解释、迁移可回退。
+
+### 51.1 连接和事务基线
+
+```sql
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA temp_store = MEMORY;
+PRAGMA busy_timeout = 5000;
+PRAGMA wal_autocheckpoint = 1000;
+```
+
+参数含义和约束：
+
+- 每个数据库连接都必须显式打开 foreign_keys，SQLite 不会因新连接自动继承该设置；
+- 写事务应短而明确，事件生成、通知 Outbox、审计记录放入同一事务；
+- WAL 能提高读写并发，但不等于无需备份，也不能替代 UPS 和原子写；
+- synchronous=NORMAL 配合 WAL 和 UPS 是常见工程折中，若客户安全策略要求 FULL，应以客户策略为准并复测性能；
+- busy_timeout 只解决短期锁等待，不能把长事务、慢备份或磁盘故障视为正常；
+- 不允许多个进程各自做不受控 VACUUM、迁移或批量清理。
+
+### 51.2 建表 DDL 基线
+
+```sql
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY CHECK (version >= 1),
+  name TEXT NOT NULL,
+  applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  checksum_sha256 TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'applied' CHECK (status IN ('applied','failed')),
+  notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS app_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  description TEXT,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS app_users (
+  id TEXT PRIMARY KEY,
+  username TEXT NOT NULL COLLATE NOCASE,
+  display_name TEXT NOT NULL,
+  windows_sid TEXT,
+  role TEXT NOT NULL CHECK (role IN ('administrator','operator','viewer')),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  last_login_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS regions (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  parent_id TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  is_deleted INTEGER NOT NULL DEFAULT 0 CHECK (is_deleted IN (0,1)),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  FOREIGN KEY (parent_id) REFERENCES regions(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS nvr_devices (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  brand TEXT NOT NULL,
+  model TEXT,
+  firmware TEXT,
+  host_or_ip TEXT NOT NULL,
+  port INTEGER NOT NULL DEFAULT 554 CHECK (port BETWEEN 1 AND 65535),
+  rtsp_template TEXT NOT NULL,
+  username TEXT,
+  secret_ref TEXT,
+  transport TEXT NOT NULL DEFAULT 'tcp' CHECK (transport IN ('tcp','udp')),
+  capabilities_json TEXT NOT NULL DEFAULT '{}',
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  connection_state TEXT NOT NULL DEFAULT 'unknown'
+    CHECK (connection_state IN ('unknown','offline','connecting','online','degraded','error')),
+  last_error TEXT,
+  last_connected_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  UNIQUE (host_or_ip, port)
+);
+
+CREATE TABLE IF NOT EXISTS channels (
+  id TEXT PRIMARY KEY,
+  nvr_id TEXT NOT NULL,
+  channel_no INTEGER NOT NULL CHECK (channel_no BETWEEN 1 AND 1024),
+  name TEXT NOT NULL,
+  region_id TEXT,
+  uri_path_main TEXT,
+  uri_path_sub TEXT,
+  codec TEXT,
+  width INTEGER CHECK (width IS NULL OR width > 0),
+  height INTEGER CHECK (height IS NULL OR height > 0),
+  fps REAL CHECK (fps IS NULL OR fps > 0),
+  bitrate_kbps INTEGER CHECK (bitrate_kbps IS NULL OR bitrate_kbps > 0),
+  ai_enabled INTEGER NOT NULL DEFAULT 1 CHECK (ai_enabled IN (0,1)),
+  connection_state TEXT NOT NULL DEFAULT 'unknown'
+    CHECK (connection_state IN ('unknown','offline','connecting','online','degraded','error')),
+  last_error TEXT,
+  last_frame_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  FOREIGN KEY (nvr_id) REFERENCES nvr_devices(id) ON DELETE RESTRICT,
+  FOREIGN KEY (region_id) REFERENCES regions(id) ON DELETE SET NULL,
+  UNIQUE (nvr_id, channel_no)
+);
+
+CREATE TABLE IF NOT EXISTS detection_models (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  version TEXT NOT NULL,
+  model_uri TEXT NOT NULL,
+  checksum_sha256 TEXT NOT NULL,
+  labels_json TEXT NOT NULL,
+  runtime TEXT NOT NULL DEFAULT 'onnxruntime-directml',
+  input_width INTEGER NOT NULL CHECK (input_width > 0),
+  input_height INTEGER NOT NULL CHECK (input_height > 0),
+  default_threshold REAL NOT NULL DEFAULT 0.45 CHECK (default_threshold BETWEEN 0 AND 1),
+  status TEXT NOT NULL DEFAULT 'candidate'
+    CHECK (status IN ('candidate','canary','active','retired','rejected')),
+  metrics_json TEXT NOT NULL DEFAULT '{}',
+  registered_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  activated_at TEXT,
+  retired_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  UNIQUE (name, version)
+);
+
+CREATE TABLE IF NOT EXISTS model_channel_bindings (
+  id TEXT PRIMARY KEY,
+  model_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  threshold_override REAL CHECK (threshold_override IS NULL OR threshold_override BETWEEN 0 AND 1),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  effective_from TEXT NOT NULL,
+  effective_to TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  FOREIGN KEY (model_id) REFERENCES detection_models(id) ON DELETE RESTRICT,
+  FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS rules (
+  id TEXT PRIMARY KEY,
+  channel_id TEXT NOT NULL,
+  region_id TEXT,
+  rule_type TEXT NOT NULL
+    CHECK (rule_type IN ('intrusion','line_crossing','loitering','left_object','removed_object')),
+  geometry_json TEXT NOT NULL,
+  target_labels_json TEXT NOT NULL DEFAULT '["person"]',
+  schedule_json TEXT NOT NULL DEFAULT '{"type":"always"}',
+  sensitivity REAL NOT NULL DEFAULT 0.5 CHECK (sensitivity BETWEEN 0 AND 1),
+  confirm_frames INTEGER NOT NULL DEFAULT 3 CHECK (confirm_frames BETWEEN 1 AND 30),
+  cooldown_seconds INTEGER NOT NULL DEFAULT 30 CHECK (cooldown_seconds BETWEEN 0 AND 86400),
+  min_object_height_px INTEGER NOT NULL DEFAULT 40 CHECK (min_object_height_px BETWEEN 1 AND 10000),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE RESTRICT,
+  FOREIGN KEY (region_id) REFERENCES regions(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_tasks (
+  id TEXT PRIMARY KEY,
+  channel_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  sample_fps REAL NOT NULL DEFAULT 2 CHECK (sample_fps BETWEEN 0.1 AND 10),
+  priority INTEGER NOT NULL DEFAULT 100 CHECK (priority BETWEEN 1 AND 1000),
+  state TEXT NOT NULL DEFAULT 'stopped'
+    CHECK (state IN ('stopped','starting','running','degraded','failed')),
+  consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+  last_result_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+  FOREIGN KEY (model_id) REFERENCES detection_models(id) ON DELETE RESTRICT,
+  UNIQUE (channel_id)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+  id TEXT PRIMARY KEY,
+  event_key TEXT NOT NULL,
+  rule_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  model_id TEXT,
+  severity TEXT NOT NULL CHECK (severity IN ('low','medium','high','critical')),
+  event_status TEXT NOT NULL DEFAULT 'new'
+    CHECK (event_status IN ('new','acknowledged','confirmed','false_positive','suppressed','closed')),
+  occurred_at TEXT NOT NULL,
+  received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  nvr_time TEXT,
+  clock_delta_ms INTEGER,
+  confidence REAL CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 1),
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  snapshot_uri TEXT,
+  snapshot_status TEXT NOT NULL DEFAULT 'missing'
+    CHECK (snapshot_status IN ('missing','pending','complete','failed','recoverable_missing')),
+  clip_uri TEXT,
+  clip_status TEXT NOT NULL DEFAULT 'missing'
+    CHECK (clip_status IN ('missing','pending','complete','failed','recoverable_missing')),
+  dedup_count INTEGER NOT NULL DEFAULT 1 CHECK (dedup_count >= 1),
+  first_occurred_at TEXT NOT NULL,
+  last_occurred_at TEXT NOT NULL,
+  acknowledged_by TEXT,
+  acknowledged_at TEXT,
+  closed_by TEXT,
+  closed_at TEXT,
+  closure_reason TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  FOREIGN KEY (rule_id) REFERENCES rules(id) ON DELETE RESTRICT,
+  FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE RESTRICT,
+  FOREIGN KEY (model_id) REFERENCES detection_models(id) ON DELETE SET NULL,
+  FOREIGN KEY (acknowledged_by) REFERENCES app_users(id) ON DELETE SET NULL,
+  FOREIGN KEY (closed_by) REFERENCES app_users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS event_tracks (
+  id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL,
+  track_id TEXT NOT NULL,
+  frame_no INTEGER NOT NULL CHECK (frame_no >= 0),
+  label TEXT NOT NULL,
+  confidence REAL CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 1),
+  bbox_json TEXT NOT NULL,
+  point_json TEXT,
+  observed_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
+  UNIQUE (event_id, frame_no, track_id)
+);
+
+CREATE TABLE IF NOT EXISTS notification_outbox (
+  id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL,
+  channel_type TEXT NOT NULL CHECK (channel_type IN ('sms','email','webhook','desktop','phone_call')),
+  recipient_ref TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','sending','sent','failed','dead')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  max_attempts INTEGER NOT NULL DEFAULT 8 CHECK (max_attempts BETWEEN 1 AND 20),
+  next_retry_at TEXT NOT NULL,
+  sent_at TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
+  CHECK (attempts <= max_attempts)
+);
+
+CREATE TABLE IF NOT EXISTS process_instances (
+  id TEXT PRIMARY KEY,
+  process_role TEXT NOT NULL CHECK (process_role IN ('engine','inference','media','ui','watchdog')),
+  instance_name TEXT NOT NULL,
+  pid INTEGER CHECK (pid IS NULL OR pid > 0),
+  state TEXT NOT NULL CHECK (state IN ('starting','running','stopped','crashed','killed','failed')),
+  started_at TEXT NOT NULL,
+  stopped_at TEXT,
+  exit_code INTEGER,
+  restart_count INTEGER NOT NULL DEFAULT 0 CHECK (restart_count >= 0),
+  last_heartbeat_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS health_samples (
+  id TEXT PRIMARY KEY,
+  sampled_at TEXT NOT NULL,
+  process_instance_id TEXT,
+  process_role TEXT NOT NULL CHECK (process_role IN ('engine','inference','media','ui','watchdog')),
+  channel_count INTEGER NOT NULL DEFAULT 0 CHECK (channel_count >= 0),
+  cpu_pct REAL CHECK (cpu_pct IS NULL OR cpu_pct BETWEEN 0 AND 100),
+  memory_mb REAL CHECK (memory_mb IS NULL OR memory_mb >= 0),
+  gpu_memory_mb REAL CHECK (gpu_memory_mb IS NULL OR gpu_memory_mb >= 0),
+  queue_wait_ms REAL CHECK (queue_wait_ms IS NULL OR queue_wait_ms >= 0),
+  dropped_frames INTEGER NOT NULL DEFAULT 0 CHECK (dropped_frames >= 0),
+  inference_ms REAL CHECK (inference_ms IS NULL OR inference_ms >= 0),
+  state TEXT NOT NULL CHECK (state IN ('green','yellow','red','unknown')),
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  FOREIGN KEY (process_instance_id) REFERENCES process_instances(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id TEXT PRIMARY KEY,
+  actor_user_id TEXT,
+  actor_name TEXT NOT NULL,
+  action TEXT NOT NULL,
+  resource_type TEXT NOT NULL,
+  resource_id TEXT,
+  result TEXT NOT NULL CHECK (result IN ('success','failure','error','denied')),
+  source_ip TEXT,
+  user_agent TEXT,
+  occurred_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%fZ','now')),
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  FOREIGN KEY (actor_user_id) REFERENCES app_users(id) ON DELETE SET NULL
+);
+```
+
+### 51.3 更新时间触发器
+
+不可变流水表（事件轨迹、健康样本、审计日志）不提供更新触发器，防止把流水记录当作可随意修改的状态。可变状态表使用统一触发器维护 updated_at：
+
+```sql
+CREATE TRIGGER IF NOT EXISTS trg_app_users_set_updated_at
+AFTER UPDATE ON app_users FOR EACH ROW
+BEGIN
+  UPDATE app_users SET updated_at = strftime('%Y-%m-%dT%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_regions_set_updated_at
+AFTER UPDATE ON regions FOR EACH ROW
+BEGIN
+  UPDATE regions SET updated_at = strftime('%Y-%m-%dT%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_nvr_devices_set_updated_at
+AFTER UPDATE ON nvr_devices FOR EACH ROW
+BEGIN
+  UPDATE nvr_devices SET updated_at = strftime('%Y-%m-%dT%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_channels_set_updated_at
+AFTER UPDATE ON channels FOR EACH ROW
+BEGIN
+  UPDATE channels SET updated_at = strftime('%Y-%m-%dT%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_detection_models_set_updated_at
+AFTER UPDATE ON detection_models FOR EACH ROW
+BEGIN
+  UPDATE detection_models SET updated_at = strftime('%Y-%m-%dT%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_model_bindings_set_updated_at
+AFTER UPDATE ON model_channel_bindings FOR EACH ROW
+BEGIN
+  UPDATE model_channel_bindings SET updated_at = strftime('%Y-%m-%dT%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_rules_set_updated_at
+AFTER UPDATE ON rules FOR EACH ROW
+BEGIN
+  UPDATE rules SET updated_at = strftime('%Y-%m-%dT%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_ai_tasks_set_updated_at
+AFTER UPDATE ON ai_tasks FOR EACH ROW
+BEGIN
+  UPDATE ai_tasks SET updated_at = strftime('%Y-%m-%dT%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_events_set_updated_at
+AFTER UPDATE ON events FOR EACH ROW
+BEGIN
+  UPDATE events SET updated_at = strftime('%Y-%m-%dT%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_outbox_set_updated_at
+AFTER UPDATE ON notification_outbox FOR EACH ROW
+BEGIN
+  UPDATE notification_outbox SET updated_at = strftime('%Y-%m-%dT%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_process_instances_set_updated_at
+AFTER UPDATE ON process_instances FOR EACH ROW
+BEGIN
+  UPDATE process_instances SET updated_at = strftime('%Y-%m-%dT%fZ','now') WHERE id = NEW.id;
+END;
+```
+
+### 51.4 索引与查询意图
+
+```sql
+CREATE UNIQUE INDEX IF NOT EXISTS ux_app_users_username ON app_users(username);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_app_users_windows_sid
+  ON app_users(windows_sid) WHERE windows_sid IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_regions_parent ON regions(parent_id);
+CREATE INDEX IF NOT EXISTS ix_nvr_devices_state ON nvr_devices(connection_state, enabled);
+CREATE INDEX IF NOT EXISTS ix_channels_nvr ON channels(nvr_id, channel_no);
+CREATE INDEX IF NOT EXISTS ix_channels_region ON channels(region_id);
+CREATE INDEX IF NOT EXISTS ix_channels_active_ai ON channels(nvr_id) WHERE ai_enabled = 1;
+CREATE INDEX IF NOT EXISTS ix_models_status ON detection_models(status, name, version);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_active_channel_model
+  ON model_channel_bindings(channel_id) WHERE enabled = 1 AND effective_to IS NULL;
+CREATE INDEX IF NOT EXISTS ix_rules_channel_enabled ON rules(channel_id, enabled);
+CREATE INDEX IF NOT EXISTS ix_ai_tasks_state ON ai_tasks(state, priority);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_events_event_key ON events(event_key);
+CREATE INDEX IF NOT EXISTS ix_events_time ON events(occurred_at);
+CREATE INDEX IF NOT EXISTS ix_events_channel_time ON events(channel_id, occurred_at);
+CREATE INDEX IF NOT EXISTS ix_events_status_time ON events(event_status, occurred_at);
+CREATE INDEX IF NOT EXISTS ix_event_tracks_event ON event_tracks(event_id, frame_no);
+CREATE INDEX IF NOT EXISTS ix_outbox_dispatch
+  ON notification_outbox(status, next_retry_at);
+CREATE INDEX IF NOT EXISTS ix_outbox_event ON notification_outbox(event_id);
+CREATE INDEX IF NOT EXISTS ix_process_heartbeat
+  ON process_instances(process_role, last_heartbeat_at);
+CREATE INDEX IF NOT EXISTS ix_health_time_role ON health_samples(sampled_at, process_role);
+CREATE INDEX IF NOT EXISTS ix_audit_time ON audit_logs(occurred_at);
+CREATE INDEX IF NOT EXISTS ix_audit_resource ON audit_logs(resource_type, resource_id, occurred_at);
+```
+
+索引验收要求：
+
+- 每个事件列表查询必须通过 EXPLAIN QUERY PLAN 确认使用时间、通道或状态索引；
+- Outbox 调度只能扫描少量到期记录，不允许全表扫描所有通知；
+- 健康样本和审计日志应按月或批量分区式保留；SQLite 原生不做分区时，应通过定期归档和删除控制表大小；
+- 新增索引必须说明查询场景、写入成本和首次发布迁移方式；
+- 每次大版本发布后执行 ANALYZE，并在样例库中保存查询计划证据。
+
+### 51.5 容量估算和保留策略
+
+以 16 路、每路每秒 2 帧分析、每日 12 小时布防为参考：
+
+| 数据 | 增长估算 | 建议保留 | 治理方式 |
+| --- | --- | --- | --- |
+| 事件主记录 | 取决于真实入侵和误报，试运行期可能较高 | 180–365 天 | 按状态和时间批量删除 |
+| 轨迹点 | 每个事件可能数十点 | 90–180 天 | 仅保留取证/复盘必要点 |
+| 健康样本 | 每 10–30 秒一条，聚合后可显著降低 | 原始 14–30 天，月报长期 | 降采样后归档 |
+| 审计日志 | 与人工操作频率相关 | 至少 1 年或按客户制度 | 不得由普通管理员删除 |
+| Outbox | 每个事件按通知渠道产生 | 180 天 | 清理 sent/dead 并保留失败统计 |
+| WAL 文件 | 峰值与长事务相关 | 不应长期膨胀 | 定期 checkpoint，排查长事务 |
+
+### 51.6 迁移和验证规则
+
+- schema_migrations 中的版本应与 PRAGMA user_version 一致；
+- 每个迁移脚本保存 SHA-256，安装器启动前重算校验；
+- 迁移必须在事务中执行；遇到不支持的旧版本，应提示升级路径而不是强制覆盖；
+- 迁移前执行 SQLite 在线备份，迁移后执行 foreign_key_check、integrity_check 和关键查询冒烟；
+- 回滚数据库前必须停止写入进程，并确认旧版本程序能够读取旧格式；
+- 不允许把“删库重建”作为正式客户现场升级方案，除非客户书面确认放弃历史数据。
+
+---
+
+## 52. Windows 服务证据包与命令级验收
+
+可靠性不能只靠设计声明。每一次试点、上线、升级和重大故障修复，都必须产生证据包，证明 Windows 服务、进程、Job Object、命名管道、事件日志、数据库、签名、防火墙、Defender 和故障注入结果符合要求。
+
+### 52.1 证据包目录
+
+建议目录名：FactoryGuard-Evidence-站点编号-YYYYMMDD-HHMMSS。
+
+| 文件 | 内容 | 责任方 |
+| --- | --- | --- |
+| 00-manifest.json | 文件清单、哈希、采集时间、采集器版本 | 诊断工具 |
+| 01-service-qc.txt | 服务启动类型、二进制路径、账户 | 实施工程师 |
+| 02-service-query.txt | 当前状态、PID、标志 | 实施工程师 |
+| 03-service-failure.txt | SCM 失败恢复动作 | 实施工程师 |
+| 04-processes.txt | Engine/Inference/Media/UI 进程、父子关系、资源 | 诊断工具 |
+| 05-job-object.txt | Job Object、子进程、限制和 kill-on-close | 产品诊断命令 |
+| 06-named-pipe.txt | 管道名称、ACL/SDDL、监听状态 | 产品诊断命令 |
+| 07-event-log.xml | 最近 200 条应用事件 | 诊断工具 |
+| 08-database-verify.txt | integrity_check、foreign_key_check、user_version | 产品诊断命令 |
+| 09-signatures.json | EXE/DLL 签名状态 | 诊断工具 |
+| 10-file-hashes.json | 安装目录文件哈希 | 诊断工具 |
+| 11-firewall.txt | 防火墙 Profile 和 FactoryGuard 规则 | 实施工程师 |
+| 12-defender.txt | Defender 状态、引擎/签名版本、排除项 | 实施工程师 |
+| 13-config-redacted.yaml | 已脱敏配置和配置校验结果 | 实施工程师 |
+| 14-fault-drills.md | 故障注入步骤、预期、实际、截图 | 双方签字 |
+
+### 52.2 自动采集脚本
+
+```powershell
+$serviceName = 'FactoryGuardEngine'
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$evidenceRoot = Join-Path $env:ProgramData "FactoryGuard\evidence\$stamp"
+$dir = New-Item -ItemType Directory -Path $evidenceRoot -Force
+$installRoot = Join-Path $env:ProgramFiles 'FactoryGuard'
+
+$commands = @(
+  @{ Name = '01-service-qc'; Script = { sc.exe qc $serviceName } },
+  @{ Name = '02-service-query'; Script = { sc.exe queryex $serviceName } },
+  @{ Name = '03-service-failure'; Script = { sc.exe qfailure $serviceName } },
+  @{ Name = '04-service-cim'; Script = { Get-CimInstance Win32_Service -Filter "Name='$serviceName'" } },
+  @{ Name = '05-processes'; Script = { Get-Process -Name 'FactoryGuard*','ffmpeg' -ErrorAction SilentlyContinue } },
+  @{ Name = '06-job-object'; Script = { FactoryGuardCtl.exe diagnostics job-object } },
+  @{ Name = '07-named-pipe'; Script = { FactoryGuardCtl.exe diagnostics named-pipe } },
+  @{ Name = '08-database-verify'; Script = { FactoryGuardCtl.exe database verify } },
+  @{ Name = '09-firewall-profile'; Script = { Get-NetFirewallProfile } },
+  @{ Name = '10-firewall-rules'; Script = { Get-NetFirewallRule -DisplayName 'FactoryGuard*' -ErrorAction SilentlyContinue } },
+  @{ Name = '11-defender-status'; Script = { Get-MpComputerStatus } },
+  @{ Name = '12-defender-preference'; Script = { Get-MpPreference } }
+)
+
+foreach ($item in $commands) {
+  $target = Join-Path $dir ($item.Name + '.txt')
+  & $item.Script *> $target
+}
+
+$eventTarget = Join-Path $dir '13-event-log.xml'
+wevtutil qe Application "/q:*[System[Provider[@Name='FactoryGuardEngine']]]" /c:200 /rd:true /f:xml *> $eventTarget
+
+$bin = Join-Path $installRoot 'bin'
+Get-ChildItem -Path $bin -Recurse -File -ErrorAction SilentlyContinue |
+  Get-FileHash -Algorithm SHA256 |
+  Select-Object Path, Hash |
+  ConvertTo-Json -Depth 4 |
+  Set-Content -Encoding UTF8 (Join-Path $dir '14-file-hashes.json')
+
+Get-ChildItem -Path $bin -Recurse -File -ErrorAction SilentlyContinue |
+  Get-AuthenticodeSignature |
+  Select-Object Path, Status, SignerCertificate |
+  ConvertTo-Json -Depth 4 |
+  Set-Content -Encoding UTF8 (Join-Path $dir '15-signatures.json')
+
+$files = Get-ChildItem -Path $dir -File | ForEach-Object {
+  $hash = Get-FileHash -Path $_.FullName -Algorithm SHA256
+  [pscustomobject]@{
+    path = $_.Name
+    bytes = $_.Length
+    sha256 = $hash.Hash
+  }
+}
+
+[pscustomobject]@{
+  manifestVersion = '1.0'
+  siteId = $env:COMPUTERNAME
+  collectedAt = (Get-Date).ToString('o')
+  collector = 'FactoryGuardDiagnostics/1.0.0'
+  files = $files
+} | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 (Join-Path $dir '00-manifest.json')
+```
+
+### 52.3 脱敏规则
+
+证据包不得包含 NVR 密码、Webhook Secret、Bearer Token、手机号完整号码和客户人员隐私。自动采集应至少执行以下规则：
+
+- RTSP/RTMP/HTTP URL 中 userinfo 的密码替换为 REDACTED；
+- 配置中的 password、secret、token、apikey 字段值替换为 REDACTED；
+- 手机号保留前 3 后 2，邮箱仅保留必要域名或收件人编号；
+- 截图中出现密码框、人员面部或车牌时，按客户制度进行遮挡或单独加密保存；
+- 原始诊断日志可以短暂保留在客户本机，但对外发送的证据包必须是脱敏版本。
+
+```powershell
+function Redact-Text {
+  param(
+    [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+    [string]$Value
+  )
+  process {
+    $Value -replace '(?i)(rtsp://[^/\s]*?:)[^@\s]+(@)', '$1REDACTED$2'
+  }
+}
+
+Get-Content '.\FactoryGuard.yaml' |
+  Redact-Text |
+  Set-Content -Encoding UTF8 '.\13-config-redacted.yaml'
+```
+
+### 52.4 命令级验收基线
+
+| 验收项 | 命令/证据 | 合格标准 |
+| --- | --- | --- |
+| 服务启动类型 | sc.exe qc | AUTO_START；二进制路径带引号；依赖项正确 |
+| 服务运行状态 | sc.exe queryex | STATE 为 RUNNING，PID 与进程清单一致 |
+| 失败恢复 | sc.exe qfailure | 首次/二次失败重启，后续按策略重启或运行诊断 |
+| 服务账户 | Win32_Service | 使用最小权限虚拟账户或指定低权限账户 |
+| Job Object | FactoryGuardCtl diagnostics job-object | FFmpeg/Inference 均在同一受控 Job 下，无孤儿进程 |
+| 命名管道 | FactoryGuardCtl diagnostics named-pipe | 仅 SYSTEM、服务账户、管理员和授权操作员组可访问 |
+| 数据库 | FactoryGuardCtl database verify | integrity_check=ok、foreign_key_check 无结果、迁移版本正确 |
+| 签名 | Get-AuthenticodeSignature | 关键二进制 Status=Valid，证书链和时间戳有效 |
+| 事件日志 | wevtutil qe | 24 小时内无未解释的 critical/error，启动恢复事件成对出现 |
+| Defender | Get-MpComputerStatus | 防护启用，签名年龄符合策略，排除项精确且可解释 |
+| 防火墙 | Get-NetFirewallProfile/Rule | 默认入站阻止，规则范围最小化，无开放 Any-Any 入站 |
+| UI 独立性 | 关闭 UI 后检查服务 | Engine、Inference、Media 连续运行，事件继续入库 |
+
+### 52.5 证据包 Manifest 示例
+
+```json
+{
+  "manifestVersion": "1.0",
+  "siteId": "FG-SITE-0001",
+  "collector": "FactoryGuardDiagnostics/1.0.0",
+  "collectedAt": "2026-10-07T10:00:00+08:00",
+  "files": [
+    { "path": "01-service-qc.txt", "bytes": 2048, "sha256": "示例哈希" },
+    { "path": "06-job-object.txt", "bytes": 4096, "sha256": "示例哈希" },
+    { "path": "08-database-verify.txt", "bytes": 1024, "sha256": "示例哈希" }
+  ],
+  "redactions": [
+    "rtsp-userinfo",
+    "webhook-secret",
+    "phone-number"
+  ],
+  "retentionYears": 3
+}
+```
+
+### 52.6 故障演练证据
+
+上线前至少完成以下演练，并保存命令输出、截图、时间线和恢复时间：
+
+| 演练 | 操作 | 必须证明 |
+| --- | --- | --- |
+| Engine 崩溃 | taskkill /PID engine /F | SCM/看门狗按策略恢复，事件不中断超过约定时长 |
+| Inference 崩溃 | 结束推理子进程 | Engine 重新拉起，失败通道隔离，其他通道继续 |
+| FFmpeg 崩溃 | 结束媒体进程 | 自动重连，媒体错误码和重启次数可追踪 |
+| UI 关闭 | 正常关闭 Qt UI | 检测服务、Outbox、通知继续运行 |
+| NVR 重启 | 计划重启 NVR | 断流可见，恢复后自动重连并生成健康事件 |
+| 网络断开 | 拔线 60 秒 | 不产生无限重连风暴，恢复后状态正确 |
+| 磁盘空间逼近 | 注入低空间条件 | 降级、清理和只读保护策略生效 |
+| 错误凭据 | 使用错误 NVR 密码 | 不锁死账户，错误可见，通知升级 |
+| 系统重启 | 重启值守电脑 | 无人登录情况下服务自动运行 |
+| 时间偏差 | 临时制造偏差 | w32tm 纠正，事件记录时钟差值 |
+
+证据包应由客户和实施方共同签字。没有故障演练证据，不能把“具备自愈能力”写入上线确认。
+
+---
+
+## 53. 月度/季度维护、容量寿命与故障演练
+
+可靠系统不是安装日结束，而是在长期运行中持续证明。FactoryGuard 应建立日自动检查、周人工确认、月维护、季度演练、年度审计的节奏，所有维护都要有窗口、责任人、证据和回退方案。
+
+### 53.1 维护分层
+
+| 频率 | 执行者 | 主要内容 | 是否停机 |
+| --- | --- | --- | --- |
+| 每日 | 系统自动 | 服务、媒体、磁盘、Outbox、事件日志、健康评分 | 否 |
+| 每周 | 值班员 | 查看未关闭事件、误报标记、通知测试、异常画面 | 否 |
+| 每月 | 客户管理员 + 实施支持 | 数据完整性、备份恢复、容量趋势、规则和账号复核 | 通常否，必要时短窗口 |
+| 每季度 | 实施/运维负责人 | BCDR 演练、安全基线、模型评估、固件/驱动复核 | 计划窗口 |
+| 每年 | 项目发起人 + 安全负责人 | 架构审计、硬件寿命、合同/SLA、制度和培训复训 | 按计划 |
+
+### 53.2 每周人工确认
+
+- 是否存在超过 24 小时未处理的 high/critical 事件；
+- 误报是否已标注原因，重复误报是否进入规则或模型治理；
+- 短信、电话、Webhook 等通知渠道至少进行一次可达性确认；
+- 所有通道是否在线，画面是否出现模糊、遮挡、偏移、过曝或夜间补光失效；
+- NVR 连续录像和 FactoryGuard 事件时间是否能相互对应；
+- 磁盘剩余空间、WAL 大小、崩溃转储数量是否异常；
+- 是否有临时布防、施工、节假日安排未同步到系统。
+
+### 53.3 月度维护清单
+
+| 类别 | 维护动作 | 合格证据 |
+| --- | --- | --- |
+| 数据库 | integrity_check、foreign_key_check、在线备份、抽样恢复 | 数据库验证报告、恢复截图 |
+| 事件质量 | 抽样复核真阳性、误报、漏报反馈 | 样本清单和趋势图 |
+| 规则 | 检查规则线、目标高度、灵敏度、布防日历 | 规则版本和客户确认 |
+| 账号 | 清理离职人员、复核管理员/操作员权限 | 用户清单和审批记录 |
+| 通知 | 测试所有渠道和失败升级路径 | 通知送达记录 |
+| 媒体 | 检查丢帧、重连、FFmpeg 错误、关键帧间隔 | 月度媒体健康汇总 |
+| 系统 | 查看事件日志、崩溃转储、重启原因、Windows 更新状态 | 系统健康报告 |
+| 物理设备 | 检查镜头、支架、补光灯、电缆、UPS 电池 | 照片/读数 |
+| 容量 | 汇总磁盘、CPU、内存、GPU、网络峰值 | 容量趋势和扩容建议 |
+
+### 53.4 季度演练与审计
+
+季度演练应至少轮换选择不同场景，不必每次都做高风险操作，但一年内必须覆盖关键场景：
+
+1. Engine 服务崩溃和 SCM 自动恢复；
+2. Inference/Media 子进程崩溃与 Job Object 清理；
+3. NVR 离线、重启和 RTSP 恢复；
+4. SQLite 备份恢复到隔离目录并由只读工具验证；
+5. 升级失败后一键回滚；
+6. UPS 切换、安全关机或低电量告警；
+7. 管理员账号锁定、错误密码和权限拒绝；
+8. Webhook/短信失败、Outbox 重试和死信升级；
+9. 磁盘空间阈值、健康降级和非关键文件清理；
+10. 值守电脑重启后无人登录自动运行。
+
+季度审计还应复核 Defender 排除项是否仍然必要、防火墙规则是否最小化、服务账户权限是否漂移、远程支持账号是否停用、安装包签名和补丁版本是否符合基线。
+
+### 53.5 年度硬件和寿命治理
+
+| 对象 | 建议观察指标 | 预警/更换建议 |
+| --- | --- | --- |
+| 系统 SSD | 通电时间、写入量、剩余寿命、介质错误、可用备用块 | 寿命使用达到 80% 制定更换计划，达到 90% 尽快更换 |
+| NVR 硬盘 | SMART、坏道、重映射、温度、录像丢失 | 出现预警即替换，不用到完全失效 |
+| UPS 电池 | 自检、负载率、带载时间、电池年龄 | 容量低于 80% 计划更换，低于 60% 不应继续依赖 |
+| GPU/主机 | 驱动崩溃、温度、热保护、风扇异响、性能余量 | 评估清灰、电源、显卡或整机替换 |
+| 摄像机 | 画面老化、红外灯、防水、支架、焦距、日夜切换 | 按现场风险更换，不以“还能出图”为唯一标准 |
+| 网络设备 | 端口错误、PoE 功率、风扇、温度、固件 | 超寿命或无安全补丁时纳入替换 |
+
+行业消费级硬件参数和 SMART 属性存在差异，因此寿命阈值应作为风险治理基线而不是绝对保证。关键站点应使用适合长期运行的企业级或工业级存储，并保留备件。
+
+### 53.6 Windows 更新和驱动策略
+
+- 安全更新不应无限期推迟，但必须先在测试或样板环境验证；
+- 建议采用“测试机/样板站点/正式站点”的分阶段更新节奏；
+- GPU 驱动、芯片组驱动、网卡驱动升级必须记录旧版本、新版本、回退文件和验证结果；
+- 更新前后均检查服务、媒体管线、DirectML、命名管道和事件日志；
+- 不建议在试点现场由 Windows Update 自动安装未验证的大型功能更新；
+- 对 LTSC/IoT 版本，应按照客户设备生命周期和授权策略制定更新计划。
+
+### 53.7 维护日历示例
+
+```yaml
+maintenance_version: 1
+timezone: Asia/Shanghai
+plans:
+  - frequency: weekly
+    owner: shift-supervisor
+    window: Friday 17:00-17:30
+    requires_downtime: false
+    tasks:
+      - review_open_events
+      - verify_notifications
+      - inspect_camera_quality
+  - frequency: monthly
+    owner: site-admin
+    support: factoryguard-support
+    window: first Sunday 09:00-12:00
+    requires_downtime: false
+    tasks:
+      - sqlite_integrity_check
+      - backup_restore_sample
+      - review_accounts
+      - summarize_false_positives
+      - inspect_ups_and_storage
+  - frequency: quarterly
+    owner: factoryguard-support
+    approver: customer-sponsor
+    window: scheduled maintenance window
+    requires_downtime: true
+    tasks:
+      - bcdr_drill
+      - rollback_drill
+      - firewall_audit
+      - model_quality_review
+      - firmware_driver_baseline_review
+  - frequency: yearly
+    owner: customer-sponsor
+    tasks:
+      - hardware_lifecycle_review
+      - security_baseline_audit
+      - training_recertification
+      - sla_and_contract_review
+```
+
+### 53.8 维护阈值建议
+
+| 指标 | 黄色预警 | 红色处理 |
+| --- | --- | --- |
+| 系统盘空闲 | <15% | <8%，进入受控清理/降级 |
+| CPU 峰值 | P95 >80% | P95 >90%或持续超过 5 分钟 |
+| 内存 | P95 >80% | 出现分页导致延迟或进程失败 |
+| 事件片段成功率 | <99% | <98%，排查媒体/磁盘/规则 |
+| 通知成功率 | <99.5% | <99%或关键渠道失败 |
+| 时钟偏差 | >500 ms | >1 s，立即排查 NTP |
+| 通道重连 | 单日偶发 | 单日多次或超过 5 分钟未恢复 |
+| 健康评分 | yellow 连续 30 分钟 | red 或无人确认超过 SLA |
+
+阈值触发后应自动生成维护任务；红色事件必须在日报中标注影响、根因、处置、恢复时间和预防措施。
+
+### 53.9 维护报告要求
+
+每次月度/季度维护结束后应输出：
+
+- 维护范围、窗口、实际开始/结束时间；
+- 参与人员和审批记录；
+- 命令输出、截图、数据库验证和恢复演练证据；
+- 发现的问题、严重级别、是否影响检测连续性；
+- 更换的硬件、文件、配置版本和回退方案；
+- 下次维护前必须关闭的行动项；
+- 客户签字和实施方签字。
+
+维护报告应与证据包 Manifest 关联。若维护中发生计划外停机或检测能力降级，应同时生成事件记录和客户公告，不能只在维护报告中轻描淡写带过。
+
+---
+
+## 54. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 50.1 平台与可靠性资料
+### 54.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -3816,8 +4787,18 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | Dahua Wiki：Remote Access/RTSP via VLC | 大华 RTSP realmonitor 地址模板参考 |
 | CCTV Database：Uniview RTSP URL | 宇视 media/video1、media/video2 路径汇总；实施时仍以厂商手册和实测为准 |
 | Microsoft Learn：Powercfg command-line options | 电源策略、睡眠状态与现场电源诊断参考 |
+| Microsoft Learn：Get-CimInstance | Win32_Service、操作系统和硬件状态的命令级证据采集 |
+| Microsoft Learn：Get-Service / Get-Process | 服务状态、进程 ID、进程资源和父子关系复核 |
+| Microsoft Learn：schtasks | 计划任务、维护任务和诊断任务调度参考 |
+| Microsoft Learn：Windows Update for Business | Windows 更新分阶段、延期和质量更新治理参考 |
+| SQLite：CREATE TABLE / CREATE INDEX / CREATE TRIGGER | 生产级 Schema、约束、索引和触发器语法依据 |
+| NIST SP 800-34 Rev.1 Contingency Planning Guide | 应急预案、恢复优先级、备份和演练参考 |
+| NIST SP 800-53 Rev.5 Security and Privacy Controls | 维护、审计、访问控制和应急控制族参考 |
+| NIST SP 800-61 Rev.2 Incident Handling Guide | 安全事件响应、证据保全和复盘参考 |
+| smartmontools project | SMART 字段、存储健康检查和寿命预警参考 |
+| ISA/IEC 62443 series | 工业控制系统安全分区、供应商和运维安全参考 |
 
-### 50.2 视频与设备协议资料
+### 54.2 视频与设备协议资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -3827,7 +4808,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | GB/T 28181 相关公共安全视频监控联网标准 | 二期平台级联和协议扩展预研 |
 | GA/T 1400 相关公共安全视频图像信息系统标准 | 二期视图库、事件对象和平台对接预研 |
 
-### 50.3 主要链接
+### 54.3 主要链接
 
 - https://learn.microsoft.com/en-us/windows/win32/services/service-programs
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w
@@ -3846,6 +4827,19 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 - https://dahuawiki.com/Remote_Access/RTSP_via_VLC
 - https://www.cctv-database.com/rtsp/uniview/
 - https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/powercfg-command-line-options
+- https://learn.microsoft.com/en-us/powershell/module/cimcmdlets/get-ciminstance
+- https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/get-service
+- https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/get-process
+- https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks
+- https://learn.microsoft.com/en-us/windows/deployment/update/waas-manage-updates-wufb
+- https://www.sqlite.org/lang_createtable.html
+- https://www.sqlite.org/lang_createindex.html
+- https://www.sqlite.org/lang_createtrigger.html
+- https://csrc.nist.gov/pubs/sp/800/34/r1/upd1/final
+- https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final
+- https://csrc.nist.gov/pubs/sp/800/61/r2/final
+- https://www.smartmontools.org/
+- https://www.isa.org/standards-and-publications/isa-standards/isa-iec-62443-series-of-standards
 - https://learn.microsoft.com/en-us/windows/security/identity-protection/access-control/service-accounts
 - https://learn.microsoft.com/en-us/powershell/module/defender/add-mppreference
 - https://learn.microsoft.com/en-us/microsoft-365/security/defender-endpoint/configure-exclusions-microsoft-defender-antivirus
