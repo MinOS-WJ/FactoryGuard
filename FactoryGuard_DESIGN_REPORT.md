@@ -1,8 +1,8 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v2.7
+> 文档版本：v2.8
 > 成文日期：2026-10-07
-> 文档状态：立项稿（网络链路、RTSP 会话、数据盘治理与启动就绪增强版）
+> 文档状态：立项稿（主机资源治理、网络链路、RTSP 会话与启动就绪增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
 > v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
@@ -13,6 +13,7 @@
 > v2.5 增补：硬件 SMART/温度/UPS 监测、崩溃后启动恢复、告警风暴和 Load Shedding、命名管道消息目录与会话版本契约。
 > v2.6 增补：数据盘身份、GPT/NTFS、簇大小、分区对齐、盘符持久化、容量边界，以及服务依赖最小化、启动顺序、就绪确认和冷启动竞态治理。
 > v2.7 增补：网卡/VLAN/MTU/交换机端口治理、网络质量连续指标、RTSP/ONVIF 会话状态机、认证锁定、重连退避、Keepalive 和媒体新鲜度检测。
+> v2.8 增补：CPU/内存/提交量/句柄/线程/磁盘 I/O/GPU 连续监测、资源预算、Job Object 硬限制、泄漏判定、资源降级和故障注入。
 
 ---
 
@@ -8840,9 +8841,362 @@ ONVIF 请求还可能依赖设备时间与主机时间差异，某些认证场�
 
 ---
 
-## 76. 数据盘初始化、盘符持久化与文件系统验收
+## 76. Windows 主机资源基线、性能计数器与防资源耗尽
 
-### 76.1 为什么数据盘必须作为可靠性对象治理
+### 76.1 资源耗尽是无人值守系统的高概率故障
+
+FactoryGuard 的后台服务需要长期执行视频解码、帧调度、AI 推理、SQLite 写入、片段封装和通知发送。仅检查进程是否存在，无法发现以下问题：
+
+- CPU 长时间接近 100%，推理排队导致真实入侵延迟数分钟才被发现；
+- 内存只增不降，进程在几天后因提交内存不足被系统终止；
+- 句柄或线程持续泄漏，配置反复加载后进程无法打开文件、管道或套接字；
+- 磁盘平均延迟升高，SQLite 事务和媒体写入同时超时；
+- GPU 显存被多个会话占用，DirectML 初始化成功但后续帧无法提交；
+- UI、Defender 扫描、Windows Update 或第三方软件与核心服务争抢资源；
+- 队列没有字节预算，短暂码流峰值造成内存放大和连锁丢帧。
+
+因此，v1.0 必须把“资源预算、资源观测、软降级、硬限制、泄漏判定和故障演练”作为发布红线。可靠性目标不是让系统永远处于高性能状态，而是在资源紧张时仍能保证核心检测可见、可降级、可恢复，并且不产生孤儿进程或静默漏检。
+
+### 76.2 主机资源等级和预算
+
+| 资源 | 推荐 8～16 路基线 | 推荐 17～32 路基线 | 关键用途 |
+| --- | --- | --- | --- |
+| CPU | 4 物理核以上 | 6～8 物理核以上 | 解码、预处理、推理、规则和写入 |
+| 内存 | 16 GB | 24～32 GB | 帧环形缓冲、模型、工作进程和系统缓存 |
+| 系统盘 | 256 GB SSD 以上 | 512 GB SSD 以上 | OS、程序、日志和崩溃转储 |
+| 数据盘 | 512 GB 企业级 SSD/HDD 以上 | 1 TB 以上，按保留天数计算 | 数据库、截图、片段和诊断包 |
+| GPU | 可选，支持 DirectML | 建议具备 4～8 GB 显存独显 | 降低 CPU 推理压力 |
+| 网络 | 千兆有线 | 千兆/2.5G 有线 | 子码流接入和远程支持 |
+| 电源 | 主机和网络设备接入 UPS | 主机、交换机、NVR 接入 UPS | 防止掉电和写入中断 |
+
+资源预算必须在系统内转换为每进程上限，而不是只写在采购清单中。建议保留：
+
+- 系统和 Defender 至少 15% CPU、20% 内存余量；
+- FactoryGuard 全部工作负载峰值不超过主机 CPU 的 85%；
+- 全部提交内存峰值不超过物理内存的 85%，避免持续分页；
+- 媒体帧队列、推理队列和 UI 缓存分别设置字节上限；
+- 数据盘峰值使用保留至少 15～20% 余量；
+- GPU 模式失败时必须存在可执行的 CPU 降级配置。
+
+### 76.3 CPU 饱和与处理器队列
+
+CPU 指标不能只看 \`% Processor Time\`。需要同时观察：
+
+- Processor(_Total) 处理器总使用率；
+- System 处理器队列长度；
+- 每逻辑核使用率和热点是否集中在单核心；
+- 各进程 CPU 时间增量；
+- 推理队列等待时间、帧队列积压和丢帧数。
+
+判定原则：
+
+| 现象 | 工程含义 | 处理 |
+| --- | --- | --- |
+| CPU 高但队列短、延迟达标 | 算力被有效利用 | 记录容量上限，不必盲目回收 |
+| CPU 高且队列长期大于逻辑核数 | 已发生调度拥塞 | 降低帧率、通道并发或非关键任务 |
+| 单核高、其他核空闲 | 串行瓶颈、锁竞争或单路流异常 | 拆分工作队列，排查规则和日志锁 |
+| FFmpeg 短时高 CPU | 编码或码率异常 | 检查编码、分辨率和关键帧间隔 |
+| UI 高 CPU | 动画、轮询或渲染循环异常 | 降低刷新频率，UI 独立重启 |
+| 服务空闲仍持续高 CPU | 忙等、日志循环或重试风暴 | 修复定时器/退避逻辑 |
+
+任何 worker 都不允许无 sleep 的紧密循环。重试、队列检查和日志聚合必须由定时器或事件驱动。
+
+### 76.4 内存、提交量与泄漏判定
+
+需要区分两个核心指标：
+
+- **Working Set（工作集）**：进程当前驻留物理内存，可能被系统回收后下降，不适合单独作为泄漏依据；
+- **Private Bytes（私有提交字节）**：进程提交且不与其他进程共享的内存，是判断持续泄漏的主要指标。
+
+还要观察系统可用内存、已提交内存、分页速率和工作进程重启次数。仅看到内存随负载增长不能直接判定泄漏；需要在固定 workload 下观察多轮“加载—运行—卸载—空闲”周期。
+
+建议判定：
+
+| 状态 | 条件 |
+| --- | --- |
+| Normal | 负载结束后内存回落至基线附近，多轮周期趋势稳定 |
+| Warning | 连续 3 个周期后基线抬高，且没有回落趋势 |
+| Critical | 私有提交持续增长并接近进程或系统预算，同时出现分页、分配失败或队列超时 |
+| RestartNeeded | 内存未到硬上限但核心延迟持续异常，且重启可恢复 |
+
+防泄漏设计要求：
+
+- 帧缓冲使用固定容量环形结构，禁止无限追加；
+- 配置、模型、规则和摄像机重载必须释放旧对象；
+- 事件订阅和 IPC 回调必须可取消，避免旧 UI 会话仍被持有；
+- 日志、截图、片段和导出对象使用显式 Close/Dispose；
+- 大数组、像素缓冲和批处理张量使用对象池或统一分配器；
+- 长周期运行中记录每个阶段的对象计数和字节数。
+
+### 76.5 句柄、线程和 GDI/User 对象
+
+句柄泄漏往往比内存泄漏更隐蔽。需要监测每进程：
+
+- Handle Count；
+- Thread Count；
+- 文件、管道、套接字句柄；
+- UI 进程的 GDI Objects 和 User Objects；
+- 配置重载、打开窗口、导出证据和重连摄像机后的对象增量。
+
+典型阈值用于触发趋势分析，而不是简单按某台机器的绝对值杀进程：
+
+- 空闲 30 分钟后句柄数仍明显高于上一稳定周期，需标记趋势；
+- 重复 100 次打开/关闭窗口后，句柄、GDI、User 对象应回到基线附近；
+- 线程数在无通道扩展时持续增加，通常说明工作线程未回收；
+- 句柄数达到系统或进程安全余量前，应主动重启受影响非核心进程。
+
+UI 的 GDI/User 对象异常不应影响后台服务；后台服务不创建用户窗口，也不依赖桌面会话。
+
+### 76.6 磁盘 I/O 延迟与队列
+
+容量足够不代表磁盘 I/O 健康。SQLite 事务、WAL checkpoint、片段写入、日志滚动和导出可能同时发生，需要观察：
+
+- Avg. Disk sec/Read / Avg. Disk sec/Write；
+- Current/Average Disk Queue Length；
+- Disk Read Bytes/sec、Disk Write Bytes/sec；
+- IOPS、读写字节数和错误计数；
+- SQLite 事务耗时、WAL 锁等待和文件 Flush 耗时。
+
+建议以现场同型号机器建立基线：
+
+| 指标 | 预警思路 |
+| --- | --- |
+| 读写延迟 | 持续高于同型号硬件基线并影响事务或帧发布时预警 |
+| 队列长度 | 多个采样周期持续排队且不能回落，说明 I/O 饱和 |
+| 吞吐 | 峰值接近设备实测上限，且媒体写入延迟升高 |
+| 突发毛刺 | 若能自动恢复且不超过延迟红线，可记录为抖动 |
+| 持续性延迟 | 若伴随 SMART、错误包或卷错误，应优先判定硬件/文件系统问题 |
+
+工程上应错开非关键任务：Defender 全扫描、诊断包导出、备份压缩、WAL checkpoint 和大批量清理不应与高告警时段争用同一块数据盘。SQLite 写入必须有 busy timeout，但 busy timeout 不能替代磁盘容量与 I/O 治理。
+
+### 76.7 GPU、显存和后端降级
+
+GPU 资源指标在不同厂商和驱动上的通用计数器并不完全一致，不能依赖某个厂商工具作为跨现场健康依据。FactoryGuard 应以应用级会话状态为准：
+
+- GPU/适配器名称、驱动版本、显存总量；
+- ONNX Runtime 后端初始化结果和 Warmup 耗时；
+- 模型加载字节、输入输出张量和批大小；
+- 推理耗时、失败码、连续失败次数；
+- GPU 熔断状态、CPU 降级帧率和受影响通道。
+
+GPU 治理要求：
+
+1. 启动时不把 GPU 可用作为整个 Windows 服务启动的硬前置；
+2. GPU 可加载但推理失败时，有限重试并保留错误；
+3. 显存不足时降低批大小、并发通道和预览需求；
+4. 连续失败达到熔断条件后切换 CPU；
+5. CPU 无法承载全部通道时，必须明确显示降级通道和实际采样率；
+6. 驱动升级后必须重新跑 Warmup、长稳和故障恢复，不保留未经证实的“兼容”状态。
+
+### 76.8 Job Object 的硬资源限制
+
+所有子进程应加入 Job Object，并结合软策略设置硬边界：
+
+| Job 限制 | 用途 | 注意事项 |
+| --- | --- | --- |
+| KILL_ON_JOB_CLOSE | supervisor 异常退出时清理子进程 | 防止孤儿 FFmpeg 长期占用会话 |
+| Active Process Limit | 限制递归启动和失控拉起 | 必须高于正常进程数并保留余量 |
+| Process Memory Limit | 防止单进程耗尽系统内存 | 应高于正常峰值，过低会导致非预期终止 |
+| CPU Rate Limit | 防止非核心工作进程长期独占 CPU | 核心检测需要优先级和容量核算 |
+| Affinity | 必要时隔离工作负载 | 不应在不同 CPU 拓扑中硬编码核心编号 |
+| UI Restriction | 限制子进程访问桌面或剪贴板等能力 | 按进程角色最小授权 |
+
+建议采用“软阈值触发降级或受控重启，硬阈值兜底”的两层设计。不要等到 Job 硬杀进程才第一次暴露问题；在到达硬限制前，健康系统应提前预警并主动释放低优先级资源。
+
+### 76.9 资源紧张时的降级顺序
+
+资源仲裁必须明确优先级：
+
+1. 看门狗、心跳、服务控制和崩溃恢复；
+2. 布防通道的帧接收、核心规则检测和事件事务；
+3. 截图、Outbox、基础通知和审计；
+4. 告警片段、关键证据封装；
+5. UI 实时预览、图表和非关键统计；
+6. 导出、诊断包、调试日志、更新检查和非关键维护。
+
+降级动作按资源类型执行：
+
+| 资源 | 降级动作 |
+| --- | --- |
+| CPU | 降低 UI 刷新、通道采样率、批处理并发和非关键片段任务 |
+| 内存 | 缩短帧缓冲、限制预览缓存、禁用非关键导出和调试采样 |
+| GPU | 降批大小、减少通道并发、熔断后切 CPU |
+| 磁盘 I/O | 延迟备份压缩、诊断导出和非关键清理，优先事务和截图 |
+| 磁盘容量 | 按保留策略清理媒体，保留数据库、核心截图和必要日志 |
+| 句柄 | 停止非关键轮询，关闭旧会话，重启非核心进程 |
+
+降级必须记录触发条件、开始时间、影响对象和恢复时间。恢复时逐步提高负载，避免从低负载瞬间恢复为全部通道并发。
+
+### 76.10 实时资源快照脚本
+
+以下脚本使用 Get-Counter、Get-Process 和 CIM 读取现场资源状态。不同语言版 Windows 的性能计数器显示名称可能存在本地化差异，发布测试必须覆盖目标系统语言；若计数器路径无法解析，应保留错误并通过应用内指标补充，不允许脚本静默返回空数据。
+
+```powershell
+[CmdletBinding()]
+param(
+  [string[]]$ProcessNames = @(
+    'factoryguard-supervisor',
+    'factoryguard-engine',
+    'factoryguard-inference',
+    'factoryguard-ui',
+    'factoryguard-ffmpeg'
+  )
+)
+
+$counterPaths = @(
+  '\Processor(_Total)\% Processor Time',
+  '\System\Processor Queue Length',
+  '\Memory\Available MBytes',
+  '\Memory\% Committed Bytes In Use',
+  '\PhysicalDisk(_Total)\Avg. Disk sec/Read',
+  '\PhysicalDisk(_Total)\Avg. Disk sec/Write',
+  '\PhysicalDisk(_Total)\Avg. Disk Queue Length',
+  '\Process(_Total)\Handle Count',
+  '\Process(_Total)\Thread Count'
+)
+
+$counterSample = $null
+$counterError = $null
+try {
+  $counterSample = Get-Counter -Counter $counterPaths -ErrorAction Stop
+} catch {
+  $counterError = $_.Exception.Message
+}
+
+$targetProcesses = Get-Process -ErrorAction SilentlyContinue |
+  Where-Object { $ProcessNames -contains $_.ProcessName } |
+  Select-Object Name, Id, StartTime, CPU,
+                @{ Name = 'WorkingSetBytes'; Expression = { $_.WorkingSet64 } },
+                @{ Name = 'PrivateBytes'; Expression = { $_.PrivateMemorySize64 } },
+                @{ Name = 'HandleCount'; Expression = { $_.HandleCount } },
+                @{ Name = 'ThreadCount'; Expression = { $_.Threads.Count } }
+
+$operatingSystem = Get-CimInstance Win32_OperatingSystem |
+  Select-Object LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize,
+                FreeVirtualMemory, TotalVirtualMemorySize
+
+$processors = Get-CimInstance Win32_Processor |
+  Select-Object DeviceId, Name, NumberOfCores, NumberOfLogicalProcessors, LoadPercentage
+
+[pscustomobject]@{
+  GeneratedAt = (Get-Date).ToString('o')
+  Counters = $counterSample.CounterSamples |
+    Select-Object Path, CookedValue, RawValue
+  CounterError = $counterError
+  Processes = $targetProcesses
+  OperatingSystem = $operatingSystem
+  Processors = $processors
+}
+```
+
+注意：\`Get-Process.CPU\` 是累计 CPU 时间，不是瞬时百分比；需要按两个采样点的 CPU 时间差和采样时长计算进程 CPU 使用率。每进程的 \`% Processor Time\` 可能因多核而超过 100，解读时要按逻辑核数归一化。
+
+### 76.11 资源趋势采集与泄漏回归
+
+长稳测试中，资源数据至少保留以下维度：
+
+- 5～15 秒粒度的短期样本，用于故障定位；
+- 1～5 分钟粒度的小时/日级样本，用于趋势分析；
+- 按进程重启切分的样本，防止新旧 PID 数据混在一起；
+- 通道数、帧率、模型版本和负载模式标签；
+- 降级动作、恢复动作和维护窗口。
+
+泄漏回归必须覆盖：
+
+1. UI 连续打开/关闭 100～1000 次；
+2. 配置保存和重载 100 次；
+3. 单路通道反复断线重连 100 次；
+4. 模型反复加载/卸载和 GPU/CPU 切换；
+5. 证据导出、取消导出和异常路径恢复；
+6. 72 小时固定 workload 后对比首个和最后一个空闲周期基线。
+
+### 76.12 资源故障注入矩阵
+
+| 测试 | 注入方式 | 通过标准 |
+| --- | --- | --- |
+| CPU 压力 | 在测试机运行经审批的签名压力工具，使系统保持 80～95% 负载 | 核心检测仍按降级策略运行，告警延迟和丢帧可见 |
+| 内存压力 | 逐步消耗非关键内存，逼近预警线 | 应用缩短缓存并降级，不发生未记录崩溃 |
+| 单进程内存上限 | 为测试 worker 设置 Job 内存限制 | 达到限制后受控终止并恢复，其他进程不受影响 |
+| 句柄泄漏 | 在模拟进程中打开但不释放句柄 | 趋势告警触发，重启策略只影响该进程 |
+| UI 对象泄漏 | 高频打开关闭页面和对话框 | GDI/User、句柄和私有内存回到基线 |
+| 磁盘高延迟 | 用实验室故障注入或高并发 I/O 制造排队 | 事务超时可记录，核心状态不损坏 |
+| GPU 显存压力 | 增加批大小或并发模型会话 | 显存不足时降级或熔断，不阻断服务 |
+| 启动资源紧张 | 开机后立即运行压力负载 | checkpoint 正常，核心链路优先恢复 |
+| 恢复峰值 | 32 路同时从断线恢复 | 系统按批恢复，CPU/内存不越过红线 |
+| 长时间空闲后突发 | 空闲后模拟多通道同时告警 | 队列和对象池正常扩容，事件不丢失 |
+
+压力工具只能在实验室或客户书面批准的维护窗口运行，执行后必须删除或禁用，并在证据中记录命令、时长、操作者和恢复结果。
+
+### 76.13 资源健康 JSON
+
+```json
+{
+  "version": 1,
+  "sampledAt": "2026-10-07T12:00:00+08:00",
+  "host": {
+    "logicalProcessors": 8,
+    "cpuTotalPercent": 62.4,
+    "processorQueueLength": 1,
+    "availableMemoryBytes": 7516192768,
+    "committedMemoryPercent": 68.2,
+    "uptimeSeconds": 86400
+  },
+  "dataVolume": {
+    "readLatencyMs": 1.8,
+    "writeLatencyMs": 4.2,
+    "queueLength": 0.4,
+    "freeBytes": 549755813888
+  },
+  "processes": [
+    {
+      "role": "supervisor",
+      "pid": 1200,
+      "cpuPercent": 2.1,
+      "privateBytes": 83886080,
+      "workingSetBytes": 104857600,
+      "handleCount": 180,
+      "threadCount": 8,
+      "restartCount": 0
+    },
+    {
+      "role": "inference",
+      "pid": 1300,
+      "cpuPercent": 55.0,
+      "privateBytes": 1610612736,
+      "workingSetBytes": 1811939328,
+      "handleCount": 260,
+      "threadCount": 12,
+      "restartCount": 0
+    }
+  ],
+  "gpu": {
+    "backend": "DirectML",
+    "state": "ready",
+    "fallbackToCpu": false,
+    "consecutiveFailures": 0
+  },
+  "degradation": {
+    "active": false,
+    "reasons": [],
+    "affectedChannelIds": []
+  }
+}
+```
+
+### 76.14 发布门禁
+
+- CPU、内存、提交量、句柄、线程、磁盘 I/O、GPU 和队列指标必须可采集；
+- 关键进程必须配置软阈值、硬上限、受控重启和 Job Object 清理；
+- 固定 workload 下不得存在未解释的私有内存、句柄或线程持续增长；
+- 资源紧张时必须优先保证看门狗、核心检测、事件事务和基础通知；
+- 降级动作必须显示影响通道、实际帧率和恢复条件；
+- CPU/内存/磁盘 I/O/GPU/句柄泄漏故障注入必须在发布前完成并保存证据。
+
+---
+
+## 77. 数据盘初始化、盘符持久化与文件系统验收
+
+### 77.1 为什么数据盘必须作为可靠性对象治理
 
 FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告警前后片段、临时片段、日志、诊断包和本地备份副本。若这些数据直接散落在系统盘、U 盘、网络共享或未验收卷上，即使检测进程本身正常，也可能出现以下失效：
 
@@ -8858,7 +9212,7 @@ FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告�
 
 因此，v1.0 不允许安装器在启动时自动寻找“看起来容量最大”的磁盘并格式化。数据盘必须经过勘察、身份确认、审批、初始化、验收和登记。系统上线后，服务每次启动都要核验磁盘身份；身份不符时只能进入安全模式并告警，不能静默改写磁盘或切换到系统盘。
 
-### 76.2 v1.0 标准文件系统决策
+### 77.2 v1.0 标准文件系统决策
 
 | 项目 | v1.0 标准决策 | 说明 |
 | --- | --- | --- |
@@ -8876,7 +9230,7 @@ FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告�
 
 结论很明确：**新项目首版默认“固定数据盘 + GPT + NTFS + 4K 簇 + 固定盘符 + 显式身份登记”**。ReFS 的完整性流、块克隆和弹性能力值得关注，但不同 Windows 版本和使用场景的能力边界不同；在没有完成现场兼容性验证前，不应为了追求单一特性而更换默认文件系统。
 
-### 76.3 磁盘身份识别与防误格式化
+### 77.3 磁盘身份识别与防误格式化
 
 磁盘编号可能因为插拔顺序、控制器和 BIOS 设置变化，不能作为唯一身份。实施时至少记录以下字段：
 
@@ -8890,7 +9244,7 @@ FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告�
 
 初始化脚本必须通过 \`UniqueId\` 或序列号精确选择磁盘，并再次确认该磁盘不是启动盘、系统盘，且没有分区。任何“按容量自动匹配”“只有一块空盘所以直接格式化”的逻辑都不允许进入生产安装器。
 
-### 76.4 数据目录与容量边界
+### 77.4 数据目录与容量边界
 
 以盘符 \`V\` 为例，标准布局如下：
 
@@ -8916,7 +9270,7 @@ FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告�
 
 数据库所在目录应保留独立最小空间，例如 5 GB 或按现场通道数计算的上限。媒体清理不能通过删除数据库文件、WAL 文件或尚未完成取证审批的证据来换取空间。
 
-### 76.5 受控初始化脚本示例
+### 77.5 受控初始化脚本示例
 
 以下脚本默认只执行 WhatIf 预演；只有传入 \`-Commit\` 才会真正初始化。生产交付时应把同等校验逻辑固化到签名安装器，并把命令输出存入部署证据包。
 
@@ -9040,7 +9394,7 @@ if ($Commit) {
 }
 ```
 
-### 76.6 只读盘点与对齐核验脚本
+### 77.6 只读盘点与对齐核验脚本
 
 以下脚本只读不写，用于部署前和每次大版本升级前采集证据：
 
@@ -9089,7 +9443,7 @@ $ntfsInfo = & fsutil fsinfo ntfsinfo "$DriveLetter`:"
 
 验收时必须确认目标分区的 \`AlignedTo1MiB\` 为 true，文件系统为 NTFS，簇大小为 4096，且剩余容量符合容量规划。若 \`fsutil\` 返回权限或路径错误，应在提权命令行中重新执行并保存原始输出。
 
-### 76.7 NTFS 与 ReFS 的工程选择
+### 77.7 NTFS 与 ReFS 的工程选择
 
 | 维度 | NTFS | ReFS |
 | --- | --- | --- |
@@ -9103,7 +9457,7 @@ $ntfsInfo = & fsutil fsinfo ntfsinfo "$DriveLetter`:"
 
 不能把 ReFS 宣传成“永远不会损坏”。文件系统只能提高某些故障的检测和恢复能力，无法替代 UPS、断电写入测试、数据库事务、备份和物理磁盘健康监测。
 
-### 76.8 写入持久性和原子重命名演练
+### 77.8 写入持久性和原子重命名演练
 
 初始化完成后不能只验证“能创建文件”，还应验证显式 Flush、崩溃和重命名语义。
 
@@ -9145,7 +9499,7 @@ Get-ChildItem -LiteralPath $probeDirectory |
 
 重启后检查：最终文件可读取；临时文件可被启动恢复任务识别并清理；数据库不会引用不存在的媒体文件；没有半个文件被标记为“已发布”。
 
-### 76.9 数据盘异常处理矩阵
+### 77.9 数据盘异常处理矩阵
 
 | 异常 | 期望检测 | 系统动作 |
 | --- | --- | --- |
@@ -9160,7 +9514,7 @@ Get-ChildItem -LiteralPath $probeDirectory |
 | 空间不足 | 容量水位越界 | 按分级策略清理和降级，保留核心告警 |
 | SMART 警告 | 健康状态或可靠性计数器异常 | 提前更换磁盘并执行迁移，不等待完全失效 |
 
-### 76.10 验收记录 JSON
+### 77.10 验收记录 JSON
 
 ```json
 {
@@ -9212,7 +9566,7 @@ Get-ChildItem -LiteralPath $probeDirectory |
 }
 ```
 
-### 76.11 发布门禁
+### 77.11 发布门禁
 
 - 安装器不得提供“一键自动格式化所有空盘”功能；
 - 没有磁盘序列号、UniqueId、客户审批和现场照片，不得执行初始化；
@@ -9225,9 +9579,9 @@ Get-ChildItem -LiteralPath $probeDirectory |
 
 ---
 
-## 77. Windows 服务依赖、启动顺序与就绪确认
+## 78. Windows 服务依赖、启动顺序与就绪确认
 
-### 77.1 SCM 能保证什么，不能保证什么
+### 78.1 SCM 能保证什么，不能保证什么
 
 Windows Service Control Manager 可以根据服务配置、服务依赖和加载顺序组安排服务进程启动。Microsoft 对 \`CreateService\` 的 \`lpDependencies\` 参数定义为：系统必须在当前服务之前启动的服务或加载顺序组；依赖一个组只表示该组至少一个成员在尝试启动后处于运行状态。
 
@@ -9241,7 +9595,7 @@ Windows Service Control Manager 可以根据服务配置、服务依赖和加载
 
 因此，FactoryGuard 必须同时管理两层顺序：第一层是 SCM 的进程和系统服务启动顺序；第二层是 FactoryGuard 内部的资源就绪顺序。不能把 SCM 依赖当成摄像机、模型、数据库或 NVR 的健康监控。
 
-### 77.2 默认依赖最小化原则
+### 78.2 默认依赖最小化原则
 
 v1.0 的默认核心服务采用：
 
@@ -9268,7 +9622,7 @@ v1.0 的默认核心服务采用：
 
 依赖关系应服务于“没有它进程不应该启动”的场景，而不是为了让配置表看起来完整。
 
-### 77.3 内部启动阶段
+### 78.3 内部启动阶段
 
 FactoryGuard 的 \`ServiceMain\` 应按以下阶段推进，并及时向 SCM 报告 \`SERVICE_START_PENDING\`、checkpoint 和 wait hint：
 
@@ -9288,7 +9642,7 @@ FactoryGuard 的 \`ServiceMain\` 应按以下阶段推进，并及时向 SCM 报
 
 启动阶段必须周期性更新 checkpoint。任何一个阶段可能超过 SCM 的默认等待窗口时，都不能让主线程无提示阻塞；应每 5～10 秒报告一次仍在启动，并说明当前阶段。
 
-### 77.4 “运行中”的业务定义
+### 78.4 “运行中”的业务定义
 
 只有在下面条件满足后，才能对外部显示为完整 Running：
 
@@ -9307,7 +9661,7 @@ FactoryGuard 的 \`ServiceMain\` 应按以下阶段推进，并及时向 SCM 报
 
 单路摄像机不可达、某一个 Webhook 超时或 GPU 不可用，不应导致整个 Windows 服务停留在 Start Pending。服务可以进入 Running，但健康面板必须明确列出降级项。
 
-### 77.5 依赖配置脚本示例
+### 78.5 依赖配置脚本示例
 
 安装器权威实现应调用 \`CreateService\` 或 \`ChangeServiceConfig\`。命令行脚本只用于复核或现场诊断。
 
@@ -9353,7 +9707,7 @@ if ($LASTEXITCODE -ne 0) {
 
 依赖名称必须使用服务键名，而不是显示名称。多个依赖以正斜杠分隔。若要清除依赖，应在安装器中实现单独的显式操作并保存变更记录，不应在普通诊断脚本中隐式清空。
 
-### 77.6 自动启动与延迟启动选择
+### 78.6 自动启动与延迟启动选择
 
 | 启动方式 | 适用对象 | FactoryGuard 结论 |
 | --- | --- | --- |
@@ -9364,7 +9718,7 @@ if ($LASTEXITCODE -ne 0) {
 
 延迟启动不能保证在某个网络服务、交换机链路或 GPU 初始化完成之后执行，也不能替代内部就绪检查。对安防系统而言，开机后数分钟不能检测是实质性风险。若现场存在开机风暴，应优先优化启动阶段、分批复连摄像机、限制启动时全量扫描，而不是简单把核心服务改为 delayed-auto。
 
-### 77.7 冷启动证据采集脚本
+### 78.7 冷启动证据采集脚本
 
 ```powershell
 [CmdletBinding()]
@@ -9418,7 +9772,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 
 冷启动证据应能回答：服务是否自动启动、启动类型是否被改变、依赖是什么、开机后多久进入 Running、数据盘是否准时出现、网络是否就绪、时钟是否可信、是否出现 SCM 超时或崩溃恢复。
 
-### 77.8 冷启动竞态与重试策略
+### 78.8 冷启动竞态与重试策略
 
 | 竞态 | 典型表现 | FactoryGuard 策略 |
 | --- | --- | --- |
@@ -9434,7 +9788,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 
 所有重试都必须有次数、间隔、超时、日志和最终状态，避免无限 busy loop。核心链路的重试间隔应短于非核心链路，非关键导出、诊断和更新检查应延后。
 
-### 77.9 启动测试矩阵
+### 78.9 启动测试矩阵
 
 | 测试 | 操作 | 通过标准 |
 | --- | --- | --- |
@@ -9451,7 +9805,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | 依赖缺失 | 可选依赖服务禁用 | 若非硬依赖，核心服务仍能启动并报告降级 |
 | SCM 恢复 | 连续触发服务失败 | 恢复动作、退避和事件计数符合配置 |
 
-### 77.10 发布门禁
+### 78.10 发布门禁
 
 - 核心检测服务必须为自动启动，不能依赖用户登录；
 - 不允许把 Qt UI 或远程支持工具配置为核心服务的前置条件；
@@ -9464,11 +9818,11 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 
 ---
 
-## 78. 行业资料与标准依据
+## 79. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 78.1 平台与可靠性资料
+### 79.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -9569,12 +9923,19 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | Microsoft NetTCPIP：Get-NetIPAddress / Get-NetRoute / Get-NetIPInterface | IP、路由、接口 MTU 和网络配置核验依据 |
 | Microsoft DnsClient：Resolve-DnsName / Get-DnsClientServerAddress | DNS 解析、DNS 服务器和缓存排障依据 |
 | Microsoft NetConnection：Get-NetConnectionProfile | 网络位置、连接状态和网络类别检查依据 |
+| Microsoft Diagnostics：Get-Counter | 实时 CPU、内存、磁盘、进程等性能计数器采集依据 |
+| Microsoft Performance Counters Portal | Windows 性能计数器架构和使用边界 |
+| Microsoft Process and Thread：GetProcessMemoryInfo | 进程工作集、内存计数和资源占用采集依据 |
+| PSAPI：PROCESS_MEMORY_COUNTERS / _EX | 进程页错误、工作集、分页字节和峰值字段 |
+| Win32 System Information：GlobalMemoryStatusEx | 系统物理内存、可用内存和提交限制检查依据 |
+| File API：GetDiskFreeSpaceEx | 卷容量和可用空间检测依据 |
+| CIM：Win32_OperatingSystem / Win32_Processor | 操作系统、内存、启动时间和 CPU 负载复核 |
 | RFC 2326 Real Time Streaming Protocol (RTSP) 1.0 | RTSP 方法、Session、认证、PLAY/TEARDOWN 和兼容设备行为依据 |
 | RFC 7826 Real-Time Streaming Protocol (RTSP) 2.0 | RTSP 2.0 能力边界和版本差异参考 |
 | ONVIF Profile S Specification | IP 视频设备、媒体配置和 GetStreamUri 能力参考 |
 | ISA/IEC 62443 series | 工业控制系统安全分区、供应商和运维安全参考 |
 
-### 78.2 视频与设备协议资料
+### 79.2 视频与设备协议资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -9584,7 +9945,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | GB/T 28181 相关公共安全视频监控联网标准 | 二期平台级联和协议扩展预研 |
 | GA/T 1400 相关公共安全视频图像信息系统标准 | 二期视图库、事件对象和平台对接预研 |
 
-### 78.3 主要链接
+### 79.3 主要链接
 
 - https://learn.microsoft.com/en-us/windows/win32/services/service-programs
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w
@@ -9721,6 +10082,15 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 - https://learn.microsoft.com/en-us/powershell/module/nettcpip/test-netconnection
 - https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/test-connection
 - https://www.rfc-editor.org/rfc/rfc2326
+- https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.diagnostics/get-counter
+- https://learn.microsoft.com/en-us/windows/win32/perfctrs/using-performance-counters
+- https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-getprocessmemoryinfo
+- https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters
+- https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters_ex
+- https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-globalmemorystatusex
+- https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskfreespaceexa
+- https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-operatingsystem
+- https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-processor
 - https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls
 - https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipes
 - https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createnamedpipea
@@ -9744,6 +10114,15 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 - **PoE（Power over Ethernet，以太网供电）**：交换机通过网线向摄像机等终端供电，需核验端口功率和总电源预算。
 
 ---
+
+
+- **处理器队列长度（Processor Queue Length）**：等待执行的线程数量；长期高队列通常说明 CPU 已出现调度拥塞。
+- **私有字节（Private Bytes）**：进程私有提交的内存大小，常用于判断内存泄漏趋势。
+- **工作集（Working Set）**：进程当前驻留在物理内存中的字节数，可能被系统回收。
+- **提交内存（Committed Memory）**：系统或进程已承诺提供 backing store 的内存；超过物理内存时可能发生分页。
+- **句柄泄漏（Handle Leak）**：文件、线程、套接字、管道等内核对象未及时关闭，导致句柄数持续增长。
+- **磁盘 I/O 延迟**：读/写请求从提交到完成所经历的时间，是判断磁盘响应能力的重要指标。
+- **资源硬限制**：通过 Job Object 等机制设置的进程内存、CPU 或活动进程上限，用于故障兜底。
 
 ## 附录：术语
 
