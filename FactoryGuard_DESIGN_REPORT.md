@@ -1,8 +1,8 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v2.4
+> 文档版本：v2.5
 > 成文日期：2026-10-07
-> 文档状态：立项稿（应用控制、网络加固、防御式工程与 UI 一致性增强版）
+> 文档状态：立项稿（硬件健康、崩溃恢复、负载保护与 IPC 契约增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
 > v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
@@ -10,6 +10,7 @@
 > v2.2 增补：Windows 服务状态机、通知模板与值班升级、备份加密和密钥托管、需求—测试—证据追踪矩阵及发布授权包。
 > v2.3 增补：勒索软件防护和攻击面减少、崩溃转储符号化、补丁生命周期、安全事件响应、根因分析和客户公告。
 > v2.4 增补：WDAC/AppLocker 应用白名单、可移动介质、SMB/RDP/WinRM 加固、防御式编译/Fuzzing/CI、Qt UI 状态一致性与降级模式。
+> v2.5 增补：硬件 SMART/温度/UPS 监测、崩溃后启动恢复、告警风暴和 Load Shedding、命名管道消息目录与会话版本契约。
 
 ---
 
@@ -7607,11 +7608,741 @@ UI 的可靠性标准是：操作员始终知道系统真实状态、数据是�
 
 ---
 
-## 70. 行业资料与标准依据
+## 70. 硬件健康、SMART、温度与环境连续监测
+
+FactoryGuard 的可靠性不仅取决于程序代码，还取决于系统盘、内存、GPU、网卡、电源、散热和 UPS 的长期状态。许多现场故障在真正崩溃前已有信号：磁盘重映射扇区增加、温度长期偏高、网卡错误计数增长、UPS 自检失败。系统应主动采集这些信号，并把变化纳入健康评分和维护计划。
+
+### 70.1 监测对象
+
+| 对象 | 关键指标 | 黄色预警 | 红色处理 |
+| --- | --- | --- | --- |
+| 物理磁盘 | 健康状态、磨损度、介质错误、温度、重映射 | Health 非 Healthy 或可靠性计数异常 | 立即备份并更换 |
+| 逻辑卷 | 容量、文件系统错误、IO 延迟 | 空闲 <15% 或延迟持续升高 | 空闲 <8%，执行受控清理/扩容 |
+| 内存 | 可用内存、分页、纠正错误（硬件支持时） | P95 使用率 >80% | 出现资源失败或严重分页 |
+| GPU | 温度、驱动重启、显存、设备丢失 | 温度接近厂商阈值或驱动重启 | 设备不可用，切换降级策略 |
+| 网卡 | 丢包、错误包、链路速率、重连次数 | 错误计数增长 | RTSP 受影响，立即排查 |
+| 电源/UPS | 市电状态、电池负载、自检、剩余时间 | 自检异常或电池老化 | 市电异常时按策略安全关机 |
+| 机箱环境 | 温度、风扇、湿度、粉尘（可取得时） | 长期接近阈值 | 物理整改或停机保护 |
+
+硬件监测必须允许“指标不可得”。不是所有消费级电脑、磁盘或 GPU 都暴露全部传感器；系统应显示 unsupported/unknown，不能伪造 0 值并给出绿色结论。
+
+### 70.2 物理磁盘和可靠性计数器
+
+```powershell
+Get-PhysicalDisk |
+  Select-Object DeviceId, FriendlyName, MediaType, BusType, HealthStatus,
+    OperationalStatus, Size, AllocatedSize |
+  Format-Table -AutoSize
+
+Get-PhysicalDisk |
+  Get-StorageReliabilityCounter |
+  Select-Object DeviceId, Temperature, ReadErrorsTotal, WriteErrorsTotal,
+    PowerOnHours, StartStopCycleCount, LoadUnloadCycleCount, Wear |
+  Format-Table -AutoSize
+```
+
+字段含义受硬件和驱动支持影响：
+
+- Wear 不是所有磁盘都提供；
+- NVMe、SATA/SAS 和 USB 转接盒暴露的字段不同；
+- 0 可能表示真实零，也可能表示不支持，需要结合传感器类型判断；
+- USB 转接、RAID 控制器或虚机可能隐藏 SMART；
+- 关键站点不应依赖无 SMART 透传的外接转接盒承载主数据。
+
+### 70.3 卷容量和 IO 性能
+
+```powershell
+Get-Volume |
+  Where-Object DriveLetter |
+  Select-Object DriveLetter, FileSystemLabel, FileSystem, HealthStatus,
+    SizeRemaining, Size |
+  Format-Table -AutoSize
+
+$counters = @(
+  '\PhysicalDisk(_Total)\% Disk Time',
+  '\PhysicalDisk(_Total)\Avg. Disk sec/Read',
+  '\PhysicalDisk(_Total)\Avg. Disk sec/Write',
+  '\PhysicalDisk(_Total)\Current Disk Queue Length',
+  '\Memory\Available MBytes',
+  '\Memory\Pages/sec'
+)
+
+Get-Counter -Counter $counters -SampleInterval 2 -MaxSamples 15 |
+  Export-Counter -Path '.\storage-performance.blg' -FileFormat BLG
+```
+
+建议阈值：
+
+| 指标 | yellow | red |
+| --- | --- | --- |
+| Avg. Disk sec/Read/Write | P95 >20 ms（系统盘） | >100 ms 或导致事件写入超时 |
+| Current Disk Queue | 长时间 >2 | 持续 >10 或服务等待 |
+| Available MBytes | <总内存 20% | <总内存 10% 或出现分配失败 |
+| Pages/sec | 持续升高 | 明显影响推理和媒体处理 |
+
+工业现场可能使用普通办公 SSD，性能和断电保护能力不同，阈值应结合实际硬件，不应只按短期测试平均值判断。
+
+### 70.4 GPU 和网卡状态
+
+```powershell
+Get-CimInstance Win32_VideoController |
+  Select-Object Name, DriverVersion, DriverDate, AdapterRAM,
+    CurrentHorizontalResolution, CurrentVerticalResolution, Status |
+  Format-List
+
+Get-NetAdapter |
+  Select-Object Name, InterfaceDescription, Status, LinkSpeed,
+    MediaType, MacAddress, DriverVersion, DriverDate |
+  Format-Table -AutoSize
+
+Get-NetAdapterStatistics |
+  Select-Object Name, ReceivedPacketErrors, OutboundPacketErrors,
+    ReceivedDiscardedPackets, OutboundDiscardedPackets, ReceivedBytes, SentBytes |
+  Format-Table -AutoSize
+```
+
+验收要求：
+
+- GPU 驱动版本与 DirectML 兼容矩阵一致；
+- 网卡链路速率和双工状态明确；
+- 24 小时错误包计数不应持续增长；
+- 网卡休眠和节能策略不会导致 RTSP 长连接中断；
+- 多网卡机器有明确路由，不让 NVR 流量走不可信网络。
+
+### 70.5 UPS 和电源事件
+
+UPS 信息不一定能通过标准 Windows API 获取，可通过厂商代理、SNMP、USB HID 或人工记录。系统至少要记录：
+
+- UPS 品牌、型号、额定容量；
+- 当前负载率和电池健康；
+- 最近自检结果；
+- 预计安全关机时间；
+- 电池采购/更换日期；
+- 市电异常事件和恢复时间。
+
+```powershell
+Get-WinEvent -FilterHashtable @{
+  LogName = 'System'
+  ProviderName = 'Microsoft-Windows-Kernel-Power'
+  StartTime = (Get-Date).AddDays(-7)
+} -MaxEvents 30 |
+  Select-Object TimeCreated, Id, LevelDisplayName, Message |
+  Format-List
+```
+
+若 UPS 软件提供命令行或日志，应将输出路径加入诊断清单；没有软件接口时，应由现场电工或管理员按月签字确认自检结果。
+
+### 70.6 硬件健康 JSON 报告
+
+```json
+{
+  "hardwareReportVersion": "1.0",
+  "siteId": "FG-SITE-0001",
+  "collectedAt": "2026-10-07T11:00:00+08:00",
+  "overallStatus": "yellow",
+  "storage": [
+    {
+      "deviceId": "0",
+      "name": "Enterprise SSD",
+      "health": "Healthy",
+      "wearPct": 72,
+      "temperatureC": 41,
+      "readErrors": 0,
+      "writeErrors": 0,
+      "powerOnHours": 18200,
+      "status": "monitor"
+    }
+  ],
+  "network": [
+    {
+      "name": "Ethernet",
+      "linkSpeed": "1 Gbps",
+      "packetErrors24h": 0,
+      "status": "healthy"
+    }
+  ],
+  "gpu": {
+    "name": "DirectML-compatible adapter",
+    "driverVersion": "example",
+    "status": "healthy"
+  },
+  "actions": [
+    {
+      "severity": "medium",
+      "owner": "site-admin",
+      "dueDate": "2026-10-21",
+      "description": "plan SSD replacement before wear reaches 80 percent"
+    }
+  ]
+}
+```
+
+### 70.7 硬件故障演练
+
+| 演练 | 注入方式 | 必须证明 |
+| --- | --- | --- |
+| 磁盘空间不足 | 填充非关键文件至阈值 | 清理、只读保护和告警生效 |
+| 磁盘 SMART 预警 | 插入带预警的测试盘或模拟报告 | 维护任务生成，备份和更换计划明确 |
+| 网卡断开 | 拔线 60 秒 | 无重连风暴，恢复后通道自动重连 |
+| GPU 不可用 | 停止/重置设备（测试环境） | 错误可见，按批准策略降级 |
+| 市电异常 | UPS 自检或模拟市电事件 | 安全关机/续航策略有效 |
+| 高 IO | 并发备份和历史查询 | 检测事件写入仍优先，UI 查询可取消 |
+
+### 70.8 发布和维护门禁
+
+以下情况不能作为“硬件可靠”：
+
+- 系统盘 SMART 异常但只口头提示；
+- 值守电脑散热不良且未整改；
+- UPS 电池从未测试；
+- 磁盘、数据库、备份位于同一单点磁盘；
+- 网卡错误计数无法解释；
+- 关键传感器全部不可得却显示绿色；
+- 更换硬盘后未验证数据库恢复和服务自启。
+
+硬件健康报告必须与每日健康报表、维护记录和证据包关联。硬件风险越早暴露，FactoryGuard 越能避免在真实入侵时才进入故障状态。
+
+---
+
+## 71. 崩溃后启动恢复、状态重建与一致性审计
+
+Windows 主机可能因断电、蓝屏、进程崩溃、强制关机或升级中断而停止。可靠性设计不能假设每次退出都会执行完整停止流程。FactoryGuard 必须在下次启动时识别上次是否干净退出、哪些文件可能不完整、哪些子进程需要重新托管、哪些事件需要补偿，并把恢复过程记录成证据。
+
+### 71.1 崩溃点和恢复目标
+
+| 崩溃点 | 风险 | 恢复目标 |
+| --- | --- | --- |
+| 配置写入中 | 配置截断或旧配置被覆盖 | 从原子临时文件或上一版本恢复 |
+| 数据库事务提交中 | 事务未完整落盘 | SQLite 事务回滚或恢复到一致状态 |
+| 事件已入库但 Outbox 未创建 | 通知丢失 | 同事务避免；异常版本通过补偿扫描发现 |
+| 截图写入中 | 文件损坏或无法打开 | 标记 pending/failed，保留事件和错误码 |
+| 片段封装中 | 片段不可播放 | 标记 recoverable_missing/failed，不写 clip_uri |
+| 子进程运行中父进程退出 | 孤儿 FFmpeg/Inference | Job Object 回收；启动时扫描残留进程 |
+| 升级替换文件中 | 新旧文件混合 | 安装器事务/回滚工具恢复已验证版本 |
+| 备份写入中 | 备份副本看似存在但损坏 | 临时文件不替换正式副本，校验失败保留上一版本 |
+
+恢复时应优先保证：数据库一致 → 核心事件和通知可恢复 → 核心通道重新检测 → 再处理非关键媒体和历史缓存。
+
+### 71.2 启动状态标记
+
+建议在 ProgramData 中维护受控启动状态，但不能把它当作唯一真相：
+
+| 字段 | 含义 |
+| --- | --- |
+| boot_id | 每次系统或服务启动生成的唯一编号 |
+| previous_shutdown | clean、crash_detected、unknown |
+| previous_boot_id | 上一次服务启动编号 |
+| last_heartbeat_at | 上次服务心跳 |
+| recovery_reason | power、service_crash、upgrade、manual 等 |
+| recovery_actions | 本次执行的恢复动作 |
+| recovery_result | pass、partial、fail |
+
+启动状态文件必须原子写入：先写临时文件并 flush，再同卷替换。服务异常退出后，旧状态文件仍应可读。
+
+### 71.3 启动恢复流程
+
+1. SCM 启动服务并进入 START_PENDING；
+2. 读取启动状态文件，识别上次是否干净停止；
+3. 打开数据库，让 WAL 恢复到一致事务状态；
+4. 执行 integrity_check、foreign_key_check 和 user_version 检查；
+5. 扫描 pending 状态的截图、片段、备份和导出任务；
+6. 检查是否存在残留的 FactoryGuard 子进程和管道；
+7. 重建进程状态、通道状态和任务状态；
+8. 对关键事件执行 Outbox 补偿检查；
+9. 生成恢复事件，列出发现的问题和动作；
+10. 核心通道完成启动检查后再报告 RUNNING。
+
+不得为了“快速启动”跳过数据库检查，也不应在 START_PENDING 阶段删除用户数据或历史事件。
+
+### 71.4 残留进程和文件检查
+
+```powershell
+$processNames = @(
+  'FactoryGuardEngine',
+  'FactoryGuardInference',
+  'FactoryGuardMedia',
+  'FactoryGuardUI',
+  'ffmpeg'
+)
+
+Get-Process -Name $processNames -ErrorAction SilentlyContinue |
+  Select-Object ProcessName, Id, StartTime, Path |
+  Sort-Object ProcessName, Id |
+  Format-Table -AutoSize
+
+$dataRoot = Join-Path $env:ProgramData 'FactoryGuard'
+Get-ChildItem -Path $dataRoot -Recurse -File -ErrorAction SilentlyContinue |
+  Where-Object { $_.Extension -in '.tmp', '.part', '.wal', '.shm' } |
+  Select-Object FullName, Length, LastWriteTime |
+  Format-Table -AutoSize
+```
+
+处理规则：
+
+- 数据库 WAL/SHM 由 SQLite 管理，不应手工删除；
+- 媒体 .tmp/.part 文件要根据任务记录判断是否可继续或标记失败；
+- 残留进程若不属于当前 SCM 服务，应先记录 PID 和路径，再按策略终止；
+- 若残留进程路径无法确认，不能直接当作恶意程序，需要采集安全和事件日志；
+- Job Object 正常工作时，父进程退出后不应长期残留子进程。
+
+### 71.5 Outbox 补偿规则
+
+理想情况下事件和 Outbox 在同一事务中提交。补偿扫描只用于异常恢复或历史数据修复，不能成为日常替代事务的设计。
+
+| 查询场景 | 判定 | 动作 |
+| --- | --- | --- |
+| 事件存在但无通知任务 | 高/严重事件且应通知 | 创建补偿 Outbox 并写恢复审计 |
+| Outbox 存在但事件缺失 | 数据引用不完整 | 标记异常，不发送孤立通知 |
+| Outbox 长期 sending | 服务崩溃在发送中 | 重置为可重试或失败，保留 attempts |
+| 通知已 sent 但事件仍 new | 人员未确认，不代表故障 | 等待升级或值班处理 |
+| next_retry_at 已过 | 调度器应处理 | 恢复调度并统计延迟 |
+
+补偿操作必须使用独立审计记录，包括触发原因、事件数量、创建时间、执行人和恢复结果。
+
+### 71.6 截图和片段状态重建
+
+```powershell
+$mediaRoot = Join-Path $env:ProgramData 'FactoryGuard\media'
+$candidates = Get-ChildItem -Path $mediaRoot -Recurse -File -Include '*.tmp','*.part','*.mp4','*.jpg' -ErrorAction SilentlyContinue
+$candidates |
+  Select-Object FullName, Length, LastWriteTime |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 50 |
+  Format-Table -AutoSize
+```
+
+恢复规则：
+
+- 文件不存在：pending/missing 根据任务记录转换；
+- 文件存在但无法解析：failed 或 recoverable_missing；
+- 文件可解析但事件未引用：保留并等待维护确认，不能自动删除；
+- 完整文件校验通过：更新状态并写入 uri；
+- 关键事件媒体缺失：在 UI 和日报中明确显示，不伪装完整。
+
+### 71.7 恢复报告 JSON
+
+```json
+{
+  "recoveryReportVersion": "1.0",
+  "bootId": "BOOT-20261007-0900",
+  "previousBootId": "BOOT-20261006-2100",
+  "previousShutdown": "crash_detected",
+  "database": {
+    "integrityCheck": "ok",
+    "foreignKeyCheck": "ok",
+    "schemaVersion": 16,
+    "walRecovered": true
+  },
+  "artifacts": {
+    "pendingSnapshots": 2,
+    "recoveredSnapshots": 1,
+    "failedSnapshots": 1,
+    "pendingClips": 1,
+    "recoverableMissingClips": 1
+  },
+  "compensation": {
+    "eventsWithoutOutbox": 0,
+    "stuckSendingOutbox": 1,
+    "notificationsReset": 1
+  },
+  "processes": {
+    "orphansBefore": 0,
+    "rolesStarted": ["engine", "inference", "media"]
+  },
+  "result": "partial",
+  "message": "core detection recovered; one non-critical snapshot requires review"
+}
+```
+
+### 71.8 崩溃恢复测试矩阵
+
+| 用例 | 注入 | 预期 |
+| --- | --- | --- |
+| 强制断电模拟 | 写事务期间关闭测试机 | 重启后数据库一致，无重复事件 |
+| Engine 强杀 | taskkill /F | SCM 恢复，启动报告记录 crash_detected |
+| 媒体写入中断 | 封装中杀死 FFmpeg | 片段状态可解释，不写入错误 clip_uri |
+| 备份中断 | 备份进程强杀 | 上一正式备份保留，临时副本不替换 |
+| 配置写入中断 | 写配置时结束进程 | 配置回到上一完整版本 |
+| Outbox 发送中断 | 发送状态中强杀服务 | 重启后任务可重试，不重复发送已确认消息 |
+| 升级中断 | 安装过程中取消/断电 | 回滚工具恢复可启动版本 |
+| 子进程孤儿 | 杀死 Engine | Job Object 回收子进程，启动时无残留 |
+
+### 71.9 恢复门禁
+
+- 数据库校验失败不得进入 RUNNING；
+- Schema 版本不匹配必须明确失败或由批准迁移处理；
+- 关键通道恢复失败时只能 degraded，不能 green；
+- 补偿动作必须有审计；
+- 恢复后应执行一次合成事件；
+- 若恢复结果为 partial，必须列出影响和责任人；
+- 恢复失败时应保持故障可见，不能静默进入正常界面。
+
+崩溃恢复能力要通过真实断电、强杀和升级中断演练证明。没有这些证据，“能自动恢复”只能是设计目标。
+
+---
+
+## 72. 告警风暴、负载 Shedding 与核心链路优先级
+
+FactoryGuard 可能在短时间内遇到大量目标、摄像机画面异常、极端天气、网络抖动、恶意触发或多通道同时报警。系统不能在超负荷时平均变慢、队列无限增长或通知轰炸，而应提前定义优先级、限流、降采样、抑制和恢复机制，确保最关键通道和真实事件优先被处理。
+
+### 72.1 告警风暴的来源
+
+| 来源 | 表现 | 风险 |
+| --- | --- | --- |
+| 自然干扰 | 雨雪、虫群、树叶、水面反光、灯光闪烁 | 大量误报和通知疲劳 |
+| 设备异常 | 花屏、丢帧、I 帧间隔异常、画面遮挡 | 伪目标和规则误判 |
+| 突发人员/车辆 | 上下班、装卸、集中巡逻 | 目标关联混乱和队列积压 |
+| 网络问题 | 抖动、重连、乱序 | 帧时间异常和重复推理 |
+| 攻击/测试 | 故意触发大量规则 | 数据库、通知和 UI 被打爆 |
+| 配置错误 | 规则区域过大、灵敏度过高 | 全站点持续报警 |
+
+系统应区分“真实事件增多”和“技术噪声导致风暴”，不能只靠统一静默所有告警。
+
+### 72.2 处理优先级
+
+| 优先级 | 对象 | 策略 |
+| --- | --- | --- |
+| P1 | 非工作时间围墙、危化品、配电房、仓库等 critical 通道 | 尽量保持完整分析和初始通知 |
+| P2 | 出入口、装卸区、主要办公边界 | 保持规则确认，必要时降低帧率 |
+| P3 | 低风险区域和 informational 提示 | 可临时降采样或仅记录 |
+| P4 | UI 预览、非关键历史查询、报表美化 | 自动延迟或取消 |
+| P5 | 调试日志、详细轨迹、临时诊断 | 限流或采样输出 |
+
+负载 Shedding 的原则：先降低非关键输出，再降低低风险通道采样；不能先静默 critical 初始告警，也不能让 UI 查询占用检测资源。
+
+### 72.3 队列和背压指标
+
+| 指标 | 含义 | 阈值建议 |
+| --- | --- | --- |
+| decode_queue_depth | 等待解码或已解码等待推理的帧数 | P95 持续升高进入 yellow |
+| inference_queue_wait_ms | 帧等待推理时间 | P95 >500 ms 需要处理 |
+| rule_queue_depth | 等待规则判断的结果数量 | 不允许无限增长 |
+| db_write_ms | 事件事务写入耗时 | P95 >200 ms 排查 IO |
+| outbox_pending | 待发送通知数量 | 超过通道基线时限流更新消息 |
+| dropped_frames | 被主动丢弃的帧 | 必须按通道/原因计数 |
+| active_events | 未关闭或冷却内事件 | 突增触发风暴模式 |
+
+主动丢帧必须是可解释的策略动作，记录通道、原因、时间和数量；不能在媒体统计中悄悄消失。
+
+### 72.4 分级降级动作
+
+| 等级 | 触发条件 | 动作 |
+| --- | --- | --- |
+| L0 normal | 资源和队列正常 | 按配置分析全部通道 |
+| L1 conserve | P95 CPU/GPU >80% 或队列等待升高 | 降低 UI 刷新，暂停详细 debug 日志 |
+| L2 shed-low | 资源持续紧张 | P3 通道降采样，取消手动预览，减少轨迹点 |
+| L3 protect-core | 接近容量上限 | 保持 P1/P2，非关键规则只做聚合记录 |
+| L4 emergency | 数据库或磁盘风险 | 只允许核心事件事务，UI 进入只读/降级 |
+
+每个等级都应自动产生系统事件；恢复到 L0 后记录持续时间、影响范围和恢复原因。
+
+### 72.5 风暴检测脚本示例
+
+```powershell
+$counters = @(
+  '\Processor Information(_Total)\% Processor Time',
+  '\Memory\Available MBytes',
+  '\GPU Engine(*)\Utilization Percentage'
+)
+
+$samples = Get-Counter -Counter $counters -SampleInterval 2 -MaxSamples 30
+$summary = $samples | ForEach-Object {
+  [pscustomobject]@{
+    Timestamp = $_.Timestamp
+    CpuPct = ($_.CounterSamples |
+      Where-Object { $_.Path -like '*processor information*' } |
+      Measure-Object CookedValue -Average).Average
+    AvailableMBytes = ($_.CounterSamples |
+      Where-Object { $_.Path -like '*memory*available mbytes' } |
+      Select-Object -First 1).CookedValue
+  }
+}
+
+$summary | Format-Table -AutoSize
+$summary | Export-Csv -NoTypeInformation -Encoding UTF8 '.\load-shedding-samples.csv'
+```
+
+GPU 计数器路径在不同 Windows 和驱动上名称可能不同。若计数器不可用，应记录 unsupported，并通过产品自身健康样本补充。
+
+### 72.6 通知风暴控制
+
+- critical 事件首条通知不应被延迟；
+- 同一事件冷却期内更新消息最多按策略发送 1–2 条；
+- 不同通道同时报警时，可发送汇总，但必须保留逐事件记录；
+- 电话呼叫应设置并发上限，避免线路或供应商限流；
+- Webhook 批量发送仍需保证每条通知可重试和追踪；
+- 值班员确认某事件后，不应自动关闭其他通道事件；
+- 系统从风暴模式恢复后，可发送一条恢复摘要。
+
+通知抑制只针对重复更新和低风险提示，不能把新的 critical 事件合并掉。
+
+### 72.7 风暴状态 JSON
+
+```json
+{
+  "loadShedReportVersion": "1.0",
+  "siteId": "FG-SITE-0001",
+  "detectedAt": "2026-10-07T23:10:00+08:00",
+  "level": "L3",
+  "trigger": {
+    "cpuP95Pct": 93,
+    "gpuP95Pct": 91,
+    "inferenceQueueWaitP95Ms": 1200,
+    "activeEvents": 84
+  },
+  "actions": [
+    "paused manual video previews",
+    "reduced P3 channels from 2 fps to 1 fps",
+    "sampled detailed tracks",
+    "kept P1 critical channels at configured fps"
+  ],
+  "impact": {
+    "channelsReduced": 6,
+    "framesProactivelyDropped": 320,
+    "criticalEventsDelayed": 0,
+    "criticalNotificationsDelayed": 0
+  },
+  "recoveredAt": "2026-10-07T23:28:00+08:00",
+  "reviewRequired": true
+}
+```
+
+### 72.8 压力和恢复演练
+
+| 用例 | 注入 | 合格标准 |
+| --- | --- | --- |
+| 多目标突发 | 单画面大量合成目标 | 进入对应等级，P1 不中断 |
+| 多通道同时事件 | 8–16 通道同时触发 | 事件均入库，通知不无限轰炸 |
+| 推理变慢 | 模拟推理耗时增加 | 队列背压可见，低优先级先降级 |
+| Webhook 慢 | 外部端点延迟 | 检测不阻塞，Outbox 正确重试 |
+| 噪声风暴 | 大量伪目标/异常帧 | 风暴模式触发，误报进入治理 |
+| 恢复 | 负载恢复正常 | 自动恢复策略并生成报告 |
+
+### 72.9 发布门禁
+
+- 每个版本必须有最大安全容量和降级等级；
+- critical 通道在标准负载和 L3 场景中不得被静默；
+- 所有主动丢帧和降采样必须可审计；
+- 不允许队列无限增长直到 OOM；
+- 风暴恢复后资源指标回到稳定区间；
+- 销售和实施材料不得引用未经测试的通道数承诺。
+
+Load Shedding 不是承认系统不可靠，而是明确在异常负载下优先保护什么。真正不可靠的是系统超负荷后既不告警、也不降级、还显示一切正常。
+
+---
+
+## 73. 命名管道消息目录、版本协商与状态同步契约
+
+第 38 章定义了命名管道边界和 ACL，本章给出消息级契约。目标是让 Qt UI、诊断工具和后台服务在版本升级、会话断开、重复请求、权限变化和状态同步时有统一格式，避免每个客户端自定义命令导致兼容风险。
+
+### 73.1 消息帧基本字段
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| frame_version | number | 是 | 帧格式版本 |
+| message_id | string | 是 | 单次请求唯一 ID，用于响应匹配 |
+| correlation_id | string | 否 | 一组操作的关联编号 |
+| session_id | string | 是 | 服务端认证后分配 |
+| type | string | 是 | request、response、event、error |
+| command | string | request 必填 | 命令名称 |
+| payload | object | 否 | 命令参数或结果 |
+| issued_at | string | request 必填 | 客户端时间，仅用于诊断 |
+| server_time | string | response/event 必填 | 服务端权威时间 |
+| trace_id | string | 否 | 与需求追踪或日志关联 |
+
+服务端不信任客户端 issued_at 作为业务时间。事件确认、关闭和配置修改的业务时间以 server_time 为准。
+
+### 73.2 版本协商
+
+连接建立后先握手，未完成握手前不允许业务写操作：
+
+| 阶段 | 客户端 | 服务端 |
+| --- | --- | --- |
+| Hello | 发送支持的 frame_version、client_id、client_version、capabilities | 校验协议和客户端类型 |
+| Challenge | 无 | 返回认证上下文/会话要求 |
+| Authenticate | 使用本地身份上下文完成认证 | 验证 Windows 身份和角色 |
+| Ready | 无 | 返回 session_id、权限、服务状态、兼容能力 |
+
+若客户端过旧，服务端可拒绝写命令；若只是新增可选字段，应保持向后兼容。服务端不得用未定义的静默降级模式支持关键操作。
+
+### 73.3 Hello 示例
+
+```json
+{
+  "frame_version": 1,
+  "message_id": "msg-hello-0001",
+  "type": "request",
+  "command": "hello",
+  "issued_at": "2026-10-07T11:00:00+08:00",
+  "payload": {
+    "client_id": "factoryguard-qt-ui",
+    "client_version": "1.0.0",
+    "protocol_versions": [1],
+    "capabilities": ["events.read", "events.write", "rules.read", "rules.write"]
+  }
+}
+```
+
+### 73.4 Ready 响应
+
+```json
+{
+  "frame_version": 1,
+  "message_id": "msg-hello-0001",
+  "correlation_id": "handshake",
+  "session_id": "sess-20261007-0001",
+  "type": "response",
+  "command": "hello",
+  "server_time": "2026-10-07T11:00:01+08:00",
+  "payload": {
+    "status": "ready",
+    "service_state": "running",
+    "health": "degraded",
+    "roles": ["operator"],
+    "permissions": ["events.read", "events.acknowledge", "rules.read"],
+    "server_version": "1.0.0",
+    "protocol_version": 1,
+    "requires_client_upgrade": false
+  }
+}
+```
+
+如果服务处于 starting，Ready 响应可以建立会话，但写命令应返回 not_ready；客户端必须显示启动中。
+
+### 73.5 命令目录
+
+| 命令 | 权限 | 是否幂等 | 用途 |
+| --- | --- | --- | --- |
+| status.summary | events.read | 是 | 获取总览状态 |
+| channels.list | events.read | 是 | 获取通道健康摘要 |
+| events.list | events.read | 是 | 分页查询事件 |
+| events.get | events.read | 是 | 获取单事件详情 |
+| events.acknowledge | events.acknowledge | 是 | 确认事件 |
+| events.close | events.close | 是 | 关闭事件并填写原因 |
+| rules.list | rules.read | 是 | 查询规则版本 |
+| rules.validate | rules.read | 是 | 校验规则草稿 |
+| rules.save | rules.write | 由 rule_version 保证 | 保存规则 |
+| rules.enable | rules.write | 是 | 启停规则 |
+| config.precheck | config.read | 是 | 配置启用前检查 |
+| notification.test | notification.test | 是 | 测试通知渠道 |
+| export.create | export.create | 是 | 创建导出任务 |
+| export.status | export.read | 是 | 查询导出状态 |
+| diagnostics.collect | diagnostics.read | 是 | 创建诊断证据包 |
+
+命令应使用点分名称，避免一个通用 execute 命令接收任意字符串。服务端必须维护命令白名单和角色映射。
+
+### 73.6 事件确认请求
+
+```json
+{
+  "frame_version": 1,
+  "message_id": "msg-ack-0002",
+  "session_id": "sess-20261007-0001",
+  "type": "request",
+  "command": "events.acknowledge",
+  "issued_at": "2026-10-07T11:01:00+08:00",
+  "payload": {
+    "event_id": "00000000-0000-0000-0000-000000000001",
+    "expected_event_status": "new",
+    "note": "值班员开始查看"
+  }
+}
+```
+
+响应返回当前权威状态、处理人、server_time 和审计编号。重复确认同一事件不重复写业务状态，但应返回当前状态。
+
+### 73.7 服务端主动事件
+
+| event | 触发 | UI 动作 |
+| --- | --- | --- |
+| service.state_changed | starting/running/stopped | 更新顶部状态 |
+| health.changed | green/yellow/red | 展示健康变化和原因 |
+| channel.state_changed | 通道在线/离线/降级 | 刷新通道列表 |
+| event.created | 新事件产生 | 加入列表，高等级强提示 |
+| event.updated | 确认/关闭/合并变化 | 更新单事件状态 |
+| outbox.stalled | Outbox 积压或失败 | 通知管理员 |
+| config.drift_detected | 基线漂移 | 打开漂移报告入口 |
+| recovery.completed | 崩溃恢复结束 | 展示恢复摘要 |
+
+订阅事件必须由服务端在认证后授权。客户端不能订阅超出其角色的资源或读取详细敏感字段。
+
+### 73.8 错误响应格式
+
+```json
+{
+  "frame_version": 1,
+  "message_id": "msg-ack-0002",
+  "session_id": "sess-20261007-0001",
+  "type": "error",
+  "command": "events.acknowledge",
+  "server_time": "2026-10-07T11:01:00+08:00",
+  "payload": {
+    "code": "EVENT-STATE-CONFLICT",
+    "severity": "medium",
+    "retryable": false,
+    "message": "事件状态已变化，请刷新后重试",
+    "current_status": "acknowledged",
+    "trace_id": "trace-0001"
+  }
+}
+```
+
+错误必须映射到统一错误码目录。客户端不应把网络断开、权限拒绝和业务冲突显示成同一种“操作失败”。
+
+### 73.9 分页、过滤和查询限制
+
+- 所有 list 命令必须分页，默认页大小由服务端限制；
+- 时间范围、通道、状态和严重级别字段必须验证；
+- 不允许客户端请求无限历史或全量 payload；
+- 慢查询应可取消并释放资源；
+- 查询结果包含 server_time 和数据版本；
+- 导出大量数据必须走任务，不通过单个 IPC 响应传输。
+
+### 73.10 会话失效规则
+
+| 情况 | 处理 |
+| --- | --- |
+| 管道断开 | 取消未完成请求，客户端重新握手 |
+| 角色被降低 | 服务端推送权限变化，拒绝后续高权限命令 |
+| 账号停用 | 会话失效并写审计 |
+| 服务重启 | 所有会话失效，旧 message_id 不再用于业务状态 |
+| 重复会话 | 根据策略保留最新会话或拒绝，防止互相覆盖 |
+| 心跳超时 | 标记会话过期 |
+
+会话断开不得影响后台检测；服务也不能因为 UI 断开而停止媒体、推理或 Outbox。
+
+### 73.11 IPC 测试矩阵
+
+| 用例 | 注入 | 预期 |
+| --- | --- | --- |
+| 未握手写命令 | 直接发送 events.close | 拒绝并审计 |
+| 旧版本客户端 | frame_version 不支持 | 明确版本错误 |
+| 重复确认 | 重放相同 message_id | 幂等返回当前状态 |
+| 权限不足 | viewer 保存规则 | 拒绝，不改变规则 |
+| 超长消息 | 超过帧上限 | 拒绝并关闭/限流连接 |
+| 慢查询取消 | 客户端断开 | 请求被取消，无线程泄漏 |
+| 服务重启 | 重启 Engine | 会话失效，重连后状态正确 |
+| 事件推送积压 | UI 不读取 | 服务端限流，不无限缓存 |
+
+### 73.12 发布门禁
+
+- 所有客户端命令都有 Schema、权限和错误码；
+- 关键写操作具备幂等和版本冲突检测；
+- UI 与服务协议版本兼容矩阵可查询；
+- 消息不携带 NVR 或通知密钥明文；
+- 管道断开不影响检测服务；
+- IPC Fuzzing 纳入 CI；
+- 每次新增命令必须同步更新本章和测试。
+
+IPC 契约越清晰，Windows 现场升级和故障诊断越不容易依赖“某版本客户端刚好能工作”的偶然状态。
+
+---
+
+## 74. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 70.1 平台与可靠性资料
+### 74.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -7687,6 +8418,12 @@ UI 的可靠性标准是：操作员始终知道系统真实状态、数据是�
 | Microsoft Learn：/GS buffer security check | 编译器缓冲区安全检查和栈保护参考 |
 | Microsoft Learn：/SDL additional security checks | 编译期安全开发生命周期检查参考 |
 | Qt Documentation：QProcess / QTimer | UI进程启动、定时刷新和事件循环使用参考 |
+| Microsoft Storage：Get-PhysicalDisk | 物理磁盘健康、介质类型、总线和运行状态采集参考 |
+| Microsoft Storage：Get-StorageReliabilityCounter | SMART、磨损、温度、错误计数和加电时间字段参考 |
+| Microsoft Win32_TemperatureProbe | 温度传感器可用性、状态和硬件兼容边界参考 |
+| Microsoft Typeperf | 性能计数器命令行采集和长稳采样参考 |
+| SQLite：Atomic Commit | 崩溃恢复、事务原子性和 WAL 一致性参考 |
+| Microsoft Named Pipes / IPC | 本地消息、会话和管道通信边界参考 |
 | RFC 5905 Network Time Protocol Version 4 | NTP 时间同步、时间源、偏差和时钟治理参考 |
 | RFC 3550 RTP: A Transport Protocol for Real-Time Applications | RTP 时间戳、实时媒体传输和帧时序诊断参考 |
 | Microsoft Learn：Get-FileHash | 文件 SHA256、证据导出和完整性校验参考 |
@@ -7765,6 +8502,11 @@ UI 的可靠性标准是：操作员始终知道系统真实状态、数据是�
 - https://learn.microsoft.com/en-us/cpp/build/reference/sdl-enable-additional-security-checks
 - https://doc.qt.io/qt-6/qprocess.html
 - https://doc.qt.io/qt-6/qtimer.html
+- https://learn.microsoft.com/en-us/powershell/module/storage/get-physicaldisk
+- https://learn.microsoft.com/en-us/powershell/module/storage/get-storagereliabilitycounter
+- https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-temperatureprobe
+- https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/typeperf
+- https://www.sqlite.org/atomiccommit.html
 - https://learn.microsoft.com/en-us/powershell/module/defender/add-mppreference
 - https://learn.microsoft.com/en-us/microsoft-365/security/defender-endpoint/configure-exclusions-microsoft-defender-antivirus
 - https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule
@@ -7858,3 +8600,8 @@ UI 的可靠性标准是：操作员始终知道系统真实状态、数据是�
 - **Fuzzing**：向程序持续输入异常数据以发现崩溃、越界、死循环和资源泄漏；
 - **只读降级**：服务不可用或权限不足时，UI 仅展示可标记时间的数据而不执行写操作；
 - **本地缓存**：UI 保存的短期界面或查询数据，必须标记来源、时间和过期状态。
+- **SMART**：磁盘自监测、分析与报告技术，用于观察磨损、温度、错误计数和加电时间等指标；
+- **Load Shedding**：在资源接近上限时主动降低或延后非关键工作，以保护核心检测链路；
+- **背压**：下游处理变慢时，队列把压力反馈给上游，从而触发限流、降采样或排队；
+- **消息帧**：命名管道通信中包含版本、会话、命令、负载和时间的标准化消息结构；
+- **崩溃恢复**：服务或系统异常退出后，在重启时重建状态、校验数据并恢复检测的过程。
