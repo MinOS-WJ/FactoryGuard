@@ -1,8 +1,8 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v2.6
+> 文档版本：v2.7
 > 成文日期：2026-10-07
-> 文档状态：立项稿（数据盘治理、服务启动就绪、硬件健康与崩溃恢复增强版）
+> 文档状态：立项稿（网络链路、RTSP 会话、数据盘治理与启动就绪增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
 > v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
@@ -12,6 +12,7 @@
 > v2.4 增补：WDAC/AppLocker 应用白名单、可移动介质、SMB/RDP/WinRM 加固、防御式编译/Fuzzing/CI、Qt UI 状态一致性与降级模式。
 > v2.5 增补：硬件 SMART/温度/UPS 监测、崩溃后启动恢复、告警风暴和 Load Shedding、命名管道消息目录与会话版本契约。
 > v2.6 增补：数据盘身份、GPT/NTFS、簇大小、分区对齐、盘符持久化、容量边界，以及服务依赖最小化、启动顺序、就绪确认和冷启动竞态治理。
+> v2.7 增补：网卡/VLAN/MTU/交换机端口治理、网络质量连续指标、RTSP/ONVIF 会话状态机、认证锁定、重连退避、Keepalive 和媒体新鲜度检测。
 
 ---
 
@@ -8339,9 +8340,509 @@ IPC 契约越清晰，Windows 现场升级和故障诊断越不容易依赖“�
 
 ---
 
-## 74. 数据盘初始化、盘符持久化与文件系统验收
 
-### 74.1 为什么数据盘必须作为可靠性对象治理
+
+---
+
+## 74. 摄像机网络链路、网卡、VLAN 与连接质量治理
+
+### 74.1 网络链路是检测可用性的前置条件
+
+FactoryGuard 不替代 NVR 连续录像，但实时检测必须依赖一条从摄像机或 NVR 到 Windows 值守电脑的网络路径。即使后台服务、AI 模型和规则引擎都正常，只要出现错误 VLAN、IP 冲突、网卡休眠、MTU 黑洞、交换机端口错误或 DNS 解析失败，系统仍可能进入“进程活着但没有分析帧”的危险状态。
+
+因此，网络不能只在安装时 \`ping\` 一次。v1.0 需要把以下对象纳入验收和持续监测：
+
+- Windows 值守电脑物理网卡、驱动、链路速率和双工；
+- 网卡高级属性、省电策略、Jumbo Frame 和中断调节；
+- IP 地址、子网掩码、网关、路由和 DNS；
+- 摄像机/NVR 地址、VLAN、端口和交换机端口计数器；
+- 丢包、延迟、抖动、链路抖动、TCP 重连和帧到达间隔；
+- 网络变更、交换机重启、线缆断开、VLAN 配置错误等故障场景。
+
+可靠性原则是：**网络故障必须被明确定位、隔离和恢复，不能让服务静默等待，也不能让其他正常通道被单路故障拖垮。**
+
+### 74.2 标准网络拓扑
+
+v1.0 推荐两种拓扑，优先级如下：
+
+| 拓扑 | 结构 | 适用场景 | 结论 |
+| --- | --- | --- | --- |
+| 同 VLAN 直连 | NVR/摄像机和 FactoryGuard 主机接入同一受管交换机、同一安全 VLAN | 小型工厂、8～32 路、单站点 | 首选，最少路由和 MTU 变量 |
+| 分区 VLAN | 摄像机在 Camera VLAN，值守主机在管理或分析 VLAN，中间三层 ACL | 客户 IT 管理规范、需要隔离摄像机流量 | 可选，必须验证路由、ACL、MTU 和组播/单播策略 |
+| 跨广域网/VPN | FactoryGuard 通过 VPN 或互联网访问远端 NVR | 多站点或远程托管 | 不作为 v1.0 默认，需要单独容量与稳定性设计 |
+| 双网卡乱接 | 主机同时接办公网、访客网和摄像机网且存在多条默认路由 | 临时调试 | 禁止作为生产配置 |
+| USB 网卡/低速交换机 | USB-Ethernet 转接、家用小交换机、集线器 | 临时演示 | 禁止作为生产承载 |
+
+标准拓扑要求：
+
+1. NVR、摄像机和 FactoryGuard 主机使用固定地址或静态 DHCP 保留；
+2. 网络中只有一条明确默认路由，不允许双网卡各自抢占默认网关；
+3. 摄像机 VLAN 默认不能直接访问互联网；
+4. FactoryGuard 主机只向通知服务、时间服务和经批准的远程支持地址发起必要出站连接；
+5. 交换机端口、VLAN ID、MAC、IP、资产编号和物理配线必须写入部署档案；
+6. 若客户已有网络由第三方 IT 管理，必须明确网络故障责任人与变更通知机制。
+
+### 74.3 IP 地址、VLAN 与路由基线
+
+| 项目 | 标准要求 | 风险说明 |
+| --- | --- | --- |
+| 主机地址 | 静态 IP 或基于 MAC 的 DHCP 保留 | 地址变化会导致设备侧 ACL、日志关联和访问策略失效 |
+| 摄像机/NVR 地址 | 固定地址或静态保留 | RTSP 地址变化会造成批量通道离线 |
+| 子网规划 | 地址数量至少保留 20% 余量 | 增加摄像机或临时维护设备时避免冲突 |
+| 默认网关 | 单 VLAN 内即使无网关也应明确配置或确认不需要 | 错误网关可能造成延迟和不可达 |
+| DNS | 使用固定 IP 时可弱依赖 DNS；使用主机名时必须配置可靠 DNS | RTSP 运行时不应因短时间 DNS 波动反复销毁全部连接 |
+| VLAN | 由受管交换机端口配置，主机网卡默认使用 Access VLAN | 主机多 VLAN Tagging 会增加现场误配概率 |
+| ARP/邻居表 | 上线前后核验 MAC 与资产一致 | IP 冲突或仿冒设备会造成间歇性失败 |
+| 路由 | 只保留到摄像机网段和必要业务网段的路由 | 多默认路由会让连接走向不可预测 |
+| 地址复用 | 更换 NVR 或主机前必须检查旧地址租约和缓存 | 旧 ARP 表项可能造成短时连接错误 |
+
+摄像机系统建议优先使用固定 IP，而不是依赖短 TTL DNS。若客户统一要求主机名，应同时记录 DNS 名称、正向解析、反向解析、DNS 服务器和缓存刷新流程。
+
+### 74.4 Windows 网卡硬件与驱动基线
+
+| 检查项 | v1.0 标准 |
+| --- | --- |
+| 网卡类型 | 主板集成或经过认证的 PCIe 千兆/2.5G 网卡 |
+| 禁用适配器 | USB-Ethernet、百兆不明适配器、未识别虚拟网卡不得承载生产媒体 |
+| 链路速率 | 至少 1 Gbps，状态显示全双工 |
+| 驱动 | 使用厂商或 Windows 更新中经回归的稳定驱动 |
+| 省电 | 禁止“允许计算机关闭此设备以节约电源” |
+| 节能以太网 | 默认关闭 Energy Efficient Ethernet，除非现场完成长时间验证 |
+| Jumbo Frame | 默认 MTU 1500；启用巨型帧必须端到端验证 |
+| 中断调节 | 不为追求单次吞吐设置过度聚合，避免帧到达检测延迟增大 |
+| 多网卡 | 非生产网卡应禁用或明确无默认路由 |
+| 虚拟交换机 | 若主机还承载虚拟化，应保证管理口和媒体 VLAN 隔离 |
+
+网卡省电是常见隐性问题。链路在长时间低流量后进入节能状态，设备重启或告警发生时可能出现首批连接超时。安防值守主机不能按普通办公电脑策略让网卡频繁休眠。
+
+### 74.5 MTU、路径发现与黑洞检测
+
+v1.0 默认 MTU 1500，对应以太 payload 1500 字节；IPv4 下 ICMP payload 通常为 1472 字节时，加上 20 字节 IP 头和 8 字节 ICMP 头，总计 1500。不要只在本机查看网卡 MTU，就认定路径支持该 MTU；跨 VLAN、VPN、防火墙或三层交换时，路径中任一设备都可能减小有效 MTU。
+
+Jumbo Frame 只有在网卡、交换机、路由、防火墙和摄像机全部支持且配置一致时才可启用。对于 RTSP over TCP，MTU 不匹配可能表现为连接建立成功、DESCRIBE 正常，但 PLAY 后遇到大 I 帧或认证报文就卡住，而不是立刻明确报错。
+
+```powershell
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory = $true)]
+  [string]$Address,
+
+  [ValidateRange(68, 9000)]
+  [int]$ProbePayload = 1472
+)
+
+$pingArgs = @('-n', '4', '-f', '-l', [string]$ProbePayload, $Address)
+& ping.exe @pingArgs
+$pingExitCode = $LASTEXITCODE
+
+$interfaceMtu = Get-NetIPInterface -AddressFamily IPv4 |
+  Select-Object InterfaceAlias, ConnectionState, NlMtuBytes, Dhcp,
+                AutomaticMetric, InterfaceMetric
+
+[pscustomobject]@{
+  Target = $Address
+  ProbePayload = $ProbePayload
+  PingExitCode = $pingExitCode
+  InterfaceMtu = $interfaceMtu
+}
+```
+
+如果 1472 字节探测失败而小包成功，应检查 VLAN、VPN、防火墙 ICMP、MSS Clamping 和路径 MTU。不能简单通过应用层无限超时掩盖该问题。
+
+### 74.6 主机网络基线只读采集
+
+以下脚本只读不写，用于部署日、升级日和故障诊断：
+
+```powershell
+[CmdletBinding()]
+param(
+  [string]$CameraSubnet = '192.168.10.0/24'
+)
+
+$adapters = Get-NetAdapter |
+  Select-Object Name, InterfaceDescription, Status, LinkSpeed, MacAddress,
+                MediaConnectionState, DriverName, DriverVersion, PnPDeviceID
+
+$adapterPower = Get-NetAdapterPowerManagement |
+  Select-Object Name, AllowComputerToTurnOffDevice, WakeOnMagicPacket,
+                WakeOnPattern, ArpOffload, NSOffload, RsnRekeyOffload
+
+$advancedProperties = Get-NetAdapterAdvancedProperty |
+  Select-Object Name, DisplayName, DisplayValue, RegistryKeyword, RegistryValue
+
+$ipAddresses = Get-NetIPAddress -AddressFamily IPv4 |
+  Select-Object InterfaceAlias, IPAddress, PrefixLength, PrefixOrigin,
+                SuffixOrigin, AddressState
+
+$routes = Get-NetRoute -AddressFamily IPv4 |
+  Select-Object InterfaceAlias, DestinationPrefix, NextHop, RouteMetric,
+                AddressFamily, PolicyStore
+
+$dnsServers = Get-DnsClientServerAddress -AddressFamily IPv4 |
+  Select-Object InterfaceAlias, ServerAddresses
+
+$profiles = Get-NetConnectionProfile |
+  Select-Object Name, InterfaceAlias, NetworkCategory, IPv4Connectivity,
+                IPv6Connectivity
+
+$statistics = foreach ($adapter in Get-NetAdapter) {
+  Get-NetAdapterStatistics -Name $adapter.Name
+}
+
+[pscustomobject]@{
+  GeneratedAt = (Get-Date).ToString('s')
+  CameraSubnet = $CameraSubnet
+  Adapters = $adapters
+  AdapterPower = $adapterPower
+  AdvancedProperties = $advancedProperties
+  IpAddresses = $ipAddresses
+  Routes = $routes
+  DnsServers = $dnsServers
+  Profiles = $profiles
+  Statistics = $statistics
+}
+```
+
+验收时应人工复核：只有目标生产网卡为 Up；IP 与勘察表一致；默认路由唯一；目标网卡不允许系统断电；Jumbo Packet 默认关闭或与设计一致；统计计数器初始值已归零或已记录。
+
+### 74.7 交换机侧验收要求
+
+FactoryGuard 无法直接读取所有交换机配置，因此交换机侧必须由客户 IT 或实施工程师提供证据：
+
+| 项目 | 验收要求 |
+| --- | --- |
+| 端口类型 | 摄像机/NVR/主机端口明确标记 Access 或 Trunk，未使用端口关闭 |
+| VLAN | PVID、允许 VLAN、本征 VLAN 与设计一致 |
+| 速率双工 | 协商速率和双工状态明确，端口无错误包 |
+| PoE | 若摄像机由交换机供电，总 PoE 预算和单端口功率满足要求 |
+| 端口安全 | 如启用 MAC 绑定，更换主机或摄像机前必须走变更 |
+| STP | 接入口配置边缘端口或等价策略，避免重启后 30 秒以上等待 |
+| IGMP Snooping | 单播 RTSP 不受影响；若使用组播，必须配置 Querier 和组播路由 |
+| 广播/组播限制 | 限制广播风暴，但不能丢弃正常 RTSP/RTP/ONVIF 流量 |
+| 流控 | 记录配置，避免异常流控暂停导致端口长期阻塞 |
+| 交换机日志 | 保存链路 Up/Down、PoE 故障、环路和端口安全事件 |
+
+PoE 摄像机场景还要记录交换机电源冗余和硬盘录像机/NVR 供电。若 NVR 重启后大量摄像机同时重连，交换机 PoE 预算、MAC 表和生成树状态都可能短时波动。
+
+### 74.8 网络质量连续指标
+
+| 指标 | 建议阈值 | 用途 |
+| --- | --- | --- |
+| 链路状态 | 生产网卡必须 Up | 发现断线、驱动挂起和交换机端口关闭 |
+| 链路抖动 | 24 小时非计划 Up/Down 不超过 0 次；维护窗口外任意一次告警 | 识别线缆、端口和驱动问题 |
+| 接收错误包 | 持续增长即预警，增量大于 0 需复测 | 识别双工、线缆和硬件故障 |
+| 入站丢弃 | 持续增长即预警 | 识别缓冲、广播风暴和过载 |
+| ICMP 丢包 | 部署准入 20 次丢包为 0；运行中连续 3 次失败告警 | 识别路径中断 |
+| RTT | 同 VLAN 建议 P95 ≤ 5 ms，P99 ≤ 10 ms | 发现交换机拥塞和异常路径 |
+| 帧到达间隔 | 根据子码流帧率计算，超过 8 秒无帧判为冻结 | 判断媒体链路真实健康 |
+| 重连次数 | 非维护窗口批量重连需告警 | 发现 NVR、交换机或认证异常 |
+| TCP 连接失败率 | 按通道统计，连续失败进入退避 | 避免只看全局平均掩盖单路故障 |
+| 带宽余量 | 峰值保留至少 30% 余量 | 防止关键帧同步导致拥塞 |
+
+网络采样应分为两层：主机网络状态每 5～15 秒采集一次；媒体帧新鲜度每收到一帧更新，若 8 秒无新帧则触发单路媒体恢复。
+
+### 74.9 网络故障矩阵
+
+| 故障 | 典型表现 | 自动检测 | 处理 |
+| --- | --- | --- | --- |
+| 网线断开 | 网卡 Disconnected，通道全部离线 | 网卡状态和帧超时 | 网络故障告警；恢复后按批重连 |
+| 交换机重启 | 多通道同时断开后恢复 | 多通道关联事件 | 避免同时重连，加入随机抖动 |
+| VLAN 配置错误 | 网关或 NVR 不可达，端口仍 Up | IP 探测和帧超时 | 标记配置错误，不重复认证 |
+| IP 冲突 | 时通时断，ARP MAC 变化 | ARP/MAC 核对、系统事件 | 停止误导性重连，通知网络负责人 |
+| 默认路由重复 | 部分连接走错误网卡 | 路由表检查 | 提示修正路由，不自动删除生产路由 |
+| MTU 黑洞 | 小包通、PLAY 后大报文卡住 | 路径 MTU 探测和帧超时 | 修正 MTU/MSS，再恢复通道 |
+| DNS 故障 | 主机名无法解析 | Resolve-DnsName 和缓存检查 | 使用 IP 或等待 DNS；不高频重连 |
+| 错误 PoE 预算 | 摄像机反复重启 | 多设备链路抖动 | 检查交换机电源和端口功率 |
+| 端口安全阻断 | 网卡 Up 但无数据 | 交换机日志和 MAC 表 | 通过变更更新端口绑定 |
+| 广播风暴 | RTT、丢包和错误包急剧上升 | 计数器和帧新鲜度 | 降低重连速率，隔离风暴源 |
+| 网卡驱动挂起 | 状态看似 Up，但无流量 | 帧超时、统计不增长 | 重启单卡或主机前先采集证据 |
+| 防火墙 ACL 变更 | TCP 554 被拒绝或超时 | 端口探测失败 | 通知变更责任人，按变更回退 |
+
+### 74.10 网络验收记录 JSON
+
+```json
+{
+  "version": 1,
+  "generatedAt": "2026-10-07T11:00:00+08:00",
+  "site": {
+    "siteId": "FG-SITE-001",
+    "cameraVlanId": 10,
+    "subnet": "192.168.10.0/24",
+    "gateway": "192.168.10.1"
+  },
+  "host": {
+    "adapterName": "Ethernet",
+    "macAddress": "00-00-00-00-00-00",
+    "ipv4": "192.168.10.100",
+    "linkSpeed": "1 Gbps",
+    "mtu": 1500,
+    "powerSavingDisabled": true,
+    "defaultRouteCount": 1
+  },
+  "switch": {
+    "managed": true,
+    "model": "example-switch",
+    "vlansVerified": true,
+    "portCountersClean": true,
+    "poeBudgetVerified": true,
+    "spanningTreeEdgeVerified": true
+  },
+  "tests": {
+    "ping20ZeroLoss": true,
+    "pathMtu1500": true,
+    "tenMinuteRTSPSoak": true,
+    "cablePullRecovery": true,
+    "switchRestartRecovery": true,
+    "duplicateAddressDetection": true
+  },
+  "approval": {
+    "networkOwner": "customer-it",
+    "securityOwner": "customer-facility",
+    "evidencePackageId": "FG-NET-EVIDENCE-001"
+  }
+}
+```
+
+### 74.11 发布门禁
+
+- 未确认网卡、交换机端口、VLAN、IP、路由和 MTU，不得进入生产模式；
+- 生产主机不得使用 USB 网卡、未受控 Wi-Fi、双默认路由或错误的访客网络；
+- 网卡省电和节能以太网必须经过验收，默认关闭高风险节能策略；
+- 10 分钟实流拉流、20 次零丢包探测和峰值带宽余量必须形成证据；
+- 交换机重启、拔线、IP 冲突、MTU 黑洞、DNS 故障必须有恢复演练；
+- 网络故障必须按通道和站点展示，不允许只显示一个笼统“连接失败”。
+
+---
+
+## 75. RTSP/ONVIF 会话生命周期、重连退避与媒体新鲜度
+
+### 75.1 协议分层与能力边界
+
+FactoryGuard 的运行时媒体路径以 RTSP 建立会话、以 RTP 承载视频。RTSP 负责播放控制，RTP 负责媒体载荷和时间信息；使用 TCP 交错传输时，RTSP 控制消息和 RTP 媒体包通常复用同一条 TCP 连接。ONVIF 可用于设备发现、能力查询、媒体 URI 获取和配置管理，但 v1.0 的连续分析不要求 ONVIF 会话长期在线。
+
+需要明确：
+
+- RFC 2326 定义 RTSP 1.0，现场大量摄像机和 NVR 仍使用该版本；
+- RFC 7826 定义 RTSP 2.0，不能假定现场设备支持；
+- ONVIF Profile S 关注基于 IP 的视频系统，设备是否支持 Profile S 与具体 RTSP 行为仍需实测；
+- RTSP over TCP 可减少普通丢包导致的花屏，但不能消除设备冻结、认证锁定、TCP 半开连接、带宽拥塞和时间戳异常；
+- ONVIF 取流成功不代表长时间 RTSP 播放稳定，仍需独立长稳测试。
+
+### 75.2 RTSP 建立会话的标准顺序
+
+典型 RTSP 1.0 会话过程如下：
+
+```mermaid
+sequenceDiagram
+    participant Client as FactoryGuard FFmpeg
+    participant Device as Camera/NVR
+    Client->>Device: OPTIONS（可选，探测能力）
+    Device-->>Client: 200 OK
+    Client->>Device: DESCRIBE rtsp://...
+    Device-->>Client: 401 Unauthorized（Digest/Basic Challenge）
+    Client->>Device: DESCRIBE + Authorization
+    Device-->>Client: 200 OK + SDP
+    Client->>Device: SETUP + Transport: TCP interleaved
+    Device-->>Client: 200 OK + Session
+    Client->>Device: PLAY + Range
+    Device-->>Client: 200 OK + RTP-Info
+    Device-->>Client: RTP video frames
+    Client->>Device: GET_PARAMETER/OPTIONS keepalive
+    Client->>Device: TEARDOWN
+```
+
+各阶段的失败含义不同，不能统一映射成“网络错误”：
+
+| 阶段 | 成功证据 | 失败含义 |
+| --- | --- | --- |
+| TCP 连接 | 端口建立成功 | 网络不可达、端口未开放、ACL 或服务未启动 |
+| DESCRIBE | 返回 SDP，包含视频 track | URL 错误、认证失败、设备媒体服务异常 |
+| SETUP | 返回 Session、Transport 和 interleaved channel | 传输模式不支持、资源不足、并发限制 |
+| PLAY | 返回 RTP-Info 和播放范围 | 会话状态错误、设备无法开始发送 |
+| 收帧 | 连续收到带 PTS/序号的视频帧 | 流冻结、MTU、带宽、编码或设备故障 |
+| TEARDOWN | 设备释放会话 | 失败时仍应由 Job Object 和进程退出释放本机资源 |
+
+### 75.3 Session、超时与 Keepalive
+
+设备在 SETUP 或 PLAY 响应中可能返回 \`Session\` 标识和 timeout。timeout 表示设备允许的会话空闲间隔，不同厂商差异很大。FactoryGuard 不应把固定的 60 秒假设写入所有设备；应优先解析设备值，未提供时采用保守默认并在兼容矩阵中记录。
+
+Keepalive 的实现取决于设备支持情况：
+
+- RTSP 1.0 常用 \`GET_PARAMETER\`；
+- 某些设备不支持 GET_PARAMETER，可接受 \`OPTIONS\`；
+- 部分设备只依据 TCP 连接和媒体流量判断会话；
+- Keepalive 必须携带 Session 标识；
+- Keepalive 失败不能立刻销毁所有通道，应区分单包超时和会话失效。
+
+停机时应先发送 TEARDOWN，再关闭管道和进程。若设备已经不可达，TEARDOWN 超时后强制结束进程，不能无限等待。无论 TEARDOWN 是否成功，Job Object 都要保证进程退出后端口、句柄和临时文件释放。
+
+### 75.4 每路通道独立会话状态机
+
+每一路通道必须拥有独立状态机，不能让 32 路通道共享一个全局“正在连接”标志。
+
+| 状态 | 进入条件 | 退出条件 |
+| --- | --- | --- |
+| Idle | 通道停用或未到布防时间 | 配置启用并进入探测 |
+| ResolveProbe | 解析主机名、探测 TCP 端口 | 成功进入认证/描述；失败进入 CoolingDown |
+| Authenticating | 设备返回 401/403 后重新请求 | 认证成功进入 Setup；明确失败进入 AuthFailed |
+| Describing | 发送 DESCRIBE | 收到合法 SDP |
+| SettingUp | 发送 SETUP | 收到 Session 和 Transport |
+| Playing | PLAY 成功并接收帧 | 无帧、连接断开或停止 |
+| Replaying | 短时网络恢复后重新 PLAY | 恢复帧或需要重建会话 |
+| CoolingDown | 连接失败或异常退出 | 退避计时器结束 |
+| AuthLocked | 多次认证失败或设备要求解锁 | 凭据更新或人工确认 |
+| Blocked | URL、编码或能力不符合红线 | 配置修复 |
+
+状态转换必须记录原因、时间、尝试次数、最近错误码和下一动作。状态机应允许同一 NVR 下不同通道处于不同状态，例如 1 路 AuthFailed、3 路 Playing、其他通道 Degraded。
+
+### 75.5 重连退避、抖动和分批恢复
+
+若 NVR、交换机或网络中断后所有通道同时立即重连，可能造成认证风暴、设备资源耗尽和交换机再次拥塞。v1.0 采用指数退避、上限封顶、随机抖动和分批复连。
+
+建议参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| 初始等待 | 2 秒 | 短时进程抖动可快速恢复 |
+| 退避倍率 | 2 | 2、4、8 秒逐步增长 |
+| 最大等待 | 60 秒 | 避免长时间无人尝试 |
+| 随机抖动 | ±20% | 防止同批通道完全同步 |
+| 同 NVR 批大小 | 4～8 路 | 按设备并发能力调整 |
+| 批次间隔 | 2～5 秒 | 避免登录和取流同时尖峰 |
+| 成功恢复 | 重置失败计数 | 仅在稳定播放超过 60 秒后重置 |
+| 维护窗口 | 可加快恢复 | 需在事件中标记为人工操作 |
+
+退避不是简单 sleep。等待期间应允许停止、禁用通道、更新凭据和切换布防状态，避免服务停止请求被重连等待阻塞。
+
+### 75.6 认证失败与账号锁定治理
+
+错误密码、只读账号权限不足、设备并发连接过多都可能返回 401 或 403。认证失败后不能按普通网络断开一样无限重连，否则可能触发设备账号锁定。
+
+v1.0 要求：
+
+- 首次明确 401：允许按更新后的凭据重试有限次数；
+- 连续 3 次认证失败：进入 AuthFailed 或 AuthLocked，不再自动高频尝试；
+- 设备明确返回账号锁定：停止自动认证，通知管理员解锁；
+- 凭据通过 secret reference 管理，不在 RTSP 普通日志中输出；
+- 修改密码后由服务做一次受控验证，成功后恢复通道；
+- 摄像机/NVR 使用专用只读账号，不与管理员账号共用；
+- 设备侧允许时限制只允许 FactoryGuard 主机 IP 访问媒体端口。
+
+401 和 403 要区分：401 通常表示未提供或凭据无效；403 可能表示账号无权限、IP 被拒绝或设备安全策略阻止。二者的恢复动作不应混用。
+
+### 75.7 媒体新鲜度、PTS 和帧间隔检测
+
+进程存在不等于流正常。每路通道需要持续计算：
+
+- 最后收到帧的本地时间和 \`stale_seconds\`；
+- RTP/容器 PTS 的增量、重复和倒退；
+- 实际帧间隔与协商帧率的偏差；
+- 字节速率、码率突增和长时间无数据；
+- 关键帧等待时间；
+- 帧尺寸、像素格式和分辨率是否中途变化；
+- FFmpeg stderr、退出码和管道 EOF。
+
+建议判定：
+
+| 状态 | 条件 |
+| --- | --- |
+| Healthy | 8 秒内持续收到帧，PTS 不倒退，帧间隔符合设备基线 |
+| Degraded | 帧间隔明显抖动、短时无帧但能恢复，或码率异常 |
+| Frozen | 超过 8 秒无新帧，进程仍在运行 |
+| TimestampFault | PTS 重复、倒退或大幅跳变，影响事件时间或片段 |
+| Offline | TCP/进程/管道断开，退避后仍未恢复 |
+| CapacityLimited | 因负载保护主动降低帧率，系统按降级状态显示 |
+
+若只是单路超时，应重启单路 FFmpeg；若同一 NVR 多通道同时超时，应优先判定 NVR 或网络故障并启用分批复连，不应并发重启全部子进程。
+
+### 75.8 ONVIF 的使用边界
+
+ONVIF 在 v1.0 中适合承担以下职责：
+
+- 获取设备能力和媒体服务地址；
+- 获取 Profile、视频编码配置和 Stream URI；
+- 辅助识别设备型号、固件和通道状态；
+- 在兼容设备上减少人工猜测 RTSP 路径。
+
+但不应把 ONVIF 用于高频健康轮询。每 5 秒调用一次 ONVIF 可能增加设备负担，且不同固件响应不稳定。运行中健康状态应主要由 RTSP 会话、帧新鲜度、TCP 连接和本地周期探测决定。
+
+ONVIF 请求还可能依赖设备时间与主机时间差异，某些认证场景下时间偏差会造成请求被拒绝。现场必须先保证 NTP/NTP 偏差可见，再进行 ONVIF 认证排障。
+
+### 75.9 RTSP 故障注入与恢复矩阵
+
+| 测试 | 操作 | 通过标准 |
+| --- | --- | --- |
+| 线缆短时拔出 | Playing 时拔线 5 秒后恢复 | 单路或受影响通道自动恢复，不影响其他通道 |
+| 交换机重启 | 重启接入交换机 | 通道按批次恢复，无认证风暴 |
+| NVR 重启 | 重启 NVR | 探测到设备离线，退避恢复，最终所有启用通道 Healthy |
+| 密码变更 | 设备侧修改密码 | 进入受控 AuthFailed，更新凭据后恢复，不触发锁定 |
+| 错误密码启动 | 配置错误凭据 | 有限尝试后锁定自动重连，提示明确 |
+| TCP 静默丢弃 | 防火墙丢弃报文但不返回 RST | 读帧超时后重建会话，不无限等待 |
+| VLAN 临时错误 | 交换机端口改到错误 VLAN | 报告网络/设备不可达，恢复 VLAN 后自动播放 |
+| 子码流关闭 | 设备禁用子码流 | 明确标记配置/能力错误，不反复拉主码流替代 |
+| 编码改变 | H.264 改 H.265 | 重新协商；不支持时阻止该通道进入 Healthy |
+| 设备时间戳跳变 | 重启或修改设备时间 | PTS 异常可见，事件时间链路标记偏差 |
+| TEARDOWN 无响应 | 设备不响应关闭请求 | 超时结束进程，句柄和临时文件释放 |
+| 大量通道同时恢复 | 32 路同时断线 | 按退避和批大小恢复，CPU/带宽不越红线 |
+| 人工停止服务 | 服务运行中发送 Stop | 各通道尽快受控停止，不产生孤儿 FFmpeg |
+
+### 75.10 会话健康 JSON
+
+```json
+{
+  "version": 1,
+  "sampledAt": "2026-10-07T11:30:00+08:00",
+  "channelId": "ch-001",
+  "device": {
+    "nvrId": "nvr-001",
+    "host": "192.168.10.20",
+    "port": 554,
+    "transport": "tcp-interleaved",
+    "rtspVersionNegotiated": "1.0"
+  },
+  "session": {
+    "state": "Playing",
+    "sessionIdPresent": true,
+    "timeoutSeconds": 60,
+    "lastKeepaliveAt": "2026-10-07T11:29:45+08:00",
+    "lastTeardownAt": null
+  },
+  "media": {
+    "lastFrameAt": "2026-10-07T11:29:58+08:00",
+    "staleSeconds": 2,
+    "width": 640,
+    "height": 360,
+    "frameRateNominal": 8,
+    "lastPtsMs": 12345678,
+    "ptsMonotonic": true,
+    "bytesPerSecond": 96000
+  },
+  "recovery": {
+    "attemptCount": 2,
+    "backoffSeconds": 4,
+    "lastErrorCode": "FG-MEDIA-1204",
+    "authFailureCount": 0,
+    "lastRecoveryAt": "2026-10-07T09:15:00+08:00"
+  }
+}
+```
+
+### 75.11 发布门禁
+
+- RTSP URL、凭据、传输模式、会话状态和恢复策略必须逐通道可审计；
+- 每路通道必须独立检测无帧、冻结、PTS 异常和认证失败；
+- 所有自动重连必须有退避、抖动、上限和批次控制；
+- 认证失败不得高频重试，设备锁定后必须等待显式处置；
+- ONVIF 不能替代长期 RTSP 健康监测；
+- NVR 重启、交换机重启、静默丢包、密码错误、子码流关闭和服务停止必须纳入发布演练。
+
+---
+
+---
+
+## 76. 数据盘初始化、盘符持久化与文件系统验收
+
+### 76.1 为什么数据盘必须作为可靠性对象治理
 
 FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告警前后片段、临时片段、日志、诊断包和本地备份副本。若这些数据直接散落在系统盘、U 盘、网络共享或未验收卷上，即使检测进程本身正常，也可能出现以下失效：
 
@@ -8357,7 +8858,7 @@ FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告�
 
 因此，v1.0 不允许安装器在启动时自动寻找“看起来容量最大”的磁盘并格式化。数据盘必须经过勘察、身份确认、审批、初始化、验收和登记。系统上线后，服务每次启动都要核验磁盘身份；身份不符时只能进入安全模式并告警，不能静默改写磁盘或切换到系统盘。
 
-### 74.2 v1.0 标准文件系统决策
+### 76.2 v1.0 标准文件系统决策
 
 | 项目 | v1.0 标准决策 | 说明 |
 | --- | --- | --- |
@@ -8375,7 +8876,7 @@ FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告�
 
 结论很明确：**新项目首版默认“固定数据盘 + GPT + NTFS + 4K 簇 + 固定盘符 + 显式身份登记”**。ReFS 的完整性流、块克隆和弹性能力值得关注，但不同 Windows 版本和使用场景的能力边界不同；在没有完成现场兼容性验证前，不应为了追求单一特性而更换默认文件系统。
 
-### 74.3 磁盘身份识别与防误格式化
+### 76.3 磁盘身份识别与防误格式化
 
 磁盘编号可能因为插拔顺序、控制器和 BIOS 设置变化，不能作为唯一身份。实施时至少记录以下字段：
 
@@ -8389,7 +8890,7 @@ FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告�
 
 初始化脚本必须通过 \`UniqueId\` 或序列号精确选择磁盘，并再次确认该磁盘不是启动盘、系统盘，且没有分区。任何“按容量自动匹配”“只有一块空盘所以直接格式化”的逻辑都不允许进入生产安装器。
 
-### 74.4 数据目录与容量边界
+### 76.4 数据目录与容量边界
 
 以盘符 \`V\` 为例，标准布局如下：
 
@@ -8415,7 +8916,7 @@ FactoryGuard 的活跃数据包括 SQLite 数据库、WAL 文件、截图、告�
 
 数据库所在目录应保留独立最小空间，例如 5 GB 或按现场通道数计算的上限。媒体清理不能通过删除数据库文件、WAL 文件或尚未完成取证审批的证据来换取空间。
 
-### 74.5 受控初始化脚本示例
+### 76.5 受控初始化脚本示例
 
 以下脚本默认只执行 WhatIf 预演；只有传入 \`-Commit\` 才会真正初始化。生产交付时应把同等校验逻辑固化到签名安装器，并把命令输出存入部署证据包。
 
@@ -8539,7 +9040,7 @@ if ($Commit) {
 }
 ```
 
-### 74.6 只读盘点与对齐核验脚本
+### 76.6 只读盘点与对齐核验脚本
 
 以下脚本只读不写，用于部署前和每次大版本升级前采集证据：
 
@@ -8588,7 +9089,7 @@ $ntfsInfo = & fsutil fsinfo ntfsinfo "$DriveLetter`:"
 
 验收时必须确认目标分区的 \`AlignedTo1MiB\` 为 true，文件系统为 NTFS，簇大小为 4096，且剩余容量符合容量规划。若 \`fsutil\` 返回权限或路径错误，应在提权命令行中重新执行并保存原始输出。
 
-### 74.7 NTFS 与 ReFS 的工程选择
+### 76.7 NTFS 与 ReFS 的工程选择
 
 | 维度 | NTFS | ReFS |
 | --- | --- | --- |
@@ -8602,7 +9103,7 @@ $ntfsInfo = & fsutil fsinfo ntfsinfo "$DriveLetter`:"
 
 不能把 ReFS 宣传成“永远不会损坏”。文件系统只能提高某些故障的检测和恢复能力，无法替代 UPS、断电写入测试、数据库事务、备份和物理磁盘健康监测。
 
-### 74.8 写入持久性和原子重命名演练
+### 76.8 写入持久性和原子重命名演练
 
 初始化完成后不能只验证“能创建文件”，还应验证显式 Flush、崩溃和重命名语义。
 
@@ -8644,7 +9145,7 @@ Get-ChildItem -LiteralPath $probeDirectory |
 
 重启后检查：最终文件可读取；临时文件可被启动恢复任务识别并清理；数据库不会引用不存在的媒体文件；没有半个文件被标记为“已发布”。
 
-### 74.9 数据盘异常处理矩阵
+### 76.9 数据盘异常处理矩阵
 
 | 异常 | 期望检测 | 系统动作 |
 | --- | --- | --- |
@@ -8659,7 +9160,7 @@ Get-ChildItem -LiteralPath $probeDirectory |
 | 空间不足 | 容量水位越界 | 按分级策略清理和降级，保留核心告警 |
 | SMART 警告 | 健康状态或可靠性计数器异常 | 提前更换磁盘并执行迁移，不等待完全失效 |
 
-### 74.10 验收记录 JSON
+### 76.10 验收记录 JSON
 
 ```json
 {
@@ -8711,7 +9212,7 @@ Get-ChildItem -LiteralPath $probeDirectory |
 }
 ```
 
-### 74.11 发布门禁
+### 76.11 发布门禁
 
 - 安装器不得提供“一键自动格式化所有空盘”功能；
 - 没有磁盘序列号、UniqueId、客户审批和现场照片，不得执行初始化；
@@ -8722,9 +9223,11 @@ Get-ChildItem -LiteralPath $probeDirectory |
 
 ---
 
-## 75. Windows 服务依赖、启动顺序与就绪确认
+---
 
-### 75.1 SCM 能保证什么，不能保证什么
+## 77. Windows 服务依赖、启动顺序与就绪确认
+
+### 77.1 SCM 能保证什么，不能保证什么
 
 Windows Service Control Manager 可以根据服务配置、服务依赖和加载顺序组安排服务进程启动。Microsoft 对 \`CreateService\` 的 \`lpDependencies\` 参数定义为：系统必须在当前服务之前启动的服务或加载顺序组；依赖一个组只表示该组至少一个成员在尝试启动后处于运行状态。
 
@@ -8738,7 +9241,7 @@ Windows Service Control Manager 可以根据服务配置、服务依赖和加载
 
 因此，FactoryGuard 必须同时管理两层顺序：第一层是 SCM 的进程和系统服务启动顺序；第二层是 FactoryGuard 内部的资源就绪顺序。不能把 SCM 依赖当成摄像机、模型、数据库或 NVR 的健康监控。
 
-### 75.2 默认依赖最小化原则
+### 77.2 默认依赖最小化原则
 
 v1.0 的默认核心服务采用：
 
@@ -8765,7 +9268,7 @@ v1.0 的默认核心服务采用：
 
 依赖关系应服务于“没有它进程不应该启动”的场景，而不是为了让配置表看起来完整。
 
-### 75.3 内部启动阶段
+### 77.3 内部启动阶段
 
 FactoryGuard 的 \`ServiceMain\` 应按以下阶段推进，并及时向 SCM 报告 \`SERVICE_START_PENDING\`、checkpoint 和 wait hint：
 
@@ -8785,7 +9288,7 @@ FactoryGuard 的 \`ServiceMain\` 应按以下阶段推进，并及时向 SCM 报
 
 启动阶段必须周期性更新 checkpoint。任何一个阶段可能超过 SCM 的默认等待窗口时，都不能让主线程无提示阻塞；应每 5～10 秒报告一次仍在启动，并说明当前阶段。
 
-### 75.4 “运行中”的业务定义
+### 77.4 “运行中”的业务定义
 
 只有在下面条件满足后，才能对外部显示为完整 Running：
 
@@ -8804,7 +9307,7 @@ FactoryGuard 的 \`ServiceMain\` 应按以下阶段推进，并及时向 SCM 报
 
 单路摄像机不可达、某一个 Webhook 超时或 GPU 不可用，不应导致整个 Windows 服务停留在 Start Pending。服务可以进入 Running，但健康面板必须明确列出降级项。
 
-### 75.5 依赖配置脚本示例
+### 77.5 依赖配置脚本示例
 
 安装器权威实现应调用 \`CreateService\` 或 \`ChangeServiceConfig\`。命令行脚本只用于复核或现场诊断。
 
@@ -8850,7 +9353,7 @@ if ($LASTEXITCODE -ne 0) {
 
 依赖名称必须使用服务键名，而不是显示名称。多个依赖以正斜杠分隔。若要清除依赖，应在安装器中实现单独的显式操作并保存变更记录，不应在普通诊断脚本中隐式清空。
 
-### 75.6 自动启动与延迟启动选择
+### 77.6 自动启动与延迟启动选择
 
 | 启动方式 | 适用对象 | FactoryGuard 结论 |
 | --- | --- | --- |
@@ -8861,7 +9364,7 @@ if ($LASTEXITCODE -ne 0) {
 
 延迟启动不能保证在某个网络服务、交换机链路或 GPU 初始化完成之后执行，也不能替代内部就绪检查。对安防系统而言，开机后数分钟不能检测是实质性风险。若现场存在开机风暴，应优先优化启动阶段、分批复连摄像机、限制启动时全量扫描，而不是简单把核心服务改为 delayed-auto。
 
-### 75.7 冷启动证据采集脚本
+### 77.7 冷启动证据采集脚本
 
 ```powershell
 [CmdletBinding()]
@@ -8915,7 +9418,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 
 冷启动证据应能回答：服务是否自动启动、启动类型是否被改变、依赖是什么、开机后多久进入 Running、数据盘是否准时出现、网络是否就绪、时钟是否可信、是否出现 SCM 超时或崩溃恢复。
 
-### 75.8 冷启动竞态与重试策略
+### 77.8 冷启动竞态与重试策略
 
 | 竞态 | 典型表现 | FactoryGuard 策略 |
 | --- | --- | --- |
@@ -8931,7 +9434,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 
 所有重试都必须有次数、间隔、超时、日志和最终状态，避免无限 busy loop。核心链路的重试间隔应短于非核心链路，非关键导出、诊断和更新检查应延后。
 
-### 75.9 启动测试矩阵
+### 77.9 启动测试矩阵
 
 | 测试 | 操作 | 通过标准 |
 | --- | --- | --- |
@@ -8948,7 +9451,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | 依赖缺失 | 可选依赖服务禁用 | 若非硬依赖，核心服务仍能启动并报告降级 |
 | SCM 恢复 | 连续触发服务失败 | 恢复动作、退避和事件计数符合配置 |
 
-### 75.10 发布门禁
+### 77.10 发布门禁
 
 - 核心检测服务必须为自动启动，不能依赖用户登录；
 - 不允许把 Qt UI 或远程支持工具配置为核心服务的前置条件；
@@ -8959,11 +9462,13 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 
 ---
 
-## 76. 行业资料与标准依据
+---
+
+## 78. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 76.1 平台与可靠性资料
+### 78.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -9059,9 +9564,17 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | Microsoft Learn：Automatically Starting Services | 自动服务、加载组、依赖和启动顺序参考 |
 | Microsoft Learn：CreateService / ChangeServiceConfig | 服务创建、依赖、启动类型和配置变更依据 |
 | Microsoft Learn：sc qc（旧版但仍可访问） | 查询服务启动类型、依赖、路径和账户配置 |
+| Microsoft NetAdapter：Get-NetAdapter / Statistics / AdvancedProperty | 网卡状态、驱动、速率、计数器和高级属性验收依据 |
+| Microsoft NetAdapterPowerManagement：Get/Disable | 网卡省电、唤醒和节能策略检查依据 |
+| Microsoft NetTCPIP：Get-NetIPAddress / Get-NetRoute / Get-NetIPInterface | IP、路由、接口 MTU 和网络配置核验依据 |
+| Microsoft DnsClient：Resolve-DnsName / Get-DnsClientServerAddress | DNS 解析、DNS 服务器和缓存排障依据 |
+| Microsoft NetConnection：Get-NetConnectionProfile | 网络位置、连接状态和网络类别检查依据 |
+| RFC 2326 Real Time Streaming Protocol (RTSP) 1.0 | RTSP 方法、Session、认证、PLAY/TEARDOWN 和兼容设备行为依据 |
+| RFC 7826 Real-Time Streaming Protocol (RTSP) 2.0 | RTSP 2.0 能力边界和版本差异参考 |
+| ONVIF Profile S Specification | IP 视频设备、媒体配置和 GetStreamUri 能力参考 |
 | ISA/IEC 62443 series | 工业控制系统安全分区、供应商和运维安全参考 |
 
-### 76.2 视频与设备协议资料
+### 78.2 视频与设备协议资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -9071,7 +9584,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | GB/T 28181 相关公共安全视频监控联网标准 | 二期平台级联和协议扩展预研 |
 | GA/T 1400 相关公共安全视频图像信息系统标准 | 二期视图库、事件对象和平台对接预研 |
 
-### 76.3 主要链接
+### 78.3 主要链接
 
 - https://learn.microsoft.com/en-us/windows/win32/services/service-programs
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w
@@ -9192,6 +9705,22 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-createservicea
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfigw
 - https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2012-r2-and-2012/cc742055(v=ws.11)
+- https://learn.microsoft.com/en-us/powershell/module/netadapter/get-netadapter
+- https://learn.microsoft.com/en-us/powershell/module/netadapter/get-netadapterstatistics
+- https://learn.microsoft.com/en-us/powershell/module/netadapter/get-netadapteradvancedproperty
+- https://learn.microsoft.com/en-us/powershell/module/netadapter/disable-netadapterpowermanagement
+- https://learn.microsoft.com/en-us/powershell/module/netadapter/get-netadapterpowermanagement
+- https://learn.microsoft.com/en-us/powershell/module/nettcpip/get-netipaddress
+- https://learn.microsoft.com/en-us/powershell/module/nettcpip/get-netroute
+- https://learn.microsoft.com/en-us/powershell/module/nettcpip/get-netipinterface
+- https://learn.microsoft.com/en-us/powershell/module/nettcpip/set-netipinterface
+- https://learn.microsoft.com/en-us/powershell/module/dnsclient/get-dnsclientserveraddress
+- https://learn.microsoft.com/en-us/powershell/module/dnsclient/resolve-dnsname
+- https://learn.microsoft.com/en-us/powershell/module/dnsclient/get-dnsclientcache
+- https://learn.microsoft.com/en-us/powershell/module/netconnection/get-netconnectionprofile
+- https://learn.microsoft.com/en-us/powershell/module/nettcpip/test-netconnection
+- https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/test-connection
+- https://www.rfc-editor.org/rfc/rfc2326
 - https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls
 - https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipes
 - https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createnamedpipea
@@ -9201,6 +9730,18 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 - https://www.sqlite.org/backup.html
 - https://www.sqlite.org/pragma.html#pragma_integrity_check
 - https://www.sqlite.org/pragma.html#pragma_user_version
+
+---
+
+
+- **VLAN（Virtual Local Area Network，虚拟局域网）**：在物理网络上划分逻辑广播域，用于隔离摄像机、办公网和管理网流量。
+- **MTU（Maximum Transmission Unit，最大传输单元）**：单个网络报文可承载的最大字节数；以太网络常见 MTU 为 1500。
+- **路径 MTU**：源主机到目标设备之间整条网络路径实际支持的最小 MTU。
+- **RTSP Session**：由设备在 SETUP/PLAY 阶段确认的播放会话标识，用于 Keepalive、PLAY 和 TEARDOWN。
+- **Keepalive（保活）**：客户端周期性发送的会话维持请求，用于发现失效连接并防止设备回收会话。
+- **媒体新鲜度**：根据最后一帧到达时间、帧间隔和 PTS 判断视频流是否仍在更新。
+- **链路抖动（Link Flap）**：网络链路短时间内反复 Up/Down，通常由线缆、端口、驱动、供电或配置问题导致。
+- **PoE（Power over Ethernet，以太网供电）**：交换机通过网线向摄像机等终端供电，需核验端口功率和总电源预算。
 
 ---
 
