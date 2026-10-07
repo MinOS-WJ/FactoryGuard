@@ -1,11 +1,12 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v2.0
+> 文档版本：v2.1
 > 成文日期：2026-10-07
-> 文档状态：立项稿（现场勘察、数据库 Schema、证据验收与长期运维增强版）
+> 文档状态：立项稿（时间取证、漂移审计、长稳压力与备件切换增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
 > v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
+> v2.1 增补：时间同步和电子证据链、配置漂移与文件完整性、72 小时/30 天长稳压力协议、冷备主机和备件切换机制。
 
 ---
 
@@ -4735,11 +4736,644 @@ plans:
 
 ---
 
-## 54. 行业资料与标准依据
+## 54. 时间同步、时间戳链路与电子证据可靠性
+
+FactoryGuard 的告警要能用于事后追溯，必须回答三个问题：画面是什么时间发生的、值守电脑什么时候收到和判定、NVR 连续录像如何与该事件对应。任何通知送达时间、UI 打开时间或人工确认时间，都不能替代事件本身的发生时间。
+
+### 54.1 时间戳层级
+
+| 时间戳 | 来源 | 用途 | 可靠性说明 |
+| --- | --- | --- | --- |
+| Camera/RTP timestamp | 摄像机或编码器随媒体携带 | 帧顺序、抖动和媒体诊断 | RTP 时间戳主要反映采样时序，不直接等同墙钟 |
+| Frame PTS | 解封装/解码后的呈现时间 | 帧排序、片段定位 | 依赖容器和编码器，需要结合起始时间解释 |
+| Local receive time | FactoryGuard 值守电脑收到帧时写入 | 分析链路到达时间 | 受网络抖动和本机时钟影响 |
+| Monotonic frame time | Windows QPC 等单调时钟 | 超时、帧率、重连和耗时统计 | 不能用于跨重启的取证时间 |
+| Inference time | 推理前后采样 | 模型耗时和排队分析 | 应使用单调时钟，避免墙钟跳变影响 |
+| occurred_at | 规则确认时绑定的帧时间 | 业务事件发生时间 | 不得用通知发送时间或人工确认时间覆盖 |
+| received_at | 事件入库时间 | 系统处理时延分析 | 使用值守电脑墙钟 |
+| nvr_time | NVR 画面/录像对应时间 | 与 NVR 连续录像核对 | NVR 是独立录像权威，时间偏差必须可见 |
+| acknowledged_at / closed_at | 操作员处置时间 | 响应 SLA 和审计 | 只表示处置时间，不回溯改变事件发生时间 |
+
+设计要求：
+
+- 每条事件必须保存 occurred_at、received_at 和时区；能取得 NVR 时间时保存 nvr_time；
+- 耗时、超时、冷却、重连和帧率统计优先使用单调时钟；
+- 墙钟发生跳变时不得批量改写历史事件，应记录偏差、生成系统事件并保留原始时间；
+- 通知内容中展示的时间应以 occurred_at 为主，received_at 和确认时间作为辅助；
+- 若 NVR 时间与值守电脑偏差超过阈值，事件仍应入库，但必须标记 clock_delta_ms 并产生时钟告警；
+- 片段文件应记录起始帧、结束帧和对应事件，避免只靠文件名时间定位。
+
+### 54.2 NTP 与时钟治理基线
+
+推荐 NVR、FactoryGuard 值守电脑和核心网络设备使用同一组经过客户 IT 认可的内部或公共 NTP 源。客户已有内部 NTP 时，不应擅自改为公网时间源。
+
+```powershell
+w32tm /query /status
+w32tm /query /configuration
+w32tm /query /source
+w32tm /tz
+```
+
+若客户 IT 明确允许使用外部时间源，可使用如下命令配置并强制一次同步；实际 peer list 应由客户 IT 审核：
+
+```powershell
+$peerList = 'ntp.aliyun.com,0x9 cn.pool.ntp.org,0x9 time.windows.com,0x9'
+w32tm /config /manualpeerlist:$peerList /syncfromflags:manual /reliable:no /update
+Restart-Service -Name w32time -Force
+w32tm /resync /rediscover
+w32tm /query /status
+```
+
+建议阈值：
+
+| 偏差/状态 | 健康等级 | 处理 |
+| --- | --- | --- |
+| ≤200 ms | green | 仅记录趋势 |
+| 200–500 ms | yellow | 检查 NTP、网络和源可达性 |
+| 500 ms–1 s | yellow 偏高 | 当日维护并复核事件对应关系 |
+| >1 s | red | 立即告警，禁止忽略时钟偏差 |
+| 时间服务停止或来源 unsynchronized | red | 恢复服务并生成维护事件 |
+
+时间纠偏后应再次执行 w32tm /query /status，并在证据中保存纠偏前后输出。不得通过人工随意修改系统时间来“对齐”NVR；若 NVR 本身错误，应由客户 IT/安防负责人按制度纠正。
+
+### 54.3 帧时间到事件时间的绑定
+
+规则确认通常需要连续多帧满足条件。绑定时间时应遵循：
+
+1. 媒体进程为每帧生成单调序号，并记录本地接收墙钟；
+2. 解码帧保留帧序号、PTS 和媒体流标识；
+3. 推理结果必须能回指原始帧，不能只返回一个孤立 bbox；
+4. 规则达到 confirm_frames 时，以触发轨迹中可解释的关键帧时间作为 occurred_at；
+5. 冷却期内重复目标只更新 dedup_count 和 last_occurred_at，不覆盖 first_occurred_at；
+6. 如果帧时间缺失、回退或明显异常，该帧不得参与取证型规则确认，应进入媒体异常计数。
+
+事件时间链路应能在日志中复原为：通道 → 帧序号/PTS → 本地接收时间 → 推理结果 → 规则确认 → 事件入库 → 通知生成。
+
+### 54.4 取证导出包结构
+
+| 文件 | 内容 |
+| --- | --- |
+| manifest.json | 导出包 ID、事件 ID、站点、导出人、文件哈希和时间 |
+| event.json | 事件、规则、通道、模型、时钟偏差和处置记录 |
+| tracks.json | 轨迹点、帧序号、标签、置信度和 bbox |
+| snapshot.jpg | 告警截图，带状态说明时另附原始图 |
+| clip.mp4 | 告警前后短视频，若缺失必须说明原因 |
+| nvr-reference.json | NVR 通道、录像时间段和检索线索 |
+| audit-tail.json | 与导出、查看、处置相关的审计记录 |
+| signatures.json | 导出文件和程序文件签名信息 |
+| chain-of-custody.csv | 证据转交、打开、复制和封存记录 |
+
+导出包中的业务文件完成写入后再计算哈希；manifest.json 不计算自身哈希，由外部证据包或审计系统记录其哈希。
+
+### 54.5 取证导出脚本示例
+
+```powershell
+$caseId = 'CASE-20261007-001'
+$eventId = '00000000-0000-0000-0000-000000000001'
+$exportRoot = Join-Path $env:ProgramData "FactoryGuard\exports\$caseId"
+New-Item -ItemType Directory -Path $exportRoot -Force | Out-Null
+
+FactoryGuardCtl.exe export event --event-id $eventId --output $exportRoot
+if ($LASTEXITCODE -ne 0) { throw 'Event export failed' }
+
+$files = Get-ChildItem -Path $exportRoot -File | Where-Object { $_.Name -ne 'manifest.json' } | ForEach-Object {
+  $hash = Get-FileHash -Path $_.FullName -Algorithm SHA256
+  [pscustomobject]@{
+    path = $_.Name
+    bytes = $_.Length
+    sha256 = $hash.Hash
+  }
+}
+
+$manifest = [ordered]@{
+  manifestVersion = '1.0'
+  caseId = $caseId
+  eventId = $eventId
+  siteId = $env:COMPUTERNAME
+  exportedBy = "$env:USERDOMAIN\$env:USERNAME"
+  exportedAt = (Get-Date).ToString('o')
+  files = $files
+}
+
+$manifest | ConvertTo-Json -Depth 6 |
+  Set-Content -Encoding UTF8 (Join-Path $exportRoot 'manifest.json')
+
+[pscustomobject]@{
+  EventId = $eventId
+  ExportRoot = $exportRoot
+  FileCount = @($files).Count
+} | Format-List
+```
+
+### 54.6 导出包验证脚本
+
+```powershell
+param(
+  [Parameter(Mandatory = $true)]
+  [string]$ExportRoot
+)
+
+$manifestPath = Join-Path $ExportRoot 'manifest.json'
+$manifest = Get-Content -Raw -Encoding UTF8 $manifestPath | ConvertFrom-Json
+$failures = @()
+
+foreach ($item in $manifest.files) {
+  $candidate = Join-Path $ExportRoot $item.path
+  if (-not (Test-Path $candidate)) {
+    $failures += "Missing file: $($item.path)"
+    continue
+  }
+
+  $actual = Get-FileHash -Path $candidate -Algorithm SHA256
+  if ($actual.Hash -ne $item.sha256) {
+    $failures += "Hash mismatch: $($item.path)"
+  }
+
+  $actualLength = (Get-Item $candidate).Length
+  if ($actualLength -ne $item.bytes) {
+    $failures += "Length mismatch: $($item.path)"
+  }
+}
+
+if ($failures.Count -gt 0) {
+  $failures
+  throw 'Evidence package verification failed'
+}
+
+'Evidence package verification passed'
+```
+
+### 54.7 监管链记录
+
+chain-of-custody.csv 至少包含：编号、时间、动作、执行人、组织、文件范围、目的、位置、接收人、备注。证据每次复制、外发、打开、封存或导入分析，都应新增一行，不能覆盖旧记录。
+
+如果客户有更高等级的电子数据制度，应优先采用客户模板和加密方式。FactoryGuard 提供的是可追溯导出基线，不把普通截图包装成司法鉴定意见。
+
+---
+
+## 55. 配置漂移、文件完整性与运行基线
+
+Windows 现场最常见的问题不是首次安装失败，而是运行数周后被人工修改：服务被改成手动、Defender 排除项扩大、配置被另一个工具覆盖、防火墙规则漂移、DLL 被替换、ACL 被放开。必须建立“已批准运行基线 + 定期比对 + 漂移分级 + 审批修复”的机制。
+
+### 55.1 基线对象
+
+| 对象 | 基线内容 | 漂移风险 |
+| --- | --- | --- |
+| Windows 服务 | 启动类型、二进制路径、账户、依赖、失败恢复 | 服务不自启、运行错误版本、恢复失效 |
+| 可执行文件 | EXE/DLL/模型/脚本的路径、长度、SHA256、签名 | 被替换、植入、升级中断或文件损坏 |
+| 配置文件 | 版本、哈希、启用通道、规则、通知、存储阈值 | 规则错误、通知中断、数据路径变化 |
+| 注册表 | 服务参数、WER、Dump、事件日志注册值 | 崩溃证据和诊断行为失效 |
+| ACL | ProgramData、数据库、日志、命名管道权限 | 权限过宽或服务无法写入 |
+| 防火墙 | Profile、规则、端口、远程地址、授权程序 | 暴露面扩大或媒体/通知被阻断 |
+| Defender | 防护状态、引擎版本、精确排除项 | 防护关闭、误杀、性能问题 |
+| 计划任务 | 备份、巡检、清理、证据采集任务 | 任务被禁用或以错误账户运行 |
+| 驱动和运行时 | GPU、网卡、ONNX Runtime、FFmpeg 版本 | DirectML 异常、媒体兼容退化 |
+
+### 55.2 基线生命周期
+
+1. 安装器完成部署并通过验收后生成候选基线；
+2. 实施工程师复核服务、配置、ACL、防火墙和 Defender；
+3. 客户管理员确认业务规则和通知配置；
+4. 基线文件写入受保护目录，并由双方保存哈希；
+5. 系统按计划每日自动比对，升级或批准变更后生成新基线；
+6. 旧基线不得删除，应至少保留一个支持周期或按客户审计制度保留；
+7. 漂移修复必须有审批和记录，不能由监控脚本静默回滚所有内容。
+
+建议基线文件目录：C:\ProgramData\FactoryGuard\baselines。基线目录只允许 SYSTEM、管理员和服务账户写入，普通操作员只读。
+
+### 55.3 基线采集脚本
+
+```powershell
+param(
+  [string]$ServiceName = 'FactoryGuardEngine',
+  [Parameter(Mandatory = $true)]
+  [string]$OutputPath
+)
+
+$ErrorActionPreference = 'Stop'
+$installRoot = Join-Path $env:ProgramFiles 'FactoryGuard'
+$programDataRoot = Join-Path $env:ProgramData 'FactoryGuard'
+
+$binaryFiles = Get-ChildItem -Path (Join-Path $installRoot 'bin') -Recurse -File -ErrorAction Stop |
+  ForEach-Object {
+    $hash = Get-FileHash -Path $_.FullName -Algorithm SHA256
+    $signature = Get-AuthenticodeSignature -FilePath $_.FullName
+    [pscustomobject]@{
+      path = $_.FullName.Substring($installRoot.Length).TrimStart('\')
+      bytes = $_.Length
+      sha256 = $hash.Hash
+      signatureStatus = $signature.Status
+    }
+  }
+
+$configurationHashes = Get-ChildItem -Path $programDataRoot -Recurse -File -ErrorAction SilentlyContinue |
+  Where-Object { $_.Extension -in '.yaml', '.yml', '.json' } |
+  ForEach-Object {
+    $hash = Get-FileHash -Path $_.FullName -Algorithm SHA256
+    [pscustomobject]@{
+      path = $_.FullName
+      bytes = $_.Length
+      sha256 = $hash.Hash
+    }
+  }
+
+$baseline = [ordered]@{
+  baselineVersion = '1.0'
+  generatedAt = (Get-Date).ToString('o')
+  host = $env:COMPUTERNAME
+  serviceName = $ServiceName
+  serviceQc = (& sc.exe qc $ServiceName) -join [Environment]::NewLine
+  serviceFailure = (& sc.exe qfailure $ServiceName) -join [Environment]::NewLine
+  defenderStatus = Get-MpComputerStatus
+  defenderPreference = Get-MpPreference
+  firewallProfiles = Get-NetFirewallProfile
+  firewallRules = Get-NetFirewallRule -DisplayName 'FactoryGuard*' -ErrorAction SilentlyContinue
+  binaryFiles = $binaryFiles
+  configurationHashes = $configurationHashes
+}
+
+$baseline | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 $OutputPath
+$baselineHash = Get-FileHash -Path $OutputPath -Algorithm SHA256
+[pscustomobject]@{
+  OutputPath = $OutputPath
+  Bytes = (Get-Item $OutputPath).Length
+  Sha256 = $baselineHash.Hash
+}
+```
+
+### 55.4 漂移分级
+
+| 等级 | 示例 | 处理要求 |
+| --- | --- | --- |
+| critical | 服务被禁用、关键二进制哈希不一致、防护关闭、ACL 对 Everyone 放开 | 立即告警，必要时隔离 UI/远程入口，按事件流程处理 |
+| high | 失败恢复动作丢失、配置哈希变化但无变更单、数据库目录权限异常 | 当日处理，恢复前加强人工巡检 |
+| medium | 新增防火墙规则、计划任务禁用、Defender 引擎版本落后 | 进入维护清单，期限内关闭 |
+| low | 非关键日志格式或注释变化、可解释的时间戳变化 | 记录并在下一次维护复核 |
+
+漂移报告不能只显示“different”，必须给出对象、期望值、当前值、发现时间、风险等级、关联变更单和建议动作。密钥和密码字段必须脱敏。
+
+### 55.5 漂移报表示例
+
+```json
+{
+  "reportVersion": "1.0",
+  "siteId": "FG-SITE-0001",
+  "host": "FG-ANALYZER-01",
+  "baselineId": "baseline-20261007-0900",
+  "detectedAt": "2026-10-08T08:00:00+08:00",
+  "overallStatus": "drift",
+  "items": [
+    {
+      "severity": "high",
+      "objectType": "service",
+      "objectId": "FactoryGuardEngine",
+      "field": "startType",
+      "expected": "AUTO_START",
+      "actual": "DEMAND_START",
+      "changeRequestId": null,
+      "recommendedAction": "restore AUTO_START and verify SCM recovery actions"
+    },
+    {
+      "severity": "medium",
+      "objectType": "scheduled-task",
+      "objectId": "FactoryGuardNightlyBackup",
+      "field": "enabled",
+      "expected": true,
+      "actual": false,
+      "changeRequestId": null,
+      "recommendedAction": "enable task and run one backup immediately"
+    }
+  ]
+}
+```
+
+### 55.6 漂移修复原则
+
+- 对服务启动类型、失败恢复、ACL、防火墙和计划任务，可提供经审批的自动修复；
+- 对二进制文件、模型文件和数据库格式不一致，不得直接覆盖，应先采集证据并判断升级、损坏或篡改；
+- 对业务规则和通知对象变化，必须由业务负责人确认，不能只按技术基线回滚；
+- 修复后重新采集当前基线并比对，直到 critical/high 项清零；
+- 如果漂移来自客户安全软件、域策略或系统管理平台，应由客户 IT 调整源头策略，避免下次开机再次漂移。
+
+### 55.7 基线发布门禁
+
+以下任一情况不得封存正式基线：
+
+- 24 小时内存在未解释的服务崩溃或媒体错误；
+- 数据库 integrity_check 不为 ok；
+- 关键二进制没有有效签名；
+- 配置校验未通过或存在过期 URL、未知字段；
+- 命名管道、数据库目录和导出目录 ACL 未确认；
+- 规则仍处于临时调试状态且客户未签字；
+- 故障注入恢复项没有证据。
+
+基线不是静态文档，而是发布制品的一部分。每次安装包升级都必须能说明基线从哪个版本迁移到哪个版本。
+
+---
+
+## 56. 72 小时长稳、30 天试点与压力测试协议
+
+单次单元测试通过不能证明 Windows 现场可靠。FactoryGuard 必须在接近真实负载下连续运行，并在故障注入、通知失败、NVR 重启和事件突发条件下验证资源不泄漏、状态不混乱、证据不丢失。
+
+### 56.1 测试层级
+
+| 测试 | 时长 | 主要目标 | 发布关系 |
+| --- | --- | --- | --- |
+| 冒烟测试 | 30–60 分钟 | 安装、启动、取流、规则、通知基本可用 | 开发构建门禁 |
+| 72 小时长稳 | 72 小时 | 连续运行、资源趋势、计划故障、媒体恢复 | RC 发布门禁 |
+| 30 天试点 | 30 天 | 真实排班、自然事件、误报治理、运维节奏 | 商业推广准入 |
+| 压力测试 | 2–8 小时 | 峰值通道、突发目标、通知积压和资源上限 | 容量承诺依据 |
+| 重复回归 | 每个版本 | 防止升级破坏可靠性红线 | 发布流水线门禁 |
+
+### 56.2 72 小时标准负载
+
+以首版 16 路为参考，可按实际项目通道数等比调整：
+
+- 所有计划分析通道持续运行，子码流分辨率和帧率与现场一致；
+- 平均分析帧率达到配置值，不能通过只分析静态图片冒充；
+- 每小时生成可重复的合成安全事件，覆盖不同通道；
+- 每天覆盖白班、夜班和布防日历切换；
+- 每 6 小时至少一次通知链路测试；
+- 每天执行一次媒体进程/推理进程故障注入并恢复；
+- 测试期间保存全部事件日志、健康样本、stderr、数据库和片段产物。
+
+### 56.3 72 小时采样脚本
+
+```powershell
+param(
+  [string]$OutputCsv = '.\soak-health.csv',
+  [int]$DurationHours = 72,
+  [int]$IntervalSeconds = 30
+)
+
+$endAt = (Get-Date).AddHours($DurationHours)
+$processNames = @('FactoryGuardEngine','FactoryGuardInference','ffmpeg')
+
+while ((Get-Date) -lt $endAt) {
+  $processes = Get-Process -Name $processNames -ErrorAction SilentlyContinue
+  $sample = [pscustomobject]@{
+    sampledAt = (Get-Date).ToString('o')
+    engineRunning = @($processes | Where-Object { $_.ProcessName -eq 'FactoryGuardEngine' }).Count -gt 0
+    inferenceRunning = @($processes | Where-Object { $_.ProcessName -eq 'FactoryGuardInference' }).Count -gt 0
+    ffmpegCount = @($processes | Where-Object { $_.ProcessName -eq 'ffmpeg' }).Count
+    totalCpuSeconds = ($processes | Measure-Object CPU -Sum).Sum
+    totalWorkingSetMB = [math]::Round((($processes | Measure-Object WorkingSet64 -Sum).Sum / 1MB), 2)
+    totalHandles = ($processes | Measure-Object HandleCount -Sum).Sum
+  }
+
+  $sample | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8 -Append
+  Start-Sleep -Seconds $IntervalSeconds
+}
+```
+
+### 56.4 72 小时通过标准
+
+| 类别 | 合格标准 |
+| --- | --- |
+| 核心服务 | 无未解释 Engine 崩溃；系统重启后无人登录可自启 |
+| 子进程 | 计划内故障均能恢复；非计划重启次数为 0 或有明确外部原因 |
+| 数据完整性 | 数据库 integrity_check=ok，外键检查无异常 |
+| 事件事务 | 已确认事件与 Outbox 不出现事务性丢失 |
+| 片段和截图 | 成功率不低于 99%，失败均有错误码和可恢复说明 |
+| 通知 | 渠道成功率不低于 99.5%，失败按退避策略重试 |
+| 内存/句柄 | 无可观察的持续单调增长，恢复后回到基线附近 |
+| 媒体链路 | 无未解释花屏、无限重连或进程风暴 |
+| 磁盘 | WAL、日志和媒体增长在估算范围内，清理策略有效 |
+| 证据 | 所有故障注入均有时间线、命令输出和恢复时长 |
+
+若 72 小时内修复了代码或配置，应重新开始完整 72 小时测试；只从中断处继续不能证明新版本的连续可靠性。
+
+### 56.5 30 天试点要求
+
+30 天试点不是让客户“免费用一个月”，而是验证真实组织、排班、天气、光照、通知响应和维护流程。试点期间应满足：
+
+- 每个启用通道至少有一次合成事件或演练事件；
+- 每周覆盖一次 NVR 重启、通知失败或媒体重连场景；
+- 每周与客户复核误报、漏报反馈、未关闭事件和规则调整；
+- 每天生成健康报告，每周生成趋势汇总；
+- 所有规则调整必须记录版本、原因和批准人；
+- 值班员完成至少一次独立处警和一次证据导出；
+- 试点结束前完成备份恢复、升级回滚和无人登录重启演练。
+
+### 56.6 压力测试场景
+
+| 场景 | 注入方式 | 关注指标 |
+| --- | --- | --- |
+| 通道峰值 | 1.5 倍标准通道数或码率 | CPU、GPU、内存、丢帧、端到端延迟 |
+| 多目标突发 | 单画面 20–100 个目标或轨迹 | 推理耗时、规则聚合、队列积压 |
+| 高频事件 | 短时间大量事件通过去重仍入库 | 数据库写入、Outbox、通知限流 |
+| 通知中断 | Webhook/短信服务不可用 | 退避、重试、死信、恢复后补发 |
+| 媒体抖动 | 丢包、乱序、关键帧延迟 | 花屏、重连次数、错误码 |
+| 磁盘压力 | 剩余空间接近阈值 | 清理、只读保护、降级和告警 |
+| 日志风暴 | 大量重复错误 | 日志限流、磁盘增长、事件可见性 |
+| UI 峰值 | 多窗口刷新和历史查询 | UI 卡顿、服务资源隔离 |
+
+压力测试的目标是找到安全降级点，而不是让系统在超负荷时仍承诺无延迟。超过容量上限时，应明确优先保障核心通道和事件持久化。
+
+### 56.7 资源泄漏判定
+
+应在测试开始、每 12 小时、故障恢复后和测试结束时采集：
+
+- 工作集、提交内存、私有字节、句柄、线程数；
+- GPU 内存和 DirectML session 数量；
+- FFmpeg 子进程数量、管道句柄和临时文件数量；
+- SQLite WAL 大小、数据库页数和文件描述/句柄；
+- 故障恢复后这些指标是否回落到稳定区间。
+
+若内存或句柄随时间显著线性增长且重启后消失，应判定为泄漏缺陷。即使 72 小时内未耗尽资源，也不得带着已知泄漏发布 RC。
+
+### 56.8 长稳测试报告 Schema
+
+```json
+{
+  "reportVersion": "1.0",
+  "testType": "72h-soak",
+  "build": {
+    "product": "FactoryGuard",
+    "version": "1.0.0-rc.1",
+    "commit": "example",
+    "onnxRuntime": "example",
+    "ffmpeg": "example"
+  },
+  "environment": {
+    "os": "Windows 11 IoT Enterprise LTSC",
+    "channels": 16,
+    "sampleFps": 2,
+    "gpu": "DirectML-compatible adapter"
+  },
+  "window": {
+    "startedAt": "2026-10-07T09:00:00+08:00",
+    "endedAt": "2026-10-10T09:00:00+08:00"
+  },
+  "results": {
+    "engineUnexpectedRestarts": 0,
+    "databaseIntegrity": "ok",
+    "eventTransactionLoss": 0,
+    "snapshotClipSuccessPct": 99.6,
+    "notificationSuccessPct": 99.8,
+    "memoryLeakDetected": false,
+    "handleLeakDetected": false,
+    "decision": "pass"
+  },
+  "evidence": [
+    "soak-health.csv",
+    "event-log.xml",
+    "database-verify.txt",
+    "fault-drills.md"
+  ]
+}
+```
+
+### 56.9 失败处理
+
+- critical/high 可靠性项失败：版本不得进入 RC；
+- 仅低风险文档或非关键 UI 问题：可带问题发布，但必须公告；
+- 对无法稳定复现的问题，应保留 dump、时间线和日志，进入下一周期跟踪，不能直接标记无法复现后关闭；
+- 压力测试得到的容量上限应写入销售和交付材料，禁止对超过基线的站点作无根据承诺。
+
+---
+
+## 57. 备品备件、冷备主机、升级切换与驻场支持
+
+高可靠系统必须假设硬件会坏、升级会失败、现场会遇到不可预测的网络和供电问题。FactoryGuard 应建立备件包、冷备主机、预授权安装介质和标准切换流程，同时明确哪些故障能在小时级恢复，哪些只能按备件和物流条件处理。
+
+### 57.1 备件层级
+
+| 层级 | 适用对象 | 内容 | 恢复目标建议 |
+| --- | --- | --- | --- |
+| L0 现场小料 | 所有站点 | 网线、水晶头、扎带、标签、电源线、适配器、备用插线板 | 30 分钟内处理线缆类问题 |
+| L1 现场备件 | 重点站点 | SSD、内存条、网卡、PoE 模块、UPS 电池、USB 转接口 | 2–4 小时 |
+| L2 冷备主机 | 高等级站点 | 同规格或已验证兼容主机、GPU、系统镜像、安装介质 | 2 小时内启用，恢复服务 |
+| L3 区域备件 | 多客户区域 | GPU、主机、UPS、摄像机/交换机备件 | 下一工作日或按合同 |
+| L4 厂商 RMA | 批量硬件故障 | 返厂检测和更换 | 以硬件厂商条款为准 |
+
+RTO 是服务响应和现场准备目标，不应在没有备件和合同条款时承诺为无条件保证。
+
+### 57.2 现场备件包清单
+
+```yaml
+spare_kit_version: 1
+site_id: FG-SITE-0001
+levels:
+  level0:
+    rto_minutes: 30
+    items:
+      - name: cat6-patch-cable-2m
+        quantity: 4
+      - name: rj45-connectors
+        quantity: 20
+      - name: cable-ties-and-labels
+        quantity: 1
+      - name: power-strip-surge-protected
+        quantity: 1
+  level1:
+    rto_hours: 4
+    items:
+      - name: enterprise-ssd-1tb
+        quantity: 1
+      - name: ddr5-sodimm-16gb
+        quantity: 1
+      - name: usb-gigabit-ethernet
+        quantity: 1
+      - name: ups-replacement-battery
+        quantity: 1
+  level2:
+    rto_hours: 2
+    items:
+      - name: validated-cold-standby-host
+        quantity: 1
+      - name: directml-compatible-gpu
+        quantity: 1
+      - name: signed-install-usb
+        quantity: 1
+      - name: sealed-configuration-worksheet
+        quantity: 1
+custody:
+  locker: security-office
+  key_holder: site-admin
+  last_inventory_at: 2026-10-07
+```
+
+### 57.3 冷备主机准备要求
+
+冷备主机不是随便放一台电脑，而应预先完成以下事项：
+
+- Windows 版本、架构、内存、磁盘和 GPU 与生产主机兼容；
+- 已安装相同或经批准的新版本 FactoryGuard；
+- 已验证服务自启、DirectML、FFmpeg 和命名管道；
+- 安装介质和二进制哈希与正式版本一致；
+- 主机名、IP 和站点配置在切换时按模板设置；
+- 客户管理员知道如何联系实施支持并取得授权；
+- 每季度至少开机更新、复验并重新封存。
+
+重要限制：DPAPI 保护的 NVR 密码、Webhook Secret 与机器、用户和密钥上下文相关，不能假设复制数据库和配置文件后在另一台电脑上直接可用。冷备切换流程应包含“重新输入或恢复受管凭据”的步骤；若客户需要跨主机自动恢复密钥，必须另行设计经批准的凭据管理方案，不能把明文密码写在脚本中。
+
+### 57.4 冷备切换 Run Sheet
+
+| 步骤 | 内容 | 门禁 |
+| --- | --- | --- |
+| 1. 宣告 | 确认生产主机短时间无法恢复，启动冷备事件 | 客户管理员批准 |
+| 2. 保护现场 | 保留故障主机、dump、日志和最近配置，不随意重启覆盖证据 | 证据已采集或风险已说明 |
+| 3. 取出冷备 | 记录取出时间、保管人和设备编号 | 资产记录完整 |
+| 4. 网络接入 | 设置约定 IP/主机名，验证到 NVR 和网关连通 | RTSP 端口可达 |
+| 5. 配置恢复 | 导入脱敏配置、数据库备份或重建站点/规则 | 配置校验通过 |
+| 6. 凭据恢复 | 重新输入 NVR/通知渠道密钥 | 连接测试通过 |
+| 7. 启动检测 | 启动服务，逐通道确认在线 | 核心通道全部在线 |
+| 8. 事件验证 | 执行一次合成事件和通知测试 | 事件、截图、Outbox 正常 |
+| 9. 签收 | 记录检测恢复时间和遗留风险 | 双方确认 |
+| 10. 故障机处理 | 维修、RMA 或数据恢复 | 不影响冷备运行 |
+
+### 57.5 升级切换与回滚
+
+升级应按以下顺序执行：
+
+1. 安装日前复核变更单、版本说明、影响范围和回退版本；
+2. 备份数据库、配置、基线和当前证据包；
+3. 下载或拷贝安装包后验证签名和 SHA256；
+4. 在维护窗口停止接受配置修改；
+5. 执行安装和迁移；
+6. 启动服务并完成核心冒烟；
+7. 与 NVR 连续录像并行核对通道和事件时间；
+8. 小规模观察后再恢复全部规则；
+9. 失败时按一键回滚工具恢复旧版本和旧配置；
+10. 成功后生成新基线并关闭变更单。
+
+NVR 始终保持连续录像，FactoryGuard 升级不应要求停止 NVR 或改变 NVR 录像计划。升级失败的默认安全动作是恢复上一版本 FactoryGuard，而不是让客户现场处于无分析说明状态。
+
+### 57.6 驻场和增强支持
+
+试点首周或高等级站点上线可采用分级驻场：
+
+| 等级 | 支持方式 | 适用情况 |
+| --- | --- | --- |
+| 远程值守 | 工作时间远程响应、日报复核 | 标准站点、风险较低 |
+| 远程增强 | 夜间关键事件升级、次日复盘 | 有夜班仓储/围墙场景 |
+| 半日驻场 | 安装后 1–3 天关键时段在场 | 值班员经验不足 |
+| 全日驻场 | 首周现场陪跑 | 重点项目或流程复杂 |
+| 驻场运维 | 按周期现场维护和演练 | 多站点/集团客户 |
+
+驻场人员的职责是培训、排障、记录和推动闭环，不应代替客户承担安全主体责任。所有远程登录、配置修改、规则调整和证据导出仍需按审计制度记录。
+
+### 57.7 备件审计
+
+每月应检查备件数量、封条、电池、安装介质版本和冷备主机能否启动；每季度执行一次冷备切换演练。发现以下问题应立即整改：
+
+- 备件缺失或被挪作他用；
+- 安装 USB 中版本过期、无签名或哈希不一致；
+- 冷备主机长期未更新，无法通过配置校验；
+- 无人知道保管钥匙或审批人；
+- 切换时才发现 NVR 凭据无法恢复；
+- 备件硬盘或主机包含其他客户数据。
+
+备件可用性必须通过演练证明。只在资产表中登记“备用主机一台”，不能证明故障发生时能够恢复检测能力。
+
+---
+
+## 58. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 54.1 平台与可靠性资料
+### 58.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -4796,9 +5430,14 @@ plans:
 | NIST SP 800-53 Rev.5 Security and Privacy Controls | 维护、审计、访问控制和应急控制族参考 |
 | NIST SP 800-61 Rev.2 Incident Handling Guide | 安全事件响应、证据保全和复盘参考 |
 | smartmontools project | SMART 字段、存储健康检查和寿命预警参考 |
+| RFC 5905 Network Time Protocol Version 4 | NTP 时间同步、时间源、偏差和时钟治理参考 |
+| RFC 3550 RTP: A Transport Protocol for Real-Time Applications | RTP 时间戳、实时媒体传输和帧时序诊断参考 |
+| Microsoft Learn：Get-FileHash | 文件 SHA256、证据导出和完整性校验参考 |
+| NIST SP 800-86 Guide to Integrating Forensic Techniques | 电子证据保全、采集、检查和事件响应参考 |
+| ISO/IEC 27037 Guidelines for identification/collection/acquisition | 电子证据识别、收集、保存和流转参考 |
 | ISA/IEC 62443 series | 工业控制系统安全分区、供应商和运维安全参考 |
 
-### 54.2 视频与设备协议资料
+### 58.2 视频与设备协议资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -4808,7 +5447,7 @@ plans:
 | GB/T 28181 相关公共安全视频监控联网标准 | 二期平台级联和协议扩展预研 |
 | GA/T 1400 相关公共安全视频图像信息系统标准 | 二期视图库、事件对象和平台对接预研 |
 
-### 54.3 主要链接
+### 58.3 主要链接
 
 - https://learn.microsoft.com/en-us/windows/win32/services/service-programs
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w
@@ -4839,6 +5478,10 @@ plans:
 - https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final
 - https://csrc.nist.gov/pubs/sp/800/61/r2/final
 - https://www.smartmontools.org/
+- https://www.rfc-editor.org/rfc/rfc5905
+- https://www.rfc-editor.org/rfc/rfc3550
+- https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/get-filehash
+- https://csrc.nist.gov/pubs/sp/800/86/final
 - https://www.isa.org/standards-and-publications/isa-standards/isa-iec-62443-series-of-standards
 - https://learn.microsoft.com/en-us/windows/security/identity-protection/access-control/service-accounts
 - https://learn.microsoft.com/en-us/powershell/module/defender/add-mppreference
@@ -4909,3 +5552,11 @@ plans:
 - **RTO/RPO**：恢复时间目标 / 恢复点目标；
 - **Mock 检测器**：按剧本返回检测结果的模拟引擎；
 - **处警闭环**：事件从产生到确认、误报或关闭的完整流程。
+- **NTP**：网络时间协议，用于将值守电脑、NVR 和网络设备同步到可审计时间源；
+- **RTP**：实时传输协议，媒体时间戳和传输诊断的重要依据；
+- **PTS**：媒体帧的呈现时间戳，用于帧排序和片段定位；
+- **监管链**：电子证据从采集、保存、打开、复制、外发到封存的连续记录；
+- **运行基线**：经批准的服务、文件、配置、权限、安全策略和运行时版本快照；
+- **配置漂移**：当前系统状态与已批准基线不一致且没有对应变更记录；
+- **冷备主机**：预先安装、验证并封存，可在生产主机故障时按流程启用的备用主机；
+- **72 小时长稳**：在标准负载和计划故障注入下连续运行 72 小时的 RC 发布门禁。
