@@ -1,8 +1,8 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v2.9
+> 文档版本：v3.0
 > 成文日期：2026-10-07
-> 文档状态：立项稿（日志证据、主机资源、网络链路与启动就绪增强版）
+> 文档状态：立项稿（供应链证明、配置事务、日志证据与 Windows 可靠性增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
 > v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
@@ -15,6 +15,7 @@
 > v2.7 增补：网卡/VLAN/MTU/交换机端口治理、网络质量连续指标、RTSP/ONVIF 会话状态机、认证锁定、重连退避、Keepalive 和媒体新鲜度检测。
 > v2.8 增补：CPU/内存/提交量/句柄/线程/磁盘 I/O/GPU 连续监测、资源预算、Job Object 硬限制、泄漏判定、资源降级和故障注入。
 > v2.9 增补：结构化 JSONL、序列号、日志背压、审计写入、日志滚动、脱敏、诊断包 manifest、证据哈希和导出失败演练。
+> v3.0 增补：可重复构建、Authenticode 签名、SBOM/Provenance、软件供应链证明，以及配置事务、灰度发布、自动回滚和配置并发锁。
 
 ---
 
@@ -351,7 +352,7 @@ ONNX DirectML/CPU]
 ### 7.4 服务、Job Object 与看门狗
 
 - 服务注册为 Automatic（Delayed Start 可按现场启动风暴评估），服务恢复策略设置为第一次、第二次、后续失败均重启，并在 Windows 事件日志记录。
-- 服务账户优先使用虚拟服务账户 NT Service\FactoryGuard 或专用低权限服务账户，仅授予 ProgramData 数据目录、网络访问和必要 GPU 权限。
+- 服务账户优先使用虚拟服务账户 NT Service\FactoryGuard 或专用低权限服务账户，仅授予独立数据盘目录、网络访问和必要 GPU 权限。
 - 所有子进程加入 Job Object；设置 KILL_ON_JOB_CLOSE、进程数、CPU、内存和活动进程限制，防止监督器异常退出后留下孤儿。
 - Worker 每秒发送心跳、通道统计和队列水位；连续超时后监督器先请求优雅退出，超时再强制终止。
 - 重启采用指数退避和熔断：短时间内连续崩溃时降低重启频率，同时持续输出本地故障状态，避免无限刷进程。
@@ -378,7 +379,7 @@ ONNX DirectML/CPU]
 
 - 系统开机后无需用户登录即可启动服务；服务恢复最近一次布防状态，但必须等待通道和模型健康检查通过才显示 Ready。
 - Windows 关机时，服务按顺序停止接收新事件、刷新 Outbox、关闭数据库、结束 FFmpeg；超时未退出的子进程由 Job Object 清理。
-- 安装目录固定为 Program Files\FactoryGuard；运行数据固定为 ProgramData\FactoryGuard；UI 缓存写入用户 LocalAppData，安装后不向 Program Files 写数据。
+- 安装目录固定为 Program Files\FactoryGuard；活跃运行数据固定为 V:\FactoryGuard；UI 缓存写入用户 LocalAppData，安装后不向 Program Files 写数据。
 - 升级先停止服务，备份数据库和配置，替换二进制，执行数据库迁移，再启动健康检查；迁移失败自动回滚二进制和数据库备份。
 - NSIS 安装包必须支持静默安装、修复、卸载和保留数据；正式版本必须数字签名，避免 Defender SmartScreen 和现场安全软件误杀。
 - 日常运行和初始化向导不需要管理员权限；只有安装、服务注册、防火墙规则和诊断驱动检查时提权。
@@ -419,7 +420,7 @@ ONNX DirectML/CPU]
 
 - 电源策略设置为高性能，禁用睡眠、休眠和硬盘休眠；显示器可关闭，但主机不能进入低功耗。
 - Windows Update 设置 Active Hours 或现场维护窗口；更新重启后服务必须自动恢复。
-- Defender 实时扫描保留开启，对签名后的 Program Files 二进制和 ProgramData 数据目录使用最小必要排除规则；不建议关闭全部安全防护。
+- Defender 实时扫描保留开启，对签名后的 Program Files 二进制和 独立数据盘数据目录使用最小必要排除规则；不建议关闭全部安全防护。
 - 安装前卸载冲突的“开机加速/驱动管家/远程桌面劫持”类软件；远程维护优先使用系统远程工具或可信方案。
 - 现场交付必须检查中文路径、空格路径、非管理员账户、域策略、DPI、多显示器和屏幕保护策略。
 
@@ -986,8 +987,8 @@ Get-LocalGroupMember -Group 'FactoryGuard Operators' | Select-Object Name, Objec
 ```powershell
 $ErrorActionPreference = 'Stop'
 
-$exportPath = 'C:ProgramDataFactoryGuarddiagnosticssecedit-baseline.inf'
-$databasePath = 'C:ProgramDataFactoryGuarddiagnosticssecedit-baseline.sdb'
+$exportPath = 'V:\FactoryGuard\diagnostics\secedit-baseline.inf'
+$databasePath = 'V:\FactoryGuard\diagnostics\secedit-baseline.sdb'
 secedit /export /cfg $exportPath /areas SECURITYPOLICY /log null
 Get-Content -LiteralPath $exportPath | Where-Object { $_ -match 'Password|Lockout' }
 ```
@@ -2229,7 +2230,7 @@ v1.0 的安装、升级和服务注册允许提权；服务启动后的日常预
 | 启动类型 | Automatic |
 | 服务账户 | NT Service\FactoryGuard |
 | 安装目录 | C:\Program Files\FactoryGuard |
-| 数据目录 | C:\ProgramData\FactoryGuard |
+| 数据目录 | V:\FactoryGuard |
 | 本地操作员组 | FactoryGuard Operators |
 | 本地管道 | \\\\.\\pipe\\FactoryGuard-v1 |
 
@@ -2258,7 +2259,7 @@ $sysDrive = Get-Volume -DriveLetter $env:SystemDrive.TrimEnd(':')
 ```powershell
 $ErrorActionPreference = 'Stop'
 $groupName = 'FactoryGuard Operators'
-$dataDir = 'C:ProgramDataFactoryGuard'
+$dataDir = 'V:\FactoryGuard'
 $group = Get-LocalGroup -Name $groupName -ErrorAction SilentlyContinue
 if ($null -eq $group) {
   $group = New-LocalGroup -Name $groupName -Description 'FactoryGuard 授权值班操作员'
@@ -2281,7 +2282,7 @@ $aclArgs = @(
 if ($LASTEXITCODE -ne 0) { throw 'FactoryGuard 数据目录 ACL 配置失败' }
 ```
 
-设计说明：UI 需要的截图、片段和状态由服务通过命名管道授权传输，因此不向普通用户直接开放 ProgramData 事件文件。操作员不应因为能登录 Windows 就自动获得视频数据访问权。
+设计说明：UI 需要的截图、片段和状态由服务通过命名管道授权传输，因此不向普通用户直接开放数据盘中的事件文件。操作员不应因为能登录 Windows 就自动获得视频数据访问权。
 
 ### 37.4 注册 Windows 服务
 
@@ -2359,7 +2360,7 @@ Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = (Get-Date).AddM
 | --- | --- | --- |
 | 升级前 | 导出当前配置摘要，完成数据库 Online Backup | 备份通过 integrity_check |
 | 停止服务 | sc.exe stop；等待 STOPPED | Job Object 清理所有子进程 |
-| 文件替换 | 仅替换 Program Files 下签名文件 | 不修改 ProgramData，除非迁移要求 |
+| 文件替换 | 仅替换 Program Files 下签名文件 | 不修改活跃数据盘配置，除非迁移要求 |
 | 数据迁移 | 执行前向迁移 | 单事务、版本记录、失败自动回滚 |
 | 启动验证 | 服务启动、Warmup、通道连接、通知检查 | 健康状态和版本号正确 |
 | 交付确认 | 保存升级记录和测试证据 | 客户/实施双方确认 |
@@ -2519,7 +2520,7 @@ v1.0 对事件、Outbox、审计等关键数据采用 synchronous=FULL，优先�
 ```powershell
 $ErrorActionPreference = 'Stop'
 $serviceExe = 'C:Program FilesFactoryGuardactoryguard-supervisor.exe'
-$dbPath = 'C:ProgramDataFactoryGuarddbactoryguard.db'
+$dbPath = 'V:\FactoryGuard\db\factoryguard.db'
 & $serviceExe db migrate --database $dbPath --target 3
 if ($LASTEXITCODE -ne 0) { throw '数据库迁移失败，应按输出提示执行回滚' }
 ```
@@ -2531,8 +2532,8 @@ if ($LASTEXITCODE -ne 0) { throw '数据库迁移失败，应按输出提示执�
 ```powershell
 $ErrorActionPreference = 'Stop'
 $serviceExe = 'C:Program FilesFactoryGuardactoryguard-supervisor.exe'
-$dbPath = 'C:ProgramDataFactoryGuarddbactoryguard.db'
-$backupPath = 'C:ProgramDataFactoryGuardackupsactoryguard-before-upgrade.db'
+$dbPath = 'V:\FactoryGuard\db\factoryguard.db'
+$backupPath = 'V:\FactoryGuard\backups-local\factoryguard-before-upgrade.db'
 & $serviceExe db backup --database $dbPath --target $backupPath --verify
 if ($LASTEXITCODE -ne 0) { throw '数据库备份或校验失败' }
 ```
@@ -2545,8 +2546,8 @@ if ($LASTEXITCODE -ne 0) { throw '数据库备份或校验失败' }
 $ErrorActionPreference = 'Stop'
 $serviceName = 'FactoryGuard'
 $serviceExe = 'C:Program FilesFactoryGuardactoryguard-supervisor.exe'
-$restoreSource = 'C:ProgramDataFactoryGuardackupsactoryguard-known-good.db'
-$restoreTarget = 'C:ProgramDataFactoryGuarddbactoryguard.restored.db'
+$restoreSource = 'V:\FactoryGuard\backups-local\factoryguard-known-good.db'
+$restoreTarget = 'V:\FactoryGuard\db\factoryguard.restored.db'
 & sc.exe stop $serviceName
 if ($LASTEXITCODE -ne 0) { throw '服务停止失败' }
 & $serviceExe db restore --from $restoreSource --to $restoreTarget --verify
@@ -2602,7 +2603,7 @@ PRAGMA wal_checkpoint(TRUNCATE);
 | 云提供保护 | 按客户策略；建议开启 |
 | 篡改防护 | 不主动修改，交由客户安全策略管理 |
 | 安装目录 | 签名文件允许正常扫描 |
-| ProgramData | 不做整目录排除 |
+| 独立数据盘 | 不做整目录排除 |
 | 可疑文件 | 按 Defender 策略隔离，安装器和恢复工具不得删除安全事件证据 |
 
 只有在长稳或试点中证明扫描造成明确 CPU/IO 瓶颈时，才允许使用精确路径排除；排除项必须在配置基线、验收报告和客户安全负责人确认中留痕。
@@ -2624,7 +2625,7 @@ $ErrorActionPreference = 'Stop'
 
 $approvedExclusions = @(
   'C:Program FilesFactoryGuard',
-  'C:ProgramDataFactoryGuarddb'
+  'V:\FactoryGuard\db'
 )
 
 foreach ($path in $approvedExclusions) {
@@ -2847,7 +2848,7 @@ Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Con
 | 架构 | 仅支持 x64 |
 | 签名 | 安装包、EXE、DLL、关键脚本载荷 Authenticode 签名 |
 | 静默安装 | 支持 /S；参数和结果写入安装日志 |
-| 数据保留 | 卸载默认保留 ProgramData，除非用户明确选择删除 |
+| 数据保留 | 卸载默认保留数据盘数据，除非用户明确选择删除 |
 | 版本控制 | 阻止未经参数确认的降级安装 |
 | 回滚 | 任一步失败恢复到安装/升级前状态 |
 
@@ -2902,12 +2903,12 @@ Phase 3 Start and Verify
 | --- | --- | --- |
 | /S | Setup.exe /S | 静默安装 |
 | /InstallDir | /InstallDir="C:Program FilesFactoryGuard" | 安装目录；最终仍受路径安全检查 |
-| /DataDir | /DataDir="C:ProgramDataFactoryGuard" | 数据目录 |
+| /DataDir | /DataDir="V:\FactoryGuard" | 数据目录 |
 | /Mode | /Mode=install/upgrade/repair | 指定模式；默认自动检测 |
 | /Components | /Components="core,ui,ffmpeg,onnx" | 选择组件 |
 | /NoStartUI | /NoStartUI=1 | 安装后不启动 UI，服务仍启动 |
 | /AcceptDowngrade | /AcceptDowngrade=1 | 仅维护场景使用，必须记录审计 |
-| /LogDir | /LogDir="C:ProgramDataFactoryGuardlogs" | 安装日志目录 |
+| /LogDir | /LogDir="V:\FactoryGuard\logs" | 安装日志目录 |
 
 静默安装的返回码必须机器可读：0 成功；3010 成功但建议重启（应尽量避免）；4xxx 为预检查失败；5xxx 为服务/迁移失败；6xxx 为回滚失败。
 
@@ -2952,7 +2953,7 @@ NSIS 只作为安装事务编排器，不应在脚本中嵌入明文密码；服
 | Repair | 重新校验签名和 ACL；替换损坏二进制；不删除数据；执行健康检查 |
 | Upgrade | 自动备份、迁移、验证、失败回滚 |
 | Uninstall | 停止服务和 Job Object；删除 Program Files；默认保留数据、日志和许可证记录 |
-| Remove Data | 二次确认后删除 ProgramData；生成删除审计；不得删除已被客户保全的取证包 |
+| Remove Data | 二次确认后删除数据盘数据；生成删除审计；不得删除已被客户保全的取证包 |
 | Remove Rules | 卸载本地事件源和防火墙规则；GPO 管理项不删除 |
 
 ### 42.7 安装器发布门禁
@@ -2992,8 +2993,8 @@ product:
   previous_version: 1.0.0
   target_version: 1.1.0
 database:
-  path: C:\ProgramData\FactoryGuard\db\factoryguard.db
-  backup: C:\ProgramData\FactoryGuard\backups\factoryguard-20261007.db
+  path: V:\FactoryGuard\db\factoryguard.db
+  backup: V:\FactoryGuard\backups-local\factoryguard-20261007.db
   schema_version_before: 2
   schema_version_target: 3
   integrity_before: ok
@@ -3033,7 +3034,7 @@ $recovery = 'C:Program FilesFactoryGuardactoryguard-recovery.exe'
 & $recovery list
 if ($LASTEXITCODE -ne 0) { throw '无法列出恢复点' }
 
-$manifest = 'C:ProgramDataFactoryGuardackupsollback-manifest.yaml'
+$manifest = 'V:\FactoryGuard\backups-local\rollback-manifest.yaml'
 & $recovery verify --manifest $manifest
 if ($LASTEXITCODE -ne 0) { throw '恢复点校验失败' }
 
@@ -3163,12 +3164,12 @@ ntp:
 ```yaml
 storage:
   install_dir: C:\Program Files\FactoryGuard
-  data_dir: C:\ProgramData\FactoryGuard
+  data_dir: V:\FactoryGuard
   user_cache_dir: ${LOCALAPPDATA}\FactoryGuard
-  database_path: C:\ProgramData\FactoryGuard\db\factoryguard.db
-  snapshot_dir: C:\ProgramData\FactoryGuard\snapshots
-  clip_dir: C:\ProgramData\FactoryGuard\clips
-  temp_dir: C:\ProgramData\FactoryGuard\tmp
+  database_path: V:\FactoryGuard\db\factoryguard.db
+  snapshot_dir: V:\FactoryGuard\media\snapshots
+  clip_dir: V:\FactoryGuard\media\clips
+  temp_dir: V:\FactoryGuard\spool
   require_ntfs: true
   min_free_gb: 20
   watermarks:
@@ -3184,7 +3185,7 @@ storage:
 logging:
   level: info
   format: jsonl
-  dir: C:\ProgramData\FactoryGuard\logs
+  dir: V:\FactoryGuard\logs
   max_file_mb: 50
   max_total_mb: 500
   retain_days: 30
@@ -3255,7 +3256,7 @@ models:
     execution_policy:
       preferred: directml
       fallback: cpu
-    path: C:\ProgramData\FactoryGuard\models\person_detect_v1.onnx
+    path: V:\FactoryGuard\models\person_detect_v1.onnx
     checksum_sha256: 由发布系统生成
     labels:
       - person
@@ -3695,7 +3696,7 @@ URL 在内部保存为“主机 + 端口 + 路径模板 + secret_ref”，不把
 | 误报增多 | 核查画面变化、目标类型、规则几何、确认帧数和冷却 | 同一规则 1 小时内误报超过 3 次 |
 | 通知失败 | 查看 Outbox、Webhook 地址、签名、网络和第三方响应码 | 重试耗尽或关键事件未送达 |
 | 磁盘空间不足 | 检查保留策略、异常日志、片段数量和诊断包 | 达到 90% 水位或清理失败 |
-| 服务无法启动 | 检查 SCM、账户权限、ProgramData ACL、端口和事件日志 | 自动恢复策略失败 |
+| 服务无法启动 | 检查 SCM、账户权限、数据盘 ACL、端口和事件日志 | 自动恢复策略失败 |
 
 ### 48.3 事件严重级别
 
@@ -4445,7 +4446,7 @@ CREATE INDEX IF NOT EXISTS ix_audit_resource ON audit_logs(resource_type, resour
 ```powershell
 $serviceName = 'FactoryGuardEngine'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$evidenceRoot = Join-Path $env:ProgramData "FactoryGuard\evidence\$stamp"
+$evidenceRoot = Join-Path 'V:\FactoryGuard\exports' "evidence\$stamp"
 $dir = New-Item -ItemType Directory -Path $evidenceRoot -Force
 $installRoot = Join-Path $env:ProgramFiles 'FactoryGuard'
 
@@ -4836,7 +4837,7 @@ w32tm /query /status
 ```powershell
 $caseId = 'CASE-20261007-001'
 $eventId = '00000000-0000-0000-0000-000000000001'
-$exportRoot = Join-Path $env:ProgramData "FactoryGuard\exports\$caseId"
+$exportRoot = Join-Path 'V:\FactoryGuard' "exports\$caseId"
 New-Item -ItemType Directory -Path $exportRoot -Force | Out-Null
 
 FactoryGuardCtl.exe export event --event-id $eventId --output $exportRoot
@@ -4929,7 +4930,7 @@ Windows 现场最常见的问题不是首次安装失败，而是运行数周后
 | 可执行文件 | EXE/DLL/模型/脚本的路径、长度、SHA256、签名 | 被替换、植入、升级中断或文件损坏 |
 | 配置文件 | 版本、哈希、启用通道、规则、通知、存储阈值 | 规则错误、通知中断、数据路径变化 |
 | 注册表 | 服务参数、WER、Dump、事件日志注册值 | 崩溃证据和诊断行为失效 |
-| ACL | ProgramData、数据库、日志、命名管道权限 | 权限过宽或服务无法写入 |
+| ACL | 数据盘、数据库、日志、命名管道权限 | 权限过宽或服务无法写入 |
 | 防火墙 | Profile、规则、端口、远程地址、授权程序 | 暴露面扩大或媒体/通知被阻断 |
 | Defender | 防护状态、引擎版本、精确排除项 | 防护关闭、误杀、性能问题 |
 | 计划任务 | 备份、巡检、清理、证据采集任务 | 任务被禁用或以错误账户运行 |
@@ -4945,7 +4946,7 @@ Windows 现场最常见的问题不是首次安装失败，而是运行数周后
 6. 旧基线不得删除，应至少保留一个支持周期或按客户审计制度保留；
 7. 漂移修复必须有审批和记录，不能由监控脚本静默回滚所有内容。
 
-建议基线文件目录：C:\ProgramData\FactoryGuard\baselines。基线目录只允许 SYSTEM、管理员和服务账户写入，普通操作员只读。
+建议基线文件目录：V:\FactoryGuard\baselines。基线目录只允许 SYSTEM、管理员和服务账户写入，普通操作员只读。
 
 ### 55.3 基线采集脚本
 
@@ -4958,7 +4959,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $installRoot = Join-Path $env:ProgramFiles 'FactoryGuard'
-$programDataRoot = Join-Path $env:ProgramData 'FactoryGuard'
+$programDataRoot = Join-Path 'V:\' 'FactoryGuard'
 
 $binaryFiles = Get-ChildItem -Path (Join-Path $installRoot 'bin') -Recurse -File -ErrorAction Stop |
   ForEach-Object {
@@ -5848,7 +5849,7 @@ backup_policy:
 
 ```powershell
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backupPath = Join-Path $env:ProgramData "FactoryGuard\backups\$stamp"
+$backupPath = Join-Path 'V:\FactoryGuard' "backups-local\$stamp"
 New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
 
 FactoryGuardCtl.exe backup create --output $backupPath --encrypt --include-config
@@ -6211,21 +6212,21 @@ FactoryGuard 的运行主机长期连接厂区内网，一旦被勒索软件、�
 
 应保护以下目录：
 
-- C:\ProgramData\FactoryGuard\db；
-- C:\ProgramData\FactoryGuard\config；
-- C:\ProgramData\FactoryGuard\evidence；
-- C:\ProgramData\FactoryGuard\exports；
+- V:\FactoryGuard\db；
+- V:\FactoryGuard\config；
+- V:\FactoryGuard\exports\evidence；
+- V:\FactoryGuard\exports；
 - 经客户批准的备份目录；
 - 不在 C:\Program Files\FactoryGuard 下但由服务写入的自定义数据目录。
 
-不能简单把整个 ProgramData、D:\ 或备份盘全部保护后忽略兼容性；必须确认安装器、诊断工具、备份任务和升级流程都能合法写入。
+不能简单把整个数据盘、D:\ 或备份盘全部保护后忽略兼容性；必须确认安装器、诊断工具、备份任务和升级流程都能合法写入。
 
 ```powershell
 $protectedFolders = @(
-  'C:\ProgramData\FactoryGuard\db',
-  'C:\ProgramData\FactoryGuard\config',
-  'C:\ProgramData\FactoryGuard\evidence',
-  'C:\ProgramData\FactoryGuard\exports'
+  'V:\FactoryGuard\db',
+  'V:\FactoryGuard\config',
+  'V:\FactoryGuard\exports\evidence',
+  'V:\FactoryGuard\exports'
 )
 
 $allowedApplications = @(
@@ -6372,7 +6373,7 @@ Get-MpPreference | Select-Object EnableNetworkProtection | Format-List
 - FactoryGuardCtl；
 - Qt UI 进程。
 
-转储目录应位于受控数据盘或 ProgramData 子目录，并设置保留数量。不能无限堆积导致磁盘被占满。
+转储目录应位于受控数据盘诊断目录，并设置保留数量。不能无限堆积导致磁盘被占满。
 
 ```powershell
 $processNames = @(
@@ -6382,7 +6383,7 @@ $processNames = @(
   'FactoryGuardUI.exe'
 )
 
-$dumpFolder = 'C:\ProgramData\FactoryGuard\dumps'
+$dumpFolder = 'V:\FactoryGuard\diagnostics\dumps'
 New-Item -ItemType Directory -Path $dumpFolder -Force | Out-Null
 
 foreach ($processName in $processNames) {
@@ -6443,7 +6444,7 @@ DumpType 的具体含义以 Microsoft WER 文档为准；启用 Full dump 前必
 ```powershell
 $symbolCache = 'C:\Symbols'
 $internalSymbolServer = 'https://symbols.example.local/download/symbols'
-$dumpFile = 'C:\ProgramData\FactoryGuard\dumps\FactoryGuardEngine.exe.1234.dmp'
+$dumpFile = 'V:\FactoryGuard\diagnostics\dumps\FactoryGuardEngine.exe.1234.dmp'
 
 New-Item -ItemType Directory -Path $symbolCache -Force | Out-Null
 $env:_NT_SYMBOL_PATH = "srv*$symbolCache*$internalSymbolServer*https://msdl.microsoft.com/download/symbols"
@@ -6527,7 +6528,7 @@ $process = Get-Process -Id $beforePid
 taskkill /PID $process.Id /F
 Start-Sleep -Seconds 2
 
-$dump = Get-ChildItem 'C:\ProgramData\FactoryGuard\dumps' -Filter '*.dmp' |
+$dump = Get-ChildItem 'V:\FactoryGuard\diagnostics\dumps' -Filter '*.dmp' |
   Sort-Object LastWriteTime -Descending |
   Select-Object -First 1
 
@@ -6580,7 +6581,7 @@ Windows 可靠性不是“永不更新”，长期不打补丁会积累安全风
 
 ```powershell
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$preUpdatePath = Join-Path $env:ProgramData "FactoryGuard\patch\$stamp-before"
+$preUpdatePath = Join-Path 'V:\FactoryGuard\spool' "patch\$stamp-before"
 New-Item -ItemType Directory -Path $preUpdatePath -Force | Out-Null
 
 Get-HotFix |
@@ -6775,7 +6776,7 @@ FactoryGuard 需要同时处理两类事件：业务入侵告警和系统/安全
 
 ```powershell
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$incidentRoot = Join-Path $env:ProgramData "FactoryGuard\incidents\$stamp"
+$incidentRoot = Join-Path 'V:\FactoryGuard' "incidents\$stamp"
 New-Item -ItemType Directory -Path $incidentRoot -Force | Out-Null
 
 Get-MpComputerStatus | ConvertTo-Json -Depth 5 |
@@ -6967,7 +6968,7 @@ Get-ChildItem 'C:\Windows\System32\CodeIntegrity\CiPolicies\Active' -Filter '*.c
 ### 66.4 AppLocker 基线
 
 ```powershell
-$xmlPath = 'C:\ProgramData\FactoryGuard\policies\AppLocker-FactoryGuard.xml'
+$xmlPath = 'V:\FactoryGuard\policies\AppLocker-FactoryGuard.xml'
 Get-AppLockerPolicy -Effective -Xml |
   Set-Content -Encoding UTF8 '.\applocker-effective.before.xml'
 
@@ -7827,7 +7828,7 @@ Windows 主机可能因断电、蓝屏、进程崩溃、强制关机或升级中
 
 ### 71.2 启动状态标记
 
-建议在 ProgramData 中维护受控启动状态，但不能把它当作唯一真相：
+建议在系统盘有界 bootstrap 目录中维护启动早期状态，但不能把它当作唯一真相：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -7872,7 +7873,7 @@ Get-Process -Name $processNames -ErrorAction SilentlyContinue |
   Sort-Object ProcessName, Id |
   Format-Table -AutoSize
 
-$dataRoot = Join-Path $env:ProgramData 'FactoryGuard'
+$dataRoot = Join-Path 'V:\' 'FactoryGuard'
 Get-ChildItem -Path $dataRoot -Recurse -File -ErrorAction SilentlyContinue |
   Where-Object { $_.Extension -in '.tmp', '.part', '.wal', '.shm' } |
   Select-Object FullName, Length, LastWriteTime |
@@ -7904,7 +7905,7 @@ Get-ChildItem -Path $dataRoot -Recurse -File -ErrorAction SilentlyContinue |
 ### 71.6 截图和片段状态重建
 
 ```powershell
-$mediaRoot = Join-Path $env:ProgramData 'FactoryGuard\media'
+$mediaRoot = Join-Path 'V:\FactoryGuard' 'media'
 $candidates = Get-ChildItem -Path $mediaRoot -Recurse -File -Include '*.tmp','*.part','*.mp4','*.jpg' -ErrorAction SilentlyContinue
 $candidates |
   Select-Object FullName, Length, LastWriteTime |
@@ -10195,11 +10196,499 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 
 ---
 
-## 80. 行业资料与标准依据
+## 80. 可重复构建、代码签名与软件供应链证明
+
+### 80.1 安装包必须能被证明“从何而来”
+
+FactoryGuard 运行在客户厂区的值守电脑上，并长期访问摄像机、NVR、告警通知和证据文件。若安装包来源不可证明，即使程序内部具备看门狗和恢复机制，也无法防止以下风险：
+
+- 工程师从个人电脑临时打包，客户现场无法复现同一二进制；
+- 依赖包在构建时被解析到非预期版本；
+- 发布后同版本安装包被覆盖，导致不同客户运行不同内容；
+- EXE/DLL 没有签名或签名时间戳无效，无法判断是否被篡改；
+- SBOM 缺失，第三方组件出现安全漏洞或许可证冲突时无法定位影响范围；
+- 构建脚本、测试结果和制品哈希无法关联到源码提交；
+- 远程支持时传入来源不明的补丁或修复包。
+
+因此，v1.0 的正式安装包不得来自人工交互式桌面打包。每次正式发布都必须形成“源码提交 → 构建环境 → 依赖清单 → 测试结果 → 制品哈希 → 数字签名 → 发布记录”的闭环证据。没有签名、哈希、SBOM 和发布清单的安装包只能标记为开发构建，不得用于生产交付。
+
+### 80.2 供应链设计原则
+
+| 原则 | 工程要求 |
+| --- | --- |
+| 单一事实来源 | 正式版本号、Git 提交、标签、安装包、Release Manifest 必须一一对应 |
+| 干净构建环境 | 构建在一次性或可重建的受控环境中执行，不依赖工程师本机临时文件 |
+| 依赖固定 | 语言依赖、二进制组件、编译器和构建插件记录版本与哈希 |
+| 最小输入 | 构建只拉取明确声明的源码、依赖和工具链，不使用未登记网络资源 |
+| 制品不可变 | 正式版本发布后不得覆盖；修复问题必须发布新版本或新 RC |
+| 签名带时间戳 | 关键安装包、EXE、DLL 和恢复工具进行 Authenticode 签名，并保存签名时间 |
+| 证据可验证 | Release Manifest、SBOM、provenance、测试报告和哈希可离线检查 |
+| 最小权限 | 构建发布服务使用独立凭据；签名密钥不能暴露给普通构建任务 |
+
+### 80.3 标准发布流水线
+
+| 阶段 | 必做动作 | 阻断条件 |
+| --- | --- | --- |
+| 1. Source | 校验 Git 提交、分支策略、评审记录和版本标签候选 | 源码状态不明、存在未评审红线变更 |
+| 2. Runner | 启动干净构建环境，记录 OS、编译器、构建器和环境变量 | 构建环境无法重建或含未登记工具 |
+| 3. Resolve | 下载或恢复固定版本依赖，记录哈希和来源 | 哈希不符、依赖源不可信、存在未声明依赖 |
+| 4. Configure | 加载版本号、Schema 版本、产品渠道和编译选项 | 版本不一致、配置无法解析 |
+| 5. Build | 编译二进制、UI、服务、恢复工具和资源文件 | 编译失败、警告门禁失败 |
+| 6. Test | 执行单元、集成、AST/Schema、安全和基础可靠性测试 | 任一发布红线测试失败 |
+| 7. Package | 生成 NSIS 安装包、zip/离线符号索引和校验文件 | 包内容清单与预期不一致 |
+| 8. SBOM | 生成 SPDX 或 CycloneDX 兼容 SBOM | 关键组件、版本或许可证缺失 |
+| 9. Sign | 对安装包和关键二进制签名，带可信时间戳 | 证书链无效、签名失败 |
+| 10. Attest | 生成 provenance 和 Release Manifest | 无法关联源码、构建过程或制品哈希 |
+| 11. Publish | 发布到不可变制品库和内部发布目录 | 同版本覆盖、发布元数据缺失 |
+| 12. Verify | 在干净 Windows 虚拟机安装并复核签名/哈希 | 安装后验证失败 |
+
+流水线每个阶段都应输出机器可读结果。发布负责人依据最终 Release Authorization 决定是否放行，而不是依赖群消息或人工口头确认。
+
+### 80.4 Release Manifest
+
+```yaml
+manifest_version: 1
+release:
+  product: FactoryGuard
+  version: 1.0.0
+  maturity: ga
+  released_at: 2026-10-07T14:00:00+08:00
+source:
+  repository: FactoryGuard
+  branch: release/1.0.0
+  commit: example-commit-sha
+  annotated_tag: v1.0.0
+build:
+  runner_id: controlled-windows-builder-01
+  operating_system: Windows Server or Windows build environment
+  compiler_versions:
+    rust: pinned-by-toolchain-file
+    msvc: pinned-by-build-image
+    cmake: pinned-by-build-image
+  configuration: release
+  reproducibility:
+    rebuild_attempted: true
+    input_same_as_rebuild: true
+artifacts:
+  installer:
+    path: FactoryGuard-1.0.0-win-x64.exe
+    sha256: example-installer-sha256
+    signature:
+      algorithm: Authenticode
+      timestamped: true
+      certificate_subject: example-certificate
+  checksum_file: FactoryGuard-1.0.0-checksums.txt
+  sbom: sbom-1.0.0.spdx.json
+  provenance: provenance-1.0.0.json
+  release_notes: release-notes-1.0.0.md
+requirements:
+  schema_version: 1
+  database_min_version: 1
+  windows_10_11_x64: true
+approvals:
+  build: release-engineering
+  security: security-reviewer
+  reliability: release-manager
+```
+
+### 80.5 Provenance 示例
+
+Provenance 用于说明制品由哪个源码、构建平台和构建过程产生。下面是工程字段示例；是否符合某个外部认证等级，应以对应规范的实际审计结果为准，不能仅靠字段命名自行宣称认证。
+
+```json
+{
+  "version": 1,
+  "releaseVersion": "1.0.0",
+  "subject": [
+    {
+      "name": "FactoryGuard-1.0.0-win-x64.exe",
+      "sha256": "example-installer-sha256"
+    }
+  ],
+  "predicate": {
+    "builder": {
+      "id": "factoryguard-controlled-builder"
+    },
+    "invocation": {
+      "pipelineId": "factoryguard-release",
+      "runId": "run-20261007-0001"
+    },
+    "metadata": {
+      "startedAt": "2026-10-07T13:20:00+08:00",
+      "finishedAt": "2026-10-07T14:00:00+08:00",
+      "complete": true,
+      "reproducible": true
+    },
+    "materials": [
+      {
+        "uri": "git+FactoryGuard@example-commit-sha",
+        "digest": {
+          "sha1": "example-commit-sha"
+        }
+      }
+    ]
+  }
+}
+```
+
+### 80.6 SBOM 和第三方组件治理
+
+SBOM 至少需要覆盖：
+
+| 字段 | 用途 |
+| --- | --- |
+| component name | 组件名称，包括直接和关键间接依赖 |
+| version | 实际解析版本，不能只记录需求范围 |
+| supplier / origin | 来源项目、厂商或包仓库 |
+| hash | 构建时使用制品的摘要 |
+| license | SPDX 许可证标识或法律审查记录 |
+| relationship | 组件、产品和打包结果之间的关系 |
+| vulnerability reference | 后续漏洞扫描和影响分析入口 |
+
+首版建议使用 SPDX 或 CycloneDX 的标准 JSON 表达。第三方 FFmpeg、ONNX Runtime、Qt、SQLite、编解码组件和模型文件都应进入组件或资产清单。模型文件即使不是传统软件依赖，也需要记录版本、来源、校验和、许可证/使用授权和适用场景。
+
+许可证治理要区分：
+
+- 项目源代码采用 MIT，不代表所有随包第三方组件都采用相同条款；
+- 编码器、字体、模型、设备 SDK 和二进制 redistribution 的授权必须单独确认；
+- 商业发布前必须保留组件版本、许可证文本和法律/商务确认记录。
+
+### 80.7 签名和哈希验收脚本
+
+```powershell
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory = $true)]
+  [string]$InstallerPath,
+
+  [Parameter(Mandatory = $true)]
+  [string]$ExpectedSha256
+)
+
+$ErrorActionPreference = 'Stop'
+$signature = Get-AuthenticodeSignature -FilePath $InstallerPath
+$hash = Get-FileHash -Path $InstallerPath -Algorithm SHA256
+
+[pscustomobject]@{
+  InstallerPath = $InstallerPath
+  SignatureStatus = $signature.Status
+  SignerCertificate = $signature.SignerCertificate.Subject
+  TimeStamperCertificate = $signature.TimeStamperCertificate.Subject
+  HashAlgorithm = 'SHA256'
+  Hash = $hash.Hash
+  HashMatchesExpected = ($hash.Hash -eq $ExpectedSha256.ToUpperInvariant())
+}
+
+if ($signature.Status -ne 'Valid') {
+  throw 'Installer Authenticode signature is not valid'
+}
+if ($hash.Hash -ne $ExpectedSha256.ToUpperInvariant()) {
+  throw 'Installer SHA256 does not match the release manifest'
+}
+if ($null -eq $signature.TimeStamperCertificate) {
+  throw 'Installer signature has no trusted timestamp'
+}
+```
+
+哈希比较必须使用固定长度、大小写归一后的字符串。安装脚本不得接受网络路径上同名但未验证的 MSI/EXE，也不得因为文件名包含正式版本号就信任该文件。
+
+### 80.8 可重复构建验证
+
+可重复构建的目标是：在相同源码、依赖、工具链和构建参数下，多次构建得到相同或可解释一致的结果。需要重点消除：
+
+- 当前构建机器名称、用户名和路径；
+- 非确定性文件顺序；
+- 构建时间直接写入二进制；
+- 临时目录差异；
+- 编译器版本或补丁不一致；
+- 不同时区导致的输出差异；
+- 代码签名导致的构建前后字节差异。
+
+工程做法：
+
+1. 使用容器化或版本化构建镜像；
+2. 使用统一构建目录和固定时区；
+3. 使用 \`SOURCE_DATE_EPOCH\` 或等价机制固定可复现时间输入；
+4. 对未签名中间产物先比较哈希，再执行签名；
+5. 若哈希不同，输出差异文件、构建环境和依赖解析结果；
+6. 将重复构建记录写入 Release Manifest。
+
+不能把“签名后哈希不同”误判为不可重复；应比较签名前对象，同时分别记录签名后制品哈希。
+
+### 80.9 密钥和签名环境治理
+
+- 签名密钥不得存储在普通工程师个人电脑；
+- CI 的普通构建任务不能直接读取完整私钥；
+- 正式签名需要独立审批或受保护发布阶段；
+- 签名过程记录证书、时间、制品哈希和操作者；
+- 证书轮换、吊销和过期必须有发布响应流程；
+- 开发自签名证书不得与正式商业证书混用。
+
+若正式签名服务暂时不可用，可以完成测试构建和候选包生成，但不得把未签名包标记为 GA，也不允许通过关闭 SmartScreen、要求客户忽略警告来完成正式交付。
+
+### 80.10 供应链故障矩阵
+
+| 故障 | 检测方式 | 处置 |
+| --- | --- | --- |
+| 源码与制品哈希无法关联 | Release Manifest 校验 | 阻断发布 |
+| 依赖哈希不一致 | 依赖解析和锁文件检查 | 重新构建并调查依赖来源 |
+| 安装包签名失效 | Authenticode 验证 | 阻止部署，重新签名或换包 |
+| 签名无时间戳 | 签名证书链检查 | 重新签名 |
+| SBOM 缺少关键组件 | SBOM 校验和打包清单比对 | 阻断法律/安全放行 |
+| 同版本制品被覆盖 | 制品仓库不可变策略 | 发布新版本，记录事故 |
+| 重复构建结果不一致 | 可重复构建比对 | 定位非确定性输入，未解决不得 GA |
+| 构建环境含未知工具 | Runner Inventory | 清理或重建环境 |
+| 第三方组件出现漏洞 | SBOM 与漏洞情报比对 | 评估影响站点并发布补丁 |
+| 现场使用非发布包 | 安装前签名/哈希检查 | 立即停止安装并更换正式包 |
+
+### 80.11 发布门禁
+
+- 正式 GA 安装包必须由受控流水线构建、签名并生成不可变发布记录；
+- Release Manifest、Provenance、SBOM、Release Notes 和 SHA256 必须与版本标签一致；
+- 干净 Windows 虚拟机必须完成安装、启动、卸载或升级冒烟；
+- 关键二进制和恢复工具必须签名；
+- 可重复构建差异必须被修复或给出可审计解释；
+- 客户现场不得安装无法通过签名和哈希验证的“临时包”。
+
+---
+
+## 81. 配置事务、灰度启用与自动回滚
+
+### 81.1 配置错误是高影响、低可见故障
+
+FactoryGuard 的运行依赖摄像机、RTSP、区域、绊线、布防计划、模型绑定、通知渠道、容量阈值和服务策略。配置更新若立即全量生效，一个错误路径、错误时间表或错误通道绑定就可能导致：
+
+- 所有夜间区域不再布防；
+- 通知发送到错误群组或完全不发送；
+- 服务反复重载配置并触发资源抖动；
+- 规则几何引用错误分辨率，告警区域偏移；
+- 子码流路径错误，通道批量离线；
+- 配置覆盖了客户现场的临时例外安排；
+- UI 显示已保存，但后台服务实际未接受该配置。
+
+因此，配置不是普通文件替换，而是一个需要校验、审批、试运行、观察和回滚的事务。生产服务只能读取已提交的配置版本，不得读取半写入文件或正在编辑的临时对象。
+
+### 81.2 配置版本状态机
+
+| 状态 | 含义 | 允许进入下一状态的条件 |
+| --- | --- | --- |
+| Draft | 配置草案，仅在配置工作区存在 | Schema 初步通过 |
+| Validated | 静态校验和引用完整性通过 | 预检开始 |
+| Preflighted | 网络、凭据、码流、通知、存储等预检完成 | 获得审批 |
+| Staged | 新配置已写入待发布区，尚未控制生产链路 | 灰度开始 |
+| Canary | 少量通道或低风险对象按新配置运行 | 观察窗口通过 |
+| Rolling | 按波次扩大到更多通道 | 所有波次健康 |
+| Active | 新配置成为当前生产版本 | 稳定运行 |
+| RollbackPending | 触发自动或人工回滚 | 旧版本恢复完成 |
+| RolledBack | 已恢复上一确认版本 | 生成回滚报告 |
+| Withdrawn | 配置被撤销，不进入生产 | 审计完成 |
+
+任何状态都不得绕过校验直接进入 Active。状态迁移、操作者、原因、时间和校验结果必须写入配置事务记录。
+
+### 81.3 配置事务字段
+
+| 字段 | 说明 |
+| --- | --- |
+| transaction_id | 全局唯一配置事务 ID |
+| base_version | 修改前的配置版本 |
+| target_version | 拟发布版本 |
+| author / approver | 起草人和批准人 |
+| change_summary | 配置变更摘要 |
+| impacted_scope | NVR、通道、规则、通知、时间表等影响范围 |
+| risk_level | low、medium、high、critical |
+| validation_result | 静态校验、预检和测试结果 |
+| canary_policy | 灰度对象、观察时长和成功阈值 |
+| rollback_policy | 自动回滚触发条件和旧版本位置 |
+| decision | active、rolled_back、withdrawn |
+| timestamps | 创建、审批、灰度、激活和回滚时间 |
+
+事务 ID 必须贯穿 UI 请求、服务日志、审计表、通知测试和配置文件，使任何失败都能追溯。
+
+### 81.4 校验层级
+
+| 层级 | 校验内容 | 失败处理 |
+| --- | --- | --- |
+| Syntax/Schema | YAML/JSON 语法、字段类型、枚举、范围 | 阻止保存 Validated |
+| Semantic | ID 唯一性、规则几何、布防时间、通道能力 | 阻止进入预检 |
+| Dependency | NVR、通道、模型、通知、区域引用均存在 | 列出悬空引用 |
+| Security | 密钥引用、ACL、危险调试和外部地址 | 高风险项需更高审批 |
+| Runtime Preflight | RTSP 认证、码流、存储、NTP、Outbox | 单对象失败可隔离，不能全量发布 |
+| Canary | 小范围真实运行指标 | 触发回滚或继续灰度 |
+| Post Activation | 激活后短窗口健康确认 | 异常时自动回滚 |
+
+预检不得修改长期生产状态。测试消息必须带“测试”标识，测试拉流不得占用全部设备并发会话。
+
+### 81.5 原子写入和读取屏障
+
+配置提交流程：
+
+1. 在同一数据卷创建配置事务目录；
+2. 写入完整配置文件、校验结果和变更摘要；
+3. 调用显式 Flush；
+4. 校验文件长度、哈希和 Schema；
+5. 通过同卷原子重命名发布候选版本；
+6. 服务在安全切换点加载新配置；
+7. 加载成功并通过健康确认后更新 current pointer；
+8. 任一阶段失败，current pointer 保持指向旧版本。
+
+配置 current pointer 本身也必须原子更新。后台服务不得通过监听目录变化立即加载文件，只能在受控阶段处理明确的 Activate 请求。
+
+### 81.6 灰度选择和波次策略
+
+| 波次 | 默认范围 | 观察重点 |
+| --- | --- | --- |
+| Canary | 1 条低业务风险、现场可快速确认的通道 | 认证、帧新鲜度、规则触发、通知和日志 |
+| Wave 1 | 25% 非关键通道 | 并发、PTS、资源消耗、误报 |
+| Wave 2 | 50～75% 通道，包含一般生产区域 | 布防计划、模型绑定和通知限流 |
+| Wave 3 | 除关键区域外全部通道 | 全站资源、告警风暴和 Outbox |
+| Final | 围墙、仓库、财务室等关键区域 | 必须确认前序波次稳定后进入 |
+
+关键区域不应作为第一批 Canary，但最终激活前必须单独确认。若配置仅影响非运行期对象，可缩小灰度；若影响全站通知、核心检测或安全策略，应执行完整波次和更高等级审批。
+
+### 81.7 自动回滚触发条件
+
+| 触发条件 | 建议阈值 |
+| --- | --- |
+| 服务无法加载配置 | 首次加载失败即保持旧版本；候选版本标记失败 |
+| 关键通道离线 | Canary 或波次中关键对象因配置变为离线 |
+| 媒体新鲜度恶化 | 新配置导致无帧、冻结或重试次数超过阈值 |
+| 通知失败 | 测试或实际关键通知在观察窗口失败且无备用通道 |
+| CPU/内存越线 | 新配置导致核心资源超过发布预算 |
+| 规则错误 | 几何非法、区域越界或引用不存在对象 |
+| 安全策略冲突 | 权限、ACL、密钥引用或危险网络地址校验失败 |
+| 人工确认风险 | 值班负责人在观察窗口明确拒绝 |
+
+自动回滚必须优先于继续扩大灰度。回滚后不立刻重试同一配置；只有修复草案、重新校验并重新审批后才能生成新事务。
+
+### 81.8 配置提案示例
+
+```yaml
+transaction_id: config-20261007-143000
+base_version: 42
+target_version: 43
+change:
+  type: update_substream_and_notification
+  summary: Adjust channel 01 substream and add backup webhook
+  scope:
+    nvr_ids: [nvr-001]
+    channel_ids: [ch-001]
+    notification_ids: [notify-wecom-security, notify-dingtalk-backup]
+risk_level: medium
+validation:
+  schema_required: true
+  reference_integrity_required: true
+  rtsp_probe_required: true
+  notification_test_required: true
+canary:
+  channel_ids: [ch-001]
+  observe_minutes: 30
+  success:
+    zero_freeze: true
+    no_auth_failure: true
+    notification_success_at_least: 1
+rollout:
+  waves:
+    - channel_ids: [ch-001]
+    - channel_ids: [ch-002, ch-003, ch-004]
+    - all_remaining: true
+      include_critical_after: true
+rollback:
+  strategy: restore_last_known_good
+  max_seconds: 120
+  triggers:
+    freeze_seconds_greater_than: 8
+    critical_notification_failures_greater_than: 0
+    cpu_percent_greater_than: 85
+approval:
+  requested_by: site-operator
+  approved_by: site-owner
+```
+
+### 81.9 配置决策记录
+
+```json
+{
+  "transactionId": "config-20261007-143000",
+  "baseVersion": 42,
+  "targetVersion": 43,
+  "state": "Canary",
+  "startedAt": "2026-10-07T14:30:00+08:00",
+  "canary": {
+    "channelIds": ["ch-001"],
+    "observationEndsAt": "2026-10-07T15:00:00+08:00",
+    "metrics": {
+      "freezeCount": 0,
+      "authFailures": 0,
+      "notificationSuccesses": 1,
+      "cpuMaxPercent": 48.2,
+      "ptsFaults": 0
+    }
+  },
+  "rollback": {
+    "available": true,
+    "lastTrigger": null,
+    "restoredVersion": null
+  },
+  "decision": "continue_rollout"
+}
+```
+
+### 81.10 回滚语义
+
+自动回滚执行以下动作：
+
+1. 停止扩大灰度，冻结新配置写入；
+2. 将受影响通道切回上一确认配置；
+3. current pointer 原子指向旧版本；
+4. 保留候选配置和失败指标，不覆盖现场；
+5. 恢复媒体会话、通知策略和规则状态；
+6. 生成 RolledBack 决策记录并通知负责人。
+
+回滚不能通过删除配置目录、停止服务不恢复或关闭告警来完成。若旧版本也无法工作，系统进入更高等级故障模式，按恢复控制台和业务连续性流程处理。
+
+### 81.11 并发和锁规则
+
+- 同一站点同一时间只能有一个配置事务处于 Staged/Canary/Rolling；
+- Draft 可以保存多个，但激活必须顺序排队；
+- 紧急配置变更需要显式抢占，抢占前记录原因并中止普通灰度；
+- 配置锁必须可超时、可审计，不能留下永久锁；
+- 服务重启后能根据事务状态恢复 Active、RolledBack 或继续等待人工决定。
+
+任何锁都必须包含 owner、created_at、purpose 和 expires_at。服务发现过期锁后，只允许在确认没有活跃写入时清理，并写入审计。
+
+### 81.12 配置故障测试矩阵
+
+| 测试 | 操作 | 通过标准 |
+| --- | --- | --- |
+| 草案语法错误 | 保存错误 YAML/JSON | 不进入 Validated，不影响 Active |
+| 悬空引用 | 引用不存在模型或通道 | 校验失败并列出对象 |
+| 写一半断电 | 写入候选配置时强制断电 | current pointer 仍指向旧版本 |
+| Canary 冻结 | 让灰度通道使用错误子码流 | 自动回滚，旧通道恢复 |
+| 通知错误 | 灰度通知 Webhook 返回失败 | 不扩大范围，触发备用或回滚 |
+| 波次资源超限 | 灰度配置增加帧率和通道并发 | CPU/内存阈值触发，停止发布 |
+| 并发配置 | 同时发起两个激活请求 | 只允许一个事务，另一个明确排队或拒绝 |
+| 服务重启 | Canary 中重启服务 | 状态可恢复，不静默激活错误配置 |
+| 紧急抢占 | 高优先级安全配置进入 | 普通灰度中止并审计 |
+| 回滚失败 | 旧配置文件损坏 | 进入恢复控制台，不显示 Active |
+| 人工撤销 | Canary 前撤回配置 | 状态 Withdrawn，生产无变化 |
+| 关键区域误配 | Final 波次使用错误规则 | 关键区域不得激活，整体回滚 |
+
+### 81.13 发布门禁
+
+- 配置必须版本化、事务化，禁止直接覆盖 active 文件；
+- 没有 Schema、引用、预检、审批和灰度证据，不得激活；
+- Canary 和各波次必须有观察指标和自动回滚阈值；
+- 配置 current pointer 必须原子更新；
+- 同一站点不得并发执行多个激活事务；
+- 回滚必须恢复上一确认版本并生成审计证据。
+
+---
+
+## 82. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 80.1 平台与可靠性资料
+### 82.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -10220,6 +10709,11 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | Windows Event Log：ReportEventW | 经典事件日志写入和服务级告警参考 |
 | NSIS Users Manual / Scripting Reference | 安装页面、Section、静默安装和提权级别 |
 | Microsoft Learn：SignTool / Get-AuthenticodeSignature | 安装包和二进制签名校验 |
+| SLSA Specification | 构建 provenance、供应链完整性和发布证明参考 |
+| SPDX Specification | SBOM、组件标识、许可证和软件包关系表达 |
+| CycloneDX Specification | SBOM、组件风险、依赖关系和漏洞关联参考 |
+| in-toto | 软件供应链步骤、授权和产物完整性框架 |
+| Reproducible Builds：Definition / SOURCE_DATE_EPOCH | 可重复构建定义、非确定性输入和统一时间戳参考 |
 | Microsoft Learn：System Error Codes | 平台错误码和上游错误映射参考 |
 | Microsoft Learn：Performance Counters Portal | Windows 性能计数器和容量复核 |
 | Microsoft Learn：Windows Error Reporting | 崩溃报告、转储和错误生命周期 |
@@ -10315,7 +10809,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | ONVIF Profile S Specification | IP 视频设备、媒体配置和 GetStreamUri 能力参考 |
 | ISA/IEC 62443 series | 工业控制系统安全分区、供应商和运维安全参考 |
 
-### 80.2 视频与设备协议资料
+### 82.2 视频与设备协议资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -10325,7 +10819,7 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 | GB/T 28181 相关公共安全视频监控联网标准 | 二期平台级联和协议扩展预研 |
 | GA/T 1400 相关公共安全视频图像信息系统标准 | 二期视图库、事件对象和平台对接预研 |
 
-### 80.3 主要链接
+### 82.3 主要链接
 
 - https://learn.microsoft.com/en-us/windows/win32/services/service-programs
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w
@@ -10407,6 +10901,13 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 - https://nsis.sourceforge.io/Docs/
 - https://nsis.sourceforge.io/Docs/Chapter4.html
 - https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool
+- https://slsa.dev/spec/v1.1/
+- https://slsa.dev/spec/v1.1/distributing-provenance
+- https://spdx.dev/use/specifications/
+- https://cyclonedx.org/docs/1.5/
+- https://in-toto.io/
+- https://reproducible-builds.org/docs/definition/
+- https://reproducible-builds.org/docs/source-date-epoch/
 - https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/get-authenticodesignature
 - https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes
 - https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-
@@ -10517,6 +11018,16 @@ $recentServiceEvents = Get-WinEvent -FilterHashtable @{
 - **日志背压**：当日志产生速度超过写入能力时，通过有界队列、采样和丢弃计数阻止内存无限增长。
 - **诊断包 Manifest**：记录诊断包文件范围、哈希、脱敏规则、采集时间和审批信息的清单文件。
 - **脱敏（Redaction）**：移除或替换日志、配置和诊断材料中的密码、令牌、Cookie、联系方式等敏感信息。
+
+
+- **SBOM（Software Bill of Materials，软件物料清单）**：记录软件组件、版本、来源、许可证、依赖关系和哈希的清单。
+- **Provenance（构建来源证明）**：说明软件制品由哪个源码、构建平台和构建流程生成的证据。
+- **可重复构建（Reproducible Build）**：在相同输入和工具链下多次构建得到一致结果，用于证明制品可由源码重建。
+- **Authenticode**：Windows 平台用于验证二进制发布者、文件完整性和签名时间信息的代码签名机制。
+- **配置事务（Configuration Transaction）**：将配置草案、校验、审批、灰度、激活和回滚作为原子工作流管理。
+- **Canary（金丝雀发布）**：先让少量低风险对象使用新版本或配置，通过观察后再逐步扩大范围。
+- **Last Known Good Configuration**：最近一次经过验证并可安全回退的配置版本。
+- **配置锁**：防止同一站点多个配置激活过程并发修改生产状态的受控锁。
 
 ## 附录：术语
 
