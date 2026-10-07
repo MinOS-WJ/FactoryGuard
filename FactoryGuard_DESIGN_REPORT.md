@@ -1,8 +1,8 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v3.1
+> 文档版本：v3.2
 > 成文日期：2026-10-07
-> 文档状态：立项稿（FMEA/FTA、安全内核、供应链证明与 Windows 可靠性增强版）
+> 文档状态：立项稿（电源兜底、硬件看门狗、WinRE、持续故障注入与 Windows 可靠性增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
 > v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
@@ -17,6 +17,7 @@
 > v2.9 增补：结构化 JSONL、序列号、日志背压、审计写入、日志滚动、脱敏、诊断包 manifest、证据哈希和导出失败演练。
 > v3.0 增补：可重复构建、Authenticode 签名、SBOM/Provenance、软件供应链证明，以及配置事务、灰度发布、自动回滚和配置并发锁。
 > v3.1 增补：Windows 可靠性 FMEA/FTA、故障覆盖矩阵、最小割集、本地安全内核、证据优先级和统一状态裁决。
+> v3.2 增补：UPS/异常断电一致性、硬件看门狗、独立失联探测、WinRE/裸机救援、自动化故障注入和持续可靠性证据。
 
 ---
 
@@ -816,7 +817,7 @@ factoryguard/
 | --- | --- | --- |
 | 夜间误报（飞虫、树影、反光、动物） | 产品可信度下降 | person 过滤、区域几何、多帧确认、角度整改、试点样本调优 |
 | NVR RTSP 并发或子码流限制 | 无法全量分析 | 选型前置、品牌模板、能力探测、必要时直连摄像机子网 |
-| 真机方言差异 | 交付延期 | 兼容性矩阵、实施前 POC、GB28181 后置 |
+| 真机方言差异 | 交付延期 | 兼容性矩阵、到货兼容性核验、GB28181 后置 |
 | Windows 服务/用户会话隔离复杂 | 开机不可靠、UI 连接失败 | M0 Spike、命名管道 ACL、无人登录重启测试 |
 | GPU 驱动不稳定 | 推理崩溃或漏检 | Warmup、熔断、CPU 降级、驱动版本清单 |
 | 无独显性能不足 | 延迟或漏检 | 降帧、容量测试、明确最低硬件要求 |
@@ -11149,11 +11150,644 @@ outputs:
 
 ---
 
-## 84. 行业资料与标准依据
+## 84. Windows 电源、休眠、唤醒、UPS 与异常断电一致性
+
+### 84.1 电源不是外围条件，而是数据一致性对象
+
+FactoryGuard 的核心价值是布防期持续检测并形成可信事件。若 Windows 主机在数据库事务、片段写入、通知发送或升级过程中断电，即使进程看门狗和崩溃恢复设计完善，也可能出现数据库页不一致、片段只有文件头、Outbox 重复通知、错误的 Running 状态等问题。因此，电源策略、UPS、安全关机、脏关机识别和启动恢复必须作为 v1.0 的一组工程对象，而不是采购清单中的一句“配 UPS”。
+
+本章节的目标不是承诺停电绝不发生，而是保证：
+
+- 主机不会因错误电源策略进入睡眠、混合睡眠或不可预期低功耗；
+- UPS 在市电中断时提供足够且可验证的安全关机时间；
+- 已提交的事件、裁决和证据不丢失；未提交的媒体临时文件可识别并可清理；
+- 通知、状态迁移和 Outbox 任务具备幂等键，不会因断电补发为多条事件；
+- 脏关机后系统不会直接显示 Running，必须完成一致性审计；
+- 每台交付主机都保留电源策略、UPS 自检、断电演练和恢复结果证据。
+
+### 84.2 电源故障模型
+
+| 故障/异常 | 典型表现 | 直接风险 | 必须采取的控制 |
+| --- | --- | --- | --- |
+| 市电中断 | UPS 转电池，交换机/NVR/主机运行时间不同 | 主机仍在但网络设备先掉电，形成假 Running | UPS 负载统一核算；设备供电关系入图 |
+| UPS 电池老化 | 自检通过但实际续航显著缩短 | 安全关机未完成 | 负载测试、电池日期、更换阈值 |
+| 长时间停电 | UPS 电量耗尽或触发关机 | 来电后启动状态不确定 | BIOS AC Recovery、启动一致性审计 |
+| 电压暂降/浪涌 | 设备重启、网卡链路抖动、磁盘 I/O 错误 | 多设备共同原因故障 | UPS 稳压/浪涌保护，独立配电 |
+| USB/串口监控丢失 | 系统不知道 UPS 电量 | 低电量无法安全关机 | NMC 或独立监控；通信丢失告警 |
+| 错误睡眠策略 | 主机进入 Sleep/Hybrid Sleep | 布防中断、心跳跳变 | 禁用交流供电下睡眠、休眠和混合睡眠 |
+| 快速启动 | 关机并非完整内核重启 | 驱动/网卡/时间状态异常 | 关闭休眠与 Fast Startup，使用重启初始化 |
+| 强制断电 | Kernel-Power 41、6008 事件 | 写一半文件、数据库 WAL 状态不确定 | 事务、原子写、启动恢复和断电演练 |
+| Windows Update 重启 | 维护窗口外自动重启 | 检测中断、状态不一致 | 更新环、活动时间、审批和重启门禁 |
+| 唤醒后时钟跳变 | QPC 与墙钟差距异常 | 片段定位、证据时间和超时误判 | Resume 事件、时钟复核、会话重建 |
+
+### 84.3 Windows 电源策略基线
+
+交流供电场景必须满足：
+
+1. 电源计划为“高性能”或客户安全策略批准的等效自定义计划；
+2. 接通交流电时：关闭睡眠、混合睡眠、休眠、硬盘空闲停转；
+3. 显示器可在 5～10 分钟后关闭，但不能触主机睡眠；
+4. USB 选择性暂停默认关闭；
+5. PCI Express ASPM 默认关闭；若驱动或固件要求启用，必须完成 RTSP、GPU 和 72 小时长稳回归；
+6. 网卡“允许计算机关闭此设备以节约电源”必须取消；
+7. 电源按钮和睡眠按钮不得触发 Sleep；可设置为“不采取任何操作”或“关机”需明确客户制度；
+8. 禁用 Hibernate 和 Fast Startup；确需保留 `hiberfil.sys` 时必须说明依据并复测；
+9. Windows Update 不得在布防时间自动重启；重启只发生在批准维护窗口；
+10. BIOS/UEFI 中设置上电恢复策略为“Power On”或客户批准的“Last State”。
+
+推荐基线命令如下，实际执行必须由管理员或安装器在客户安全策略允许范围内完成：
+
+```powershell
+# 使用高性能方案；如客户域策略要求自定义方案，应先导入并核验方案 GUID。
+powercfg.exe /setactive SCHEME_MIN
+
+# 接通交流电时不睡眠、不休眠、不停硬盘；显示器可关闭。
+powercfg.exe /change standby-timeout-ac 0
+powercfg.exe /change hibernate-timeout-ac 0
+powercfg.exe /change disk-timeout-ac 0
+powercfg.exe /change monitor-timeout-ac 10
+
+# 关闭休眠与依赖 hiberfil.sys 的 Fast Startup。
+powercfg.exe /hibernate off
+
+# 输出当前方案和未完成的电源请求，供证据包记录。
+powercfg.exe /getactivescheme
+powercfg.exe /requests
+```
+
+### 84.4 UPS 容量、负载映射和电池治理
+
+UPS 不能只按标称 VA 选择。采购和勘察时必须记录：
+
+| 字段 | 验收要求 |
+| --- | --- |
+| 负载对象 | Windows 主机、PoE 交换机、NVR、网关/路由器、必要的显示器或门禁设备 |
+| 实际功率 | 使用设备铭牌和 UPS 管理接口双重记录，按 W 和 VA 同时核算 |
+| 功率因数 | 不按峰值 VA 简单相加，保留至少 30% 负载余量 |
+| 目标续航 | 默认满足安全关机并保留不少于 5 分钟余量；高风险站点按停电策略另行设计 |
+| 电池年龄 | 记录安装日期、序列号、自检日期、负载测试日期和更换日期 |
+| 通信方式 | USB/串口/NMC；通信丢失必须产生本地诊断事件 |
+| 独立告警 | 高风险站点建议启用 NMC 邮件/Webhook/网管平台告警 |
+| 供电关系 | 标明哪些设备在同一 UPS、哪些设备会先于主机关机 |
+
+安全关机阈值不得设置到电池耗尽。默认建议在“剩余预计可运行时间 <= 8 分钟”或“电量 <= 35%”时进入受控关机，具体阈值以实测关机耗时为准。关机过程必须为 SQLite checkpoint、证据文件关闭和事件日志保留至少 2 分钟余量。
+
+当主机接入 UPS 但 PoE 交换机或网关未接入同一 UPS 时，系统应将其识别为降级架构：摄像机会先于主机离线，FactoryGuard 只能证明主机在线，不能证明完整检测链路在线。
+
+### 84.5 受控关机阶段
+
+服务通过 `RegisterServiceCtrlHandlerExW` 处理停止、关机、电源事件和参数变化。关机必须有阶段边界和超时，不允许在关闭路径等待无限网络响应。
+
+| 阶段 | 最大建议耗时 | 必须完成的动作 |
+| --- | --- | --- |
+| P1 冻结变更 | 2 秒 | 拒绝新配置激活、模型切换和非关键维护任务 |
+| P2 停止取新流 | 10 秒 | 停止新帧拉取，保留当前事件裁决 |
+| P3 刷入事务 | 15 秒 | 完成关键 SQLite 事务，Outbox 保留幂等键 |
+| P4 关闭媒体 | 15 秒 | RTSP TEARDOWN、FFmpeg 子进程退出、临时片段登记 |
+| P5 关闭数据库 | 10 秒 | WAL checkpoint 或按策略保留 WAL，关闭句柄 |
+| P6 写入关机标记 | 5 秒 | 写入 boot epoch、关机原因、版本和摘要 |
+| P7 进程退出 | 3 秒 | SCM 收到 STOPPED，释放 Job Object |
+
+关机标记必须与业务数据使用同一套完整性保护，至少包含 boot ID、版本、配置版本、数据盘 UniqueId、关机原因、时间戳和单调序号。若标记未持久化，下一次启动按脏关机处理，不得推断为正常关机。
+
+### 84.6 脏关机启动恢复
+
+启动时安全内核先进入 `Recovering`，只有恢复全部通过后才能进入 Running 或受控 Degraded。恢复动作包括：
+
+1. 读取 Windows Kernel-Power、Event Log 和 UPS 事件，判断上次关机原因；
+2. 校验关机标记是否存在、是否属于当前数据盘和当前 boot；
+3. 执行 SQLite `PRAGMA integrity_check`，按需执行快速检查和 WAL 恢复；
+4. 校验关键目录 Manifest，识别 0 字节、缺失尾部、无索引的临时媒体；
+5. 扫描 Outbox，使用 event_id、notification_key 和 receiver 去重；
+6. 对未完成配置事务执行 Last Known Good 回滚；
+7. 重新建立 RTSP 会话，不把旧会话状态当作活会话；
+8. 将恢复过程、耗时和遗留风险写入事件日志与诊断包。
+
+常用系统事件包括：Kernel-Power 41（异常重启/断电）、EventLog 6008（非正常关机）、Kernel-General 12/13（系统启动/关机）。这些事件只能作为线索，不能单独证明业务数据已经一致；最终结论必须来自数据库、文件 Manifest 和恢复审计。
+
+### 84.7 电源审计脚本示例
+
+```[powershell]
+$ErrorActionPreference = 'Stop'
+$result = [ordered]@{
+  collectedAt = (Get-Date).ToString('o')
+  activeScheme = (& powercfg.exe /getactivescheme) -join "`n"
+  requests = (& powercfg.exe /requests) -join "`n"
+}
+try {
+  $win32Battery = Get-CimInstance -ClassName Win32_Battery -ErrorAction Stop |
+    Select-Object DeviceID,BatteryStatus,EstimatedChargeRemaining,Name
+  $result.battery = $win32Battery
+} catch {
+  $result.battery = 'No Win32_Battery device or UPS driver interface unavailable'
+}
+$result | ConvertTo-Json -Depth 5
+```
+
+说明：普通 UPS 是否通过 `Win32_Battery` 暴露取决于驱动和厂商软件。没有接口时不得编造电量，应以 UPS 面板/NMC 记录和人工签字作为补充证据。
+
+### 84.8 电源故障测试矩阵
+
+| 编号 | 场景 | 注入方式 | 通过标准 |
+| --- | --- | --- | --- |
+| PWR-01 | 空闲时市电中断 | 拔 UPS 输入，到达阈值后恢复 | 事件可追溯，无睡眠，设备自动恢复 |
+| PWR-02 | 检测中断电 | 事件裁决后立即断电 | 已提交事件不丢失，未确认状态可恢复 |
+| PWR-03 | SQLite 写入中断电 | 事务进行中关闭排插 | integrity_check 通过，无重复业务事件 |
+| PWR-04 | 媒体写入中断电 | 片段写入中断电 | 临时片段被隔离或可修复，索引不错误引用 |
+| PWR-05 | 通知发送中断电 | Outbox 发送前后分别断电 | 幂等键保证接收方只形成一次有效通知 |
+| PWR-06 | 低电量安全关机 | 实验室负载或 UPS 测试模式触发 | 在超时前完成关机，标记完整 |
+| PWR-07 | UPS 通信丢失 | 断开 USB/网线 | 产生通信丢失告警，不显示虚假电量 |
+| PWR-08 | 错误睡眠策略 | 临时设置短睡眠超时后唤醒 | 能检测 Resume、重建会话并产生审计 |
+| PWR-09 | 长时间停电 | 等待完全关机后再上电 | BIOS 自动上电，服务进入 Recovering |
+| PWR-10 | 电压暂降 | UPS 测试模式或实验室电源设备 | 主机、NVR、交换机状态一致，无共同重启 |
+
+### 84.9 发布门禁
+
+- 无 UPS 容量核算、实际负载记录和电池自检证据，不允许上线；
+- 未完成交流电源睡眠、休眠、Fast Startup 和网卡省电核验，不允许上线；
+- 未完成至少一次写入中断电恢复测试，不允许发布；
+- 脏关机后若系统未经恢复审计即显示 Running，视为阻断缺陷；
+- 已提交事件丢失或通知重复且无法通过幂等键消除，视为阻断缺陷。
+
+---
+
+## 85. 硬件看门狗、独立存活探测与主机级失联兜底
+
+### 85.1 软件看门狗无法覆盖操作系统级失活
+
+FactoryGuard 内部必须有线程、流水线、supervisor 和 SCM 多层看门狗，但它们都运行在同一台 Windows 主机上。以下场景中，进程列表仍可能存在，内部看门狗却无法可靠动作：
+
+- Windows 内核 DPC/中断风暴导致调度长期停止；
+- 存储栈挂起，所有写线程阻塞，看门狗无法持久化证据；
+- supervisor 主线程死锁，而独立心跳线程仍在“喂狗”；
+- GPU 驱动超时导致整个用户会话卡顿；
+- 恶意或错误驱动占用 CPU，用户态服务无法获得执行时间；
+- 主机网络栈异常，外部无法访问但本地日志无法外发；
+- 电源/主板硬件挂死，SCM 和应用恢复均无法执行。
+
+因此，v1.0 必须区分“应用自恢复”和“主机级失联兜底”。关键值守主机应采购带硬件看门狗的工业主机/看门狗卡，或使用独立网络看门狗、智能 PDU、UPS NMC 等外部设施进行受控复位。没有这些机制时，只能承诺进程崩溃恢复，不能宣称主机级故障可自动恢复。
+
+### 85.2 分层看门狗架构
+
+| 层级 | 监测对象 | 动作 | 覆盖边界 |
+| --- | --- | --- | --- |
+| L1 组件看门狗 | 解码器、推理、规则、媒体、发送器 | 重启组件，丢弃/补偿任务 | 组件卡死或崩溃 |
+| L2 supervisor | 子进程、Job Object、心跳和队列 | 重建子进程、降级、隔离 | supervisor 仍可调度 |
+| L3 SCM | Windows 服务主进程 | 服务重启、失败计数 | 服务退出且 OS 正常 |
+| L4 硬件看门狗 | 主机是否按时 pet | 硬复位或电源周期 | OS/驱动/主板级挂死 |
+| L5 独立外部探测 | 网络存活、媒体新鲜度、UPS/PDU 状态 | 升级告警，满足条件时电源复位 | 主机不可访问或失联 |
+
+L4 是可靠性兜底，不应用普通定时器线程伪造。心跳推进必须来自核心检测链路的真实进展。
+
+### 85.3 心跳证据契约
+
+心跳不是简单的“服务还活着”。至少包含：
+
+```json
+{
+  "schemaVersion": "1.0",
+  "siteId": "site-001",
+  "hostId": "win-guard-01",
+  "bootId": "2026-10-07T09:00:00Z-7f3a",
+  "heartbeatSeq": 18234,
+  "state": "Running",
+  "stateVersion": 129,
+  "observedAt": "2026-10-07T10:30:00+08:00",
+  "qpcTicks": 1298374921,
+  "lastFrameAgeMs": 180,
+  "oldestDetectionQueueAgeMs": 420,
+  "outboxPending": 2,
+  "dbLastCommitAt": "2026-10-07T10:29:59+08:00",
+  "dataDiskUniqueId": "DISK-SN-AB12",
+  "evidenceLevel": "strong",
+  "maintenanceLock": null
+}
+```
+
+心跳规则：
+
+- 心跳只能在“帧输入→裁决→事务写入”关键路径确认推进后更新；
+- 单独线程定时写 `alive=true` 不允许作为喂狗依据；
+- Running 状态默认 15 秒无强证据即 Late；Recovering 可放宽到 60 秒；Degraded 为 30 秒；
+- 媒体帧老化、Outbox 堵塞、数据库提交失败时，即使进程存在，也不得继续按 Nominal 喂狗；
+- 维护窗口必须设置带审批人和过期时间的 maintenance lock；过期后自动恢复看门狗动作。
+
+### 85.4 硬件看门狗动作策略
+
+推荐顺序：
+
+1. 工业主机硬件看门狗由 FactoryGuard watchdog bridge 通过厂商驱动/设备接口 pet；
+2. watchdog bridge 只接受 supervisor 的强证据，不直接接受 UI 或普通定时器；
+3. 超时后硬件先尝试本地硬复位；
+4. 第二次仍无法保持心跳，则通过智能 PDU/UPS 可控输出口执行完整断电再上电；
+5. 连续 3 次启动后未能在限定时间进入 Running，则进入 latch，不再无限重启，同时升级到现场负责人和支持人员。
+
+默认阈值需要经现场实测：
+
+| 参数 | 建议初值 | 调整原则 |
+| --- | --- | --- |
+| Running 心跳超时 | 45～90 秒 | 长于短暂抖动，短于安全响应可接受时间 |
+| 复位前等待 | 2 个心跳周期 | 避免摄像机短时离线造成硬复位 |
+| 启动就绪宽限 | 5 分钟 | OS 更新后恢复、数据盘检查可单独审批延长 |
+| 硬复位次数 | 2 次/小时 | 超过后 latch，防止复位风暴 |
+| 维护锁最长有效期 | 8 小时 | 到期自动恢复，必须重新审批 |
+| 外部通知延迟 | 2 分钟 | 主机级失联应比普通告警更早升级 |
+
+### 85.5 独立网络探测的证据要求
+
+外部探测器不能只 ping IP 后就重启主机。自动硬复位至少需要两个独立条件，例如：
+
+- ICMP/TCP 连续不可达，同时业务心跳端口无响应；
+- 管理口不可达，同时交换机端口无链路或错误计数器快速增长；
+- 心跳 API 超时，同时 NVR/交换机仍能证明局域网其他设备正常；
+- UPS/PDU 显示主机功耗异常，同时网络心跳停止。
+
+若只有单一 ping 失败，应产生升级告警并进入确认窗口，避免网线断开、交换机故障或防火墙变更导致误复位。高风险站点可将外部探测器部署在独立电源和独立网络路径上，但必须限制其管理接口，不开放公网。
+
+### 85.6 看门狗状态机
+
+```text
+Nominal
+  ├─ 强心跳超时 → Late
+  ├─ 维护锁有效 → Suppressed（只告警，不硬复位）
+  └─ 进入 Degraded → Nominal/Degraded（继续要求证据）
+Late
+  ├─ 恢复强心跳 → Nominal
+  ├─ 达到硬复位阈值 → ResetPending
+  └─ 维护锁生效 → Suppressed
+ResetPending
+  ├─ 硬复位成功且启动 → RecoveringBoot
+  ├─ 电源周期成功 → RecoveringBoot
+  └─ 动作失败/次数超限 → Latched
+RecoveringBoot
+  ├─ 就绪门禁通过 → Nominal
+  └─ 启动超时 → ResetPending（计数）
+Latched
+  └─ 授权解除 → ResetPending 或 Maintenance
+```
+
+### 85.7 测试矩阵
+
+| 编号 | 场景 | 通过标准 |
+| --- | --- | --- |
+| WDT-01 | 杀死子进程 | L2 重建，不触发硬复位 |
+| WDT-02 | 杀死服务 | SCM 重启，启动恢复完整 |
+| WDT-03 | 阻塞核心流水线但保留心跳线程 | 不得继续 pet，硬件看门狗进入 Late |
+| WDT-04 | 暂停虚拟机模拟 OS 挂死 | 硬件/外部看门狗超时后复位 |
+| WDT-05 | 磁盘 I/O 挂起 | 状态被识别，不能靠 UI 自报告恢复 |
+| WDT-06 | 维护锁窗口 | 不自动复位，但保留倒计时和审计 |
+| WDT-07 | 维护锁过期 | 自动恢复监测，不需人工重启服务 |
+| WDT-08 | 连续启动失败 | 达到次数后 latch，不产生重启风暴 |
+| WDT-09 | 仅 ping 不通 | 告警升级，不满足条件不硬复位 |
+| WDT-10 | 外部探测器掉电 | 主机不受影响，探测器自身产生离线告警 |
+| WDT-11 | BIOS/硬件复位原因读取 | 复位原因、次数和 boot ID 可追溯 |
+
+### 85.8 发布门禁
+
+- 硬件无看门狗能力且无独立外部复位设施，不得在报告中承诺主机级自动恢复；
+- 心跳由无关线程或 UI 进程触发，视为阻断缺陷；
+- 自动复位无次数上限、无维护锁、无 latch，视为阻断缺陷；
+- 未模拟核心流水线死锁并验证复位链路，不允许发布；
+- 所有硬复位必须能从下一次启动记录中关联到复位原因和恢复结果。
+
+---
+
+## 86. Windows 恢复环境、启动故障与裸机救援
+
+### 86.1 应用回滚不能替代操作系统救援
+
+即使安装包、数据库和配置都能回滚，Windows 仍可能因以下原因无法进入系统：
+
+- EFI 系统分区损坏或 Boot Configuration Data 错误；
+- 驱动更新导致 `INACCESSIBLE_BOOT_DEVICE`、启动循环或蓝屏；
+- Windows 质量/功能更新中断电；
+- BitLocker 等待恢复密钥；
+- 注册表、系统文件或磁盘元数据损坏；
+- 安全策略错误导致管理员无法交互登录；
+- 系统盘 SMART/介质故障；
+- 恶意软件或错误清理工具删除恢复分区。
+
+v1.0 必须同时准备应用恢复、WinRE 恢复、外部介质恢复和冷备主机方案，不能把“重装系统”作为唯一兜底。
+
+### 86.2 分区与恢复环境基线
+
+推荐生产主机满足：
+
+- UEFI 启动，Secure Boot 按客户策略启用并记录；
+- EFI 系统分区、MSR、Windows 分区、WinRE 分区和业务数据分区职责清晰；
+- 业务数据独立于系统盘或至少独立卷，系统救援不得默认格式化数据盘；
+- WinRE 已启用且镜像注册正确；
+- 恢复分区不被手工删除、压缩或用于普通文件存储；
+- 启动盘、分区布局和恢复环境状态纳入验收证据；
+- BitLocker 恢复密钥已托管并经过可用性验证。
+
+常用核验命令：
+
+```powershell
+# WinRE 状态与恢复镜像位置
+reagentc.exe /info
+
+# 启动项与启动配置（管理员）
+bcdedit.exe /enum
+
+# 磁盘和分区布局
+Get-Disk | Select-Object Number,FriendlyName,PartitionStyle,OperationalStatus,BootFromDisk
+Get-Partition | Select-Object DiskNumber,PartitionNumber,DriveLetter,Type,GptType,Size
+
+# Secure Boot 状态
+Confirm-SecureBootUEFI
+```
+
+### 86.3 启动故障处置顺序
+
+处置必须遵循“先保全证据和数据，再修复系统”的顺序：
+
+1. 记录屏幕错误码、停止代码、启动阶段和照片/视频；
+2. 确认 UPS、磁盘、电源、固件近期是否发生变化；
+3. 进入 WinRE，收集启动修复和更新失败日志；
+4. 判断是否涉及 BitLocker，使用已托管恢复密钥，不现场猜测；
+5. 优先执行启动修复、驱动回退、卸载问题更新、系统还原点等低破坏操作；
+6. 若需要修复 BCD/EFI，必须确认目标磁盘和 EFI 分区，禁止对未知磁盘执行写入；
+7. 系统盘介质故障时，直接切换冷备主机或执行裸机恢复；
+8. 恢复完成后先进入隔离状态，确认服务、数据盘身份、数据库和证据完整后再恢复生产；
+9. 形成启动故障 RCA，更新驱动/补丁基线。
+
+### 86.4 外部恢复介质和现场封存包
+
+每个站点至少保存一份可离线使用的恢复包：
+
+| 物料 | 内容 |
+| --- | --- |
+| Windows 安装/修复 USB | 与部署版本匹配，记录版本和哈希 |
+| 驱动包 | 网卡、显卡/GPU、芯片组、存储控制器、UPS、看门狗、RAID/HBA |
+| 固件资料 | BIOS/UEFI 版本、设置截图、升级说明和恢复默认值 |
+| 授权信息 | Windows 授权信息、设备资产编号；BitLocker 密钥不得明文放在现场 |
+| 网络配置 | IP、VLAN、网关、摄像机/NVR 地址表 |
+| 安装包 | FactoryGuard 指定版本、签名、哈希和回滚版本 |
+| 冷备流程 | 数据盘挂载、ACL、服务恢复、验收步骤 |
+| 签收记录 | 介质领用、归还、复制、销毁和审批记录 |
+
+恢复 USB 必须物理封存并限制复制，不得长期插在主机上，避免被勒索软件或未授权人员利用。
+
+### 86.5 黄金镜像与裸机恢复
+
+黄金镜像应记录：
+
+- Windows 主版本、OS Build、累积更新和语言区域；
+- 内置驱动、GPU 驱动、Visual C++/.NET 等运行时；
+- 服务账户、本地策略、防火墙、Defender、WDAC/AppLocker 基线；
+- FactoryGuard 版本或安装引导版本；
+- 镜像制作时间、制作者、签名/哈希和适用硬件清单；
+- Sysprep/部署方式及首次启动后的必做变更。
+
+裸机恢复不得自动清理数据盘。恢复完成后必须重新登记数据盘 UniqueId、挂载路径、ACL 和容量水位。只有当数据盘也被证明不可恢复时，才允许按备份恢复流程处理，并需客户书面授权。
+
+默认工程目标：冷备主机加数据盘挂载后 4 小时内恢复核心检测；无冷备主机的裸机重建在物料齐备时 8 小时内恢复。该指标应写入实施和服务条款，超时时按升级流程处理。
+
+### 86.6 BitLocker 与恢复密钥控制
+
+- 系统盘和数据盘启用 BitLocker 前必须先完成密钥托管；
+- 密钥托管应至少有两名授权角色可按流程获取，但不能公开张贴；
+- BIOS/UEFI、Secure Boot、关键启动配置变更前，按维护流程短暂挂起保护，完成后立即恢复；
+- 更换主板、网卡、存储控制器或调整启动项前必须预判恢复密钥请求；
+- 每季度验证一次恢复密钥可用性，但不得在生产主机上做破坏性测试；
+- 不允许在恢复 USB 明文保存恢复密钥。
+
+### 86.7 NTFS dirty、坏扇区与在线检查
+
+系统盘或数据盘异常后，不应直接对生产卷执行破坏性修复。默认顺序：
+
+1. 查询卷 dirty bit 和事件日志；
+2. 在线执行只读扫描或 `chkdsk /scan`；
+3. 复核 SMART、介质错误、重分配扇区、I/O retry 和事件 ID；
+4. 有备份或快照后，在维护窗口执行修复；
+5. 若磁盘身份不明，先隔离，不允许“修复后继续用”；
+6. 对 ReFS 卷使用其在线完整性和 salvage 机制，但仍需备份验证。
+
+参考命令：
+
+```powershell
+fsutil.exe dirty query C:
+chkdsk.exe C: /scan
+```
+
+### 86.8 启动故障决策矩阵
+
+| 现象/代码 | 优先判断 | 首选动作 | 禁止动作 |
+| --- | --- | --- | --- |
+| BitLocker recovery | 启动项/固件/硬件变化 | 使用托管密钥，进入后复核保护 | 猜测密钥、重装系统 |
+| `0xc000000e` | BCD/EFI 异常 | WinRE 启动修复，确认目标磁盘后修复 BCD | 对多磁盘主机盲目写入 bootrec |
+| INACCESSIBLE_BOOT_DEVICE | 存储驱动/控制器模式变化 | 驱动回退、恢复旧固件模式 | 删除数据分区 |
+| 更新后启动循环 | 质量更新或驱动不兼容 | WinRE 卸载更新，回退驱动 | 未备份就继续功能更新 |
+| 无可用启动设备 | 系统盘掉盘/故障 | 检查磁盘和线缆，切换冷备 | 格式化未知磁盘 |
+| WinRE 不可用 | 恢复分区损坏 | 使用外部恢复介质 | 跳过恢复验证继续上线 |
+| 磁盘 SMART 告警 | 介质寿命/坏块 | 备份、更换、恢复验证 | 只清除告警 |
+
+### 86.9 恢复演练矩阵
+
+| 编号 | 演练 | 频率 | 通过标准 |
+| --- | --- | --- | --- |
+| REC-01 | reagentc 状态核验 | 上线/每月健康检查 | WinRE enabled，位置可追溯 |
+| REC-02 | 修复 USB 启动 | 季度 | 可进入修复环境，版本匹配 |
+| REC-03 | BitLocker 密钥取回 | 季度 | 授权流程可在目标时间内完成 |
+| REC-04 | BCD 修复 | 发布前实验环境 | 修复后可启动且数据盘不变 |
+| REC-05 | 冷备主机切换 | 半年 | 核心检测在目标时间内恢复 |
+| REC-06 | 裸机镜像恢复 | 半年/重大镜像更新后 | 服务可启动，证据链完整 |
+| REC-07 | 系统盘故障更换 | 年度 | 数据盘未被误格式化，RCA 完整 |
+
+### 86.10 发布门禁
+
+- `reagentc /info` 无法证明 WinRE 可用，且没有外部恢复介质，不允许上线；
+- BitLocker 启用但密钥未托管，不允许上线；
+- 未在实验环境完成启动修复、冷备或裸机恢复中至少一项验证，不允许发布；
+- 恢复流程可能写入或格式化未知磁盘，视为阻断缺陷；
+- 系统恢复后未复核数据盘身份和数据库完整性即恢复布防，视为阻断缺陷。
+
+---
+
+## 87. 自动化故障注入、持续可靠性验证与发布证据
+
+### 87.1 可靠性必须每次发布都重新证明
+
+Windows 可靠性不是立项时列出风险就结束。驱动、Defender、运行时、模型、Qt、SQLite、网卡和安装器的任何变化，都可能使之前有效的恢复路径失效。FactoryGuard 必须建立自动化可靠性试验台，在虚拟机和物理 Windows 主机上反复执行故障注入、断言恢复结果并生成证据。
+
+发布前的核心问题是：
+
+- 故障是否能被检测到，而不是进程仍显示运行；
+- 状态是否经过安全内核裁决，而不是各组件自行恢复；
+- 数据是否一致，事件和通知是否幂等；
+- 是否留下可复核日志、事件、指标和哈希；
+- 恢复动作是否有超时、次数上限和人工升级；
+- 同一测试是否在 CI、夜间和发布流水线中可重复执行。
+
+### 87.2 试验台组成
+
+| 组件 | 职责 |
+| --- | --- |
+| Windows VM Runner | 执行快速、可快照、可重复的系统级测试 |
+| Physical Windows Runner | 覆盖真实 GPU、驱动、硬件看门狗、网卡和电源行为 |
+| Camera/NVR Simulator | 输出 RTSP/ONVIF 流、掉线、认证失败、抖动和设备重启 |
+| Fault Injector | 按签名清单执行进程、网络、存储、时间、权限和电源故障 |
+| Orchestrator | 编排场景、超时、恢复、截图和日志采集 |
+| Evidence Store | 保存测试计划、结果、日志、事件、转储和签名哈希 |
+| Release Gate | 阻断缺少证据或恢复断言失败的版本 |
+
+虚拟机测试适合高频回归；物理机测试用于发布红线。二者不能互相完全替代。
+
+### 87.3 故障目录
+
+| 域 | 故障示例 | 关键断言 |
+| --- | --- | --- |
+| 进程 | kill、挂起、死锁、重复启动、孤儿 FFmpeg | Job Object 回收，状态机正确，无重复事件 |
+| 服务 | SCM stop、启动失败、恢复次数耗尽 | 超时、失败计数、latch 和升级有效 |
+| 网络 | 断网、丢包、延迟、DNS 失败、IP 冲突、MTU 黑洞 | Degraded、重连退避、媒体新鲜度正确 |
+| 摄像机 | 401、404、Teardown、流冻结、设备重启 | 会话恢复，不误判入侵或健康 |
+| 存储 | 磁盘满、只读、延迟、权限拒绝、文件锁 | 事务不损坏，降级策略触发 |
+| 数据库 | WAL 损坏、迁移中断、integrity_check 失败 | 只读安全模式、恢复备份、RCA 记录 |
+| 电源 | 断电、Resume、低电量、UPS 通信丢失 | 脏关机恢复、关机标记和证据一致 |
+| GPU | 驱动超时、设备消失、推理超时 | 降级/重启/切换，核心告警不中断 |
+| 时钟 | 时间跳变、NTP 失败、时区变更 | 证据时间被标记，异常状态裁决 |
+| 安全 | Defender 隔离、WDAC 阻止、介质插入 | 策略事件明确，安装器不绕过防护 |
+| 升级 | 安装中断、签名失败、版本降级 | 回滚版本可启动，配置和数据可恢复 |
+| 看门狗 | 核心线程死锁、心跳过期、复位失败 | 外部复位、latch 和原因追溯 |
+
+### 87.4 故障注入安全约束
+
+故障注入工具只能在以下条件满足时运行：
+
+- 主机 ID 匹配实验室或明确授权维护窗口；
+- 场景文件经过签名或由 CI 生成，不能接受未授权临时脚本；
+- 生产环境执行时必须有维护单、审批人、开始/结束时间和回退联系人；
+- 可破坏场景必须先创建虚拟机快照、备份或使用独立磁盘；
+- 每个动作都有最大持续时间和自动恢复动作；
+- 断电、硬复位、磁盘初始化等高风险动作必须单独授权；
+- Orchestrator 与 Runner 失联时，Runner 必须自动退出维护模式并恢复看门狗。
+
+### 87.5 不变量断言模型
+
+每个场景至少定义前置、注入中、恢复后三类断言：
+
+| 断言 | 示例 |
+| --- | --- |
+| 状态不变量 | 不允许从 Recovering 未审计直接进入 Running |
+| 数据不变量 | 已提交 event_id 唯一且可按监管链追溯 |
+| 幂等不变量 | Outbox 重放不会让同一事件产生重复业务通知 |
+| 进程不变量 | 测试结束后无孤儿 FFmpeg、无残留锁、无失控句柄增长 |
+| 媒体不变量 | 数据库不得引用不存在、0 字节或未完成片段 |
+| 证据不变量 | 故障、裁决、恢复和升级均有事件或日志关联 |
+| 资源不变量 | CPU、内存、磁盘 I/O、队列长度恢复到基线范围 |
+| 安全不变量 | 恢复路径不能降低 WDAC、Defender、ACL 或防火墙策略 |
+
+断言必须包含时间容差和重试规则。例如“服务 10 秒内恢复”应明确测量起点、就绪定义和允许的 Degraded 阶段，不能用人工目测。
+
+### 87.6 测试节奏
+
+| 节奏 | 范围 | 时长 | 阻断规则 |
+| --- | --- | --- | --- |
+| PR 冒烟 | 单元、架构、核心进程快速恢复 | 15～30 分钟 | 核心不变量失败即阻断合并 |
+| 每夜 | 网络、摄像机、数据库、媒体和升级场景 | 2～4 小时 | 新失败必须建缺陷并定位责任模块 |
+| 每周 | 组合故障、资源耗尽、24 小时稳定性 | 24 小时 | 出现静默失败或数据不一致阻断候选发布 |
+| 发布候选 | 72 小时长稳、断电、看门狗、物理 GPU | 72 小时+演练窗口 | 任一红线无证据即不得发布 |
+| 季度演练 | 冷备、裸机、UPS、BitLocker | 按站点计划 | 未通过则进入维护整改清单 |
+
+### 87.7 故障计划 JSON 示例
+
+```json
+{
+  "planId": "win-reliability-rc-2026.10",
+  "schemaVersion": "1.0",
+  "hostProfile": "physical-windows-runner",
+  "maintenance": {
+    "ticket": "CHG-2026-1007",
+    "approvedBy": "release-manager",
+    "expiresAt": "2026-10-07T18:00:00+08:00"
+  },
+  "steps": [
+    {
+      "id": "NET-014",
+      "domain": "network",
+      "action": "drop_rtsp_packets",
+      "target": "camera-03",
+      "durationSeconds": 45,
+      "rollback": "restore_firewall_rules"
+    },
+    {
+      "id": "PWR-003",
+      "domain": "power",
+      "action": "hard_power_cycle",
+      "requires": ["snapshot-or-cold-lab", "explicit-approval"],
+      "assertions": [
+        "boot_enters_recovering",
+        "sqlite_integrity_check_passes",
+        "no_duplicate_business_notification",
+        "ready_within_target"
+      ]
+    }
+  ],
+  "evidence": {
+    "collectEvents": true,
+    "collectLogs": true,
+    "collectDumps": true,
+    "hashAlgorithm": "SHA256",
+    "retentionDays": 1095
+  }
+}
+```
+
+### 87.8 结果证据 Manifest
+
+```json
+{
+  "manifestVersion": "1.0",
+  "release": "FactoryGuard-1.0.0-rc.1",
+  "hostId": "physical-runner-01",
+  "bootId": "2026-10-07T08:00:00Z-a91",
+  "startedAt": "2026-10-07T08:00:00+08:00",
+  "completedAt": "2026-10-10T08:00:00+08:00",
+  "scenariosTotal": 126,
+  "scenariosPassed": 126,
+  "blockingFindings": 0,
+  "artifacts": [
+    {"type": "eventLog", "path": "evidence/system.evtx", "sha256": "..."},
+    {"type": "applicationLog", "path": "evidence/factoryguard.jsonl", "sha256": "..."},
+    {"type": "assertions", "path": "evidence/assertions.json", "sha256": "..."}
+  ],
+  "releaseDecision": "approved",
+  "approvedBy": ["qa-lead", "release-manager"]
+}
+```
+
+### 87.9 可靠性指标与缺陷升级
+
+| 指标 | 发布要求 |
+| --- | --- |
+| 静默失败 | 0 个已知未处理：任何关键输入停止必须可见 |
+| 已提交业务事件丢失 | 0 个 |
+| 通知重复 | 同一幂等键不得产生重复业务通知 |
+| 孤儿进程 | 测试结束后为 0 |
+| 数据库完整性 | integrity_check 必须通过 |
+| 崩溃恢复 | 每次崩溃必须有原因、恢复结果和缺陷关联 |
+| 资源恢复 | 故障恢复后资源趋势回到基线，不允许持续泄漏 |
+| 证据完整性 | 测试 Manifest 中每个文件有哈希和采集时间 |
+
+以下问题直接阻断发布：无法检测的核心流水线停滞、无证据的看门狗恢复、断电后数据库损坏、恢复策略降低安全基线、长稳期间出现未解释事件缺口、故障测试被跳过但仍宣称通过。
+
+### 87.10 发布门禁
+
+- 所有红线场景必须在与发布制品一致的构建上执行；
+- 物理 GPU、硬件看门狗、UPS/断电和真实网卡场景不能只由单元测试替代；
+- 证据 Manifest 缺少哈希、时间、主机 ID 或版本信息，视为证据无效；
+- 故障场景失败但通过修改测试规避，而不是修复产品问题，视为发布违规；
+- 发布后发现现场 Windows 环境与测试基线不一致，应重新评估发布授权并触发补充验收。
+
+---
+
+
+## 88. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 84.1 平台与可靠性资料
+### 88.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -11212,6 +11846,14 @@ outputs:
 | Dahua Wiki：Remote Access/RTSP via VLC | 大华 RTSP realmonitor 地址模板参考 |
 | CCTV Database：Uniview RTSP URL | 宇视 media/video1、media/video2 路径汇总；实施时仍以厂商手册和实测为准 |
 | Microsoft Learn：Powercfg command-line options | 电源策略、睡眠状态与现场电源诊断参考 |
+| Microsoft Learn：System power states | 睡眠、休眠、关机、唤醒和电源状态边界参考 |
+| Microsoft Learn：SetThreadExecutionState | 防止线程/任务执行期间进入睡眠的接口参考 |
+| Microsoft Learn：Windows Recovery Environment | WinRE 自动修复、启动故障诊断和恢复环境依据 |
+| Microsoft Learn：reagentc command-line options | WinRE 启用、状态查询和恢复镜像位置核验 |
+| Microsoft Learn：BCDEdit / BCDBoot | 启动配置数据、启动文件和 EFI 启动修复参考 |
+| Microsoft Learn：chkdsk | 卷错误、坏扇区扫描和文件系统元数据检查参考 |
+| Microsoft Learn：fsutil dirty | 查询或设置卷 dirty bit，判断是否需要修复 |
+| Microsoft Learn：BitLocker recovery overview | BitLocker 恢复原因、恢复密钥和恢复流程参考 |
 | Microsoft Learn：Get-CimInstance | Win32_Service、操作系统和硬件状态的命令级证据采集 |
 | Microsoft Learn：Get-Service / Get-Process | 服务状态、进程 ID、进程资源和父子关系复核 |
 | Microsoft Learn：schtasks | 计划任务、维护任务和诊断任务调度参考 |
@@ -11277,7 +11919,7 @@ outputs:
 | ONVIF Profile S Specification | IP 视频设备、媒体配置和 GetStreamUri 能力参考 |
 | ISA/IEC 62443 series | 工业控制系统安全分区、供应商和运维安全参考 |
 
-### 84.2 视频与设备协议资料
+### 88.2 视频与设备协议资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -11287,7 +11929,7 @@ outputs:
 | GB/T 28181 相关公共安全视频监控联网标准 | 二期平台级联和协议扩展预研 |
 | GA/T 1400 相关公共安全视频图像信息系统标准 | 二期视图库、事件对象和平台对接预研 |
 
-### 84.3 主要链接
+### 88.3 主要链接
 
 - https://learn.microsoft.com/en-us/windows/win32/services/service-programs
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w
@@ -11306,6 +11948,15 @@ outputs:
 - https://dahuawiki.com/Remote_Access/RTSP_via_VLC
 - https://www.cctv-database.com/rtsp/uniview/
 - https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/powercfg-command-line-options
+- https://learn.microsoft.com/en-us/windows/win32/power/system-power-states
+- https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate
+- https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/windows-recovery-environment--windows-re--technical-reference
+- https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/reagentc-command-line-options
+- https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/bcdedit-command-line-options
+- https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/bcdboot-command-line-options-techref-di
+- https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/chkdsk
+- https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/fsutil-dirty
+- https://learn.microsoft.com/en-us/windows/security/operating-system-security/data-protection/bitlocker/recovery-overview
 - https://learn.microsoft.com/en-us/powershell/module/cimcmdlets/get-ciminstance
 - https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/get-service
 - https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/get-process
@@ -11544,3 +12195,29 @@ outputs:
 - **背压**：下游处理变慢时，队列把压力反馈给上游，从而触发限流、降采样或排队；
 - **消息帧**：命名管道通信中包含版本、会话、命令、负载和时间的标准化消息结构；
 - **崩溃恢复**：服务或系统异常退出后，在重启时重建状态、校验数据并恢复检测的过程。
+
+- **市电**：工厂正常供电网络；设备还需考虑中断、电压暂降、浪涌和恢复后的自动上电。
+- **电压暂降（Brownout/Sag）**：电压短时间降低，可能导致设备重启、网卡抖动或存储 I/O 异常。
+- **UPS NMC**：UPS 网络管理卡，可独立提供电量、负载、市电状态和告警通知。
+- **安全关机（Graceful Shutdown）**：在 UPS 电量耗尽前按阶段停止服务、刷入事务、关闭文件和数据库。
+- **脏关机（Dirty Shutdown）**：未完成受控关机流程的断电、复位或强制关机，重启时必须执行恢复审计。
+- **快速启动（Fast Startup）**：Windows 结合注销与休眠的启动模式；值守主机默认关闭以获得完整内核初始化。
+- **混合睡眠（Hybrid Sleep）**：结合睡眠和休眠的低功耗状态，不适合无人值守的 FactoryGuard 主机。
+- **上电恢复（AC Recovery）**：BIOS/UEFI 在市电恢复后自动开机或恢复上次电源状态的策略。
+- **硬件看门狗（Hardware Watchdog）**：独立于 Windows 用户态的计时器，未按时收到喂狗信号时执行硬复位。
+- **喂狗（Pet/Kick）**：在证明核心链路真实推进后重置看门狗计时器的动作。
+- **Watchdog Bridge**：FactoryGuard 与厂商硬件看门狗驱动之间的最小权限适配组件。
+- **独立外部探测器**：运行在主机外部的存活监测组件，使用多源证据判断是否需要升级或复位。
+- **智能 PDU**：可远程监测和控制电源输出的配电设备，可用于主机级电源周期。
+- **硬复位（Hard Reset）**：不经过完整 Windows 关机流程的复位或断电再上电。
+- **复位风暴（Reset Storm）**：主机反复失败并反复重启，必须通过计数、latch 和维护介入终止。
+- **维护锁（Maintenance Lock）**：在授权维护窗口抑制自动复位或高风险动作的带过期时间锁。
+- **WinRE（Windows Recovery Environment）**：Windows 恢复环境，用于启动修复、驱动回退、卸载更新和系统恢复。
+- **EFI 系统分区（ESP）**：UEFI 系统存放启动文件的分区，修复时必须准确识别目标磁盘。
+- **BCD（Boot Configuration Data）**：Windows 启动配置数据库，损坏会导致无法启动。
+- **黄金镜像（Golden Image）**：经过版本化、哈希和适用硬件范围控制的标准系统镜像。
+- **裸机恢复（Bare-metal Recovery）**：在新的或清空后的主机上恢复操作系统、驱动、应用和配置。
+- **BitLocker 恢复密钥**：BitLocker 无法自动解锁时用于授权访问系统盘或数据盘的密钥。
+- **Dirty bit**：文件系统用于标记卷可能处于不一致状态、需要检查的位。
+- **可靠性试验台（Reliability Harness）**：自动执行故障注入、恢复断言和证据归档的测试环境。
+- **不变量断言（Invariant Assertion）**：在故障前、故障中和恢复后必须持续成立的状态、数据或安全条件。
