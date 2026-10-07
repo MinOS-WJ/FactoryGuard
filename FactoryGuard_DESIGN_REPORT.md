@@ -1,8 +1,8 @@
 ﻿# 新项目立项设计报告：厂区智防平台（FactoryGuard）
 
-> 文档版本：v3.0
+> 文档版本：v3.1
 > 成文日期：2026-10-07
-> 文档状态：立项稿（供应链证明、配置事务、日志证据与 Windows 可靠性增强版）
+> 文档状态：立项稿（FMEA/FTA、安全内核、供应链证明与 Windows 可靠性增强版）
 > 目标读者：项目发起人、产品、开发、测试、实施、售后、售前
 > 核心决策：核心检测能力以 Windows 后台服务运行，Qt 界面只做可选控制台；进程级隔离、看门狗、崩溃恢复、可观测性、故障演练、证据包和一键诊断为 v1.0 发布红线。
 > v2.0 增补：现场勘察、SQLite 生产级 Schema、Windows 服务命令级证据包、月度/季度维护与寿命治理；任何可靠性承诺都必须有可复验证据。
@@ -16,6 +16,7 @@
 > v2.8 增补：CPU/内存/提交量/句柄/线程/磁盘 I/O/GPU 连续监测、资源预算、Job Object 硬限制、泄漏判定、资源降级和故障注入。
 > v2.9 增补：结构化 JSONL、序列号、日志背压、审计写入、日志滚动、脱敏、诊断包 manifest、证据哈希和导出失败演练。
 > v3.0 增补：可重复构建、Authenticode 签名、SBOM/Provenance、软件供应链证明，以及配置事务、灰度发布、自动回滚和配置并发锁。
+> v3.1 增补：Windows 可靠性 FMEA/FTA、故障覆盖矩阵、最小割集、本地安全内核、证据优先级和统一状态裁决。
 
 ---
 
@@ -10684,11 +10685,475 @@ approval:
 
 ---
 
-## 82. 行业资料与标准依据
+## 82. Windows 可靠性 FMEA、FTA 与故障覆盖矩阵
+
+### 82.1 从“列故障”升级为“证明覆盖故障”
+
+前序章节已经分别列出服务、媒体、网络、硬件、日志、配置和发布故障，但如果没有统一分析方法，仍可能出现两个问题：
+
+- 某类故障只在文档中出现，却没有对应检测指标、自动动作、测试用例和证据文件；
+- 多个单点故障组合后形成“看起来正常、实际漏检”的复合故障，例如 RTSP 无帧、健康采样失败、UI 缓存仍显示旧画面。
+
+因此，v1.0 需要使用 FMEA（Failure Mode and Effects Analysis，故障模式与影响分析）和 FTA（Fault Tree Analysis，故障树分析）方法，将可靠性设计转换为可检查的覆盖矩阵。这里的目标不是生成形式化表格，而是回答四个问题：
+
+1. 哪些故障会导致应布防时段无法检测真实入侵；
+2. 每个故障是否能被系统主动发现；
+3. 故障能否被限制在单通道、单进程或单子系统；
+4. 恢复是否有证据，而不是仅靠界面恢复成“正常”。
+
+### 82.2 顶事件定义
+
+本轮分析的顶事件为：
+
+**T1：FactoryGuard 在布防计划有效期间，对真实区域入侵未能形成可通知、可追溯的事件。**
+
+该顶事件不等同于 NVR 没录到视频。NVR 始终保持独立连续录像权威；FactoryGuard 负责实时分析和处警闭环。T1 可分解为六个中间事件：
+
+```mermaid
+graph TD
+    T[T1: Armed period fails to produce traceable intrusion event]
+    T --> M1[M1: usable video frame not acquired]
+    T --> M2[M2: acquired frame not analyzed]
+    T --> M3[M3: analyzed person does not pass rule]
+    T --> M4[M4: confirmed detection not persisted]
+    T --> M5[M5: event exists but notification not delivered]
+    T --> M6[M6: failure exists but health state stays falsely healthy]
+
+    M1 --> M11[Camera/NVR/network failure]
+    M1 --> M12[Authentication or RTSP session failure]
+    M1 --> M13[FFmpeg process or decode failure]
+
+    M2 --> M21[Inference backend unavailable]
+    M2 --> M22[Queue overflow or load shedding]
+    M2 --> M23[Model missing, corrupt, or incorrectly bound]
+
+    M3 --> M31[Geometry or resolution mismatch]
+    M3 --> M32[Schedule or armed state wrong]
+    M3 --> M33[Cooldown or multi-frame policy suppresses event]
+
+    M4 --> M41[Data volume unavailable or full]
+    M4 --> M42[SQLite transaction failure]
+    M4 --> M43[Snapshot or clip state inconsistent]
+
+    M5 --> M51[Outbox not written]
+    M5 --> M51b[Webhook fails and retry does not recover]
+    M5 --> M52[Escalation path unavailable]
+
+    M6 --> M61[Heartbeat or freshness monitor missing]
+    M6 --> M62[UI displays stale cached state]
+    M6 --> M63[Log or event export fails]
+```
+
+### 82.3 最小割集原则
+
+最小割集表示导致顶事件发生的最少故障组合。v1.0 对不同等级故障采用不同原则：
+
+| 割集类型 | 工程要求 | 示例 |
+| --- | --- | --- |
+| 单故障导致全站漏检 | 原则上禁止 | 配置错误导致全部通道停用；核心服务未自启动 |
+| 单故障导致关键通道漏检 | 必须有明确告警和安全处置 | 关键摄像机 RTSP 认证失败 |
+| 双故障导致漏检 | 必须能分别可见，并在第二个故障发生前预警 | 帧超时 + 健康日志写入失败 |
+| 多故障但 NVR 录像仍正常 | FactoryGuard 进入故障状态，NVR 取证不被改写 | 网络短时中断、AI 服务恢复中 |
+| 环境级共同原因故障 | 通过 UPS、物理防护、站点 BCP 降低，不承诺完全消除 | 长时间停电、火灾、机柜进水 |
+
+不能把“进程存在”当作阻断 T1 的证据。必须同时存在帧新鲜度、推理结果、规则状态、事务结果和通知状态。对于无法完全消除的共同原因故障，应明确业务连续性措施和人工接管路径。
+
+### 82.4 FMEA 字段定义
+
+每个故障模式必须记录以下字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| id | 稳定故障模式 ID，例如 FMEA-MEDIA-001 |
+| subsystem | service、media、inference、storage、network、config、observability |
+| failure_mode | 可观察的故障表现 |
+| causes | 直接原因和前置条件 |
+| effect | 对通道、站点或证据链的影响 |
+| severity | critical、high、medium、low |
+| detection | 系统通过何种指标或事件发现 |
+| containment | 隔离范围，防止扩散到其他通道/进程 |
+| recovery | 自动恢复或人工恢复动作 |
+| evidence | 日志、事件 ID、数据库记录或诊断包文件 |
+| drill | 对应故障注入或演练编号 |
+| status | covered、partial、gap、accepted-risk |
+
+只有同时具备 detection、containment、recovery、evidence 和 drill，故障状态才能标记为 covered。仅有设计说明或人工流程，只能标记 partial 或 gap。
+
+### 82.5 关键 FMEA 摘录
+
+| ID | 故障模式 | 影响 | 检测 | 隔离/恢复 | 证据 |
+| --- | --- | --- | --- | --- | --- |
+| FMEA-MEDIA-001 | RTSP PLAY 后 8 秒无新帧 | 单通道假在线 | media_stale_seconds、帧新鲜度事件 | 重启单路 FFmpeg；同 NVR 多通道受影响则分批恢复 | media JSONL、事件 ID 1301 |
+| FMEA-MEDIA-002 | RTSP 认证连续失败 | 通道无法取流，可能锁账号 | 401/403 模式和认证计数 | 进入 AuthFailed/AuthLocked，更新凭据后再验证 | media 日志、认证审计 |
+| FMEA-NET-001 | VLAN 或交换机端口错误 | 多通道不可达 | 多路端口/帧探测同时失败 | 标记站点网络故障，按网络 Runbook 处置 | network inventory、SCM/事件时间线 |
+| FMEA-INFER-001 | GPU 初始化或推理连续失败 | 推理延迟或不可用 | 后端错误、连续失败计数、Warmup 结果 | 熔断 GPU，按 CPU 能力降帧 | inference JSONL、健康状态 |
+| FMEA-INFER-002 | 推理队列溢出 | 帧被延迟或丢弃 | queue depth、queue wait、dropped frames | 降低帧率或通道并发，保留核心通道 | queue metrics、Load Shedding 记录 |
+| FMEA-STORE-001 | 数据盘身份不匹配 | 可能写入错误磁盘 | UniqueId/序列号核验 | 拒绝生产写入，进入数据盘故障模式 | storage preflight、Windows Event Log |
+| FMEA-STORE-002 | 数据盘容量低于安全阈值 | 事件或媒体写入失败 | 容量水位事件 | 分级清理、降级、保留核心事务 | capacity events、清理审计 |
+| FMEA-CONFIG-001 | active 配置被半写入或覆盖 | 规则、通道或通知错误 | hash、Schema、current pointer | current pointer 保持旧版本，候选配置回滚 | config transaction、audit |
+| FMEA-OBS-001 | 日志 writer 失败 | 故障无法追溯 | writer error、日志队列水位 | 进入日志降级，保留关键事件 | bootstrap/Event Log |
+| FMEA-OBS-002 | UI 使用过期缓存状态 | 操作员误判系统健康 | 服务端健康版本和更新时间 | UI 标记 Stale，允许只读或重连 | IPC session、UI log |
+| FMEA-SVC-001 | 服务开机后未自动启动 | 全站实时检测缺失 | SCM 事件和冷启动检查 | SCM recovery/恢复控制台介入 | System event、sc qc |
+| FMEA-REL-001 | 现场安装包与发布清单不一致 | 供应链不可信 | 签名、SHA256、Release Manifest | 阻止安装并更换正式包 | release provenance、SBOM |
+
+### 82.6 严重度、发生度和探测度评价
+
+为避免随意使用一个数值化 RPN（Risk Priority Number）作为决策依据，v1.0 使用分级评价：
+
+| 维度 | 等级 | 判定标准 |
+| --- | --- | --- |
+| Severity 严重度 | critical | 全站或关键通道在布防期漏检、证据不可用 |
+|  | high | 多通道检测中断、关键通知失败，需要快速处置 |
+|  | medium | 单通道降级、短时延迟、非关键证据不完整 |
+|  | low | 不影响核心检测，只影响体验或非关键维护 |
+| Occurrence 发生度 | frequent / likely / occasional / rare | 由现场回访、试点数据和长稳测试修正，不靠主观猜测 |
+| Detection 探测度 | strong | 自动指标可在影响用户前发现并记录 |
+|  | moderate | 能发现但可能依赖巡检或人工确认 |
+|  | weak | 故障发生后才被动发现，或证据不足 |
+
+对于 severity=critical 且 detection=weak 的组合，不允许通过“理论上应该能发现”进入发布；必须补检测点或降低设计范围。
+
+### 82.7 故障覆盖矩阵
+
+覆盖矩阵以“故障模式 → 检测 → 隔离 → 恢复 → 演练 → 证据”为主键：
+
+```yaml
+coverage_version: 1
+top_event: T1_armed_intrusion_not_traceable
+required_layers:
+  - media
+  - network
+  - inference
+  - rules
+  - storage
+  - notification
+  - observability
+entries:
+  - id: FMEA-MEDIA-001
+    detection: media_frame_freshness
+    isolation: single_channel_pipeline_restart
+    recovery: exponential_backoff_with_waves
+    drill: DRILL-MEDIA-STALE-001
+    evidence:
+      - media-jsonl
+      - event-id-1301
+    status: covered
+  - id: FMEA-STORE-001
+    detection: disk_unique_id_verification
+    isolation: reject_writes_to_unverified_volume
+    recovery: storage-runbook
+    drill: DRILL-STORAGE-IDENTITY-001
+    evidence:
+      - storage-manifest
+      - windows-event-log
+    status: covered
+  - id: FMEA-OBS-002
+    detection: health_version_and_age
+    isolation: ui-stale-warning
+    recovery: ipc-reconnect
+    drill: DRILL-UI-STALE-001
+    evidence:
+      - ui-log
+      - ipc-session
+    status: covered
+acceptance:
+  critical_gaps_allowed: 0
+  partial_critical_modes_allowed: 0
+  unexplained_drills_allowed: 0
+```
+
+### 82.8 故障模式 JSON 示例
+
+```json
+{
+  "id": "FMEA-MEDIA-001",
+  "version": 1,
+  "subsystem": "media",
+  "failureMode": "RTSP session remains open but no valid video frame arrives within the freshness threshold",
+  "causes": [
+    "upstream device stops sending media",
+    "network path silently drops packets",
+    "decoder or FFmpeg pipeline stalls"
+  ],
+  "effect": {
+    "scope": "channel",
+    "severity": "high",
+    "armedPeriodImpact": "real-time detection for the channel stops"
+  },
+  "detection": {
+    "metrics": ["media_stale_seconds", "frame_interval_ms"],
+    "eventIds": [1301],
+    "strength": "strong"
+  },
+  "containment": {
+    "boundary": "single channel",
+    "action": "restart only the affected media pipeline unless multiple channels on the same NVR are correlated"
+  },
+  "recovery": {
+    "strategy": "bounded restart with exponential backoff and jitter",
+    "maxAttempts": "pinned by site policy",
+    "finalState": ["healthy", "degraded", "offline"]
+  },
+  "evidence": [
+    "media JSONL",
+    "channel health snapshot",
+    "diagnostics package"
+  ],
+  "drill": "DRILL-MEDIA-STALE-001",
+  "status": "covered"
+}
+```
+
+### 82.9 故障覆盖审计规则
+
+发布评审时必须逐项确认：
+
+- 每个 critical/high 故障模式都有自动检测指标；
+- 检测指标必须能按受影响对象聚合，不能只有站点级平均值；
+- 每个自动恢复动作都有失败后的安全状态；
+- 每个演练都能关联日志、事件 ID 和恢复时间；
+- 同一故障不能通过多个文档章节重复计数为多个覆盖项；
+- accepted-risk 必须说明客户业务决定、补偿控制和复核日期；
+- gap 项不得出现在 v1.0 发布红线范围内。
+
+覆盖率不是简单的 covered 条目百分比。关键故障没有覆盖时，即使总覆盖率很高，也必须阻断发布。
+
+### 82.10 发布门禁
+
+- v1.0 必须维护顶事件 T1 的故障树、FMEA 清单和覆盖矩阵；
+- 所有可能导致全站或关键通道漏检的故障必须为 covered；
+- 无法自动检测的故障必须改设计或退出 v1.0 范围；
+- 每个 covered 项必须有检测、隔离、恢复、证据和演练；
+- 多通道关联故障必须验证批量恢复不会形成风暴；
+- FMEA/FTA 结果必须随发布版本归档，并在现场变更后复审。
+
+---
+
+## 83. 本地安全内核、证据优先级与可靠性裁决
+
+### 83.1 为什么需要统一裁决层
+
+FactoryGuard 各子系统会同时产生大量状态：进程心跳、帧新鲜度、资源水位、磁盘身份、数据库事务、通知结果和 UI 缓存。如果每个模块各自显示“正常”，可能出现相互矛盾的状态：
+
+- 媒体进程报告 Running，但帧新鲜度已经超时；
+- UI 缓存显示通道在线，但 IPC 会话已经断开；
+- GPU 后端初始化成功，但实际推理连续失败；
+- 配置文件存在，但 current pointer 尚未确认；
+- 单通道离线，但站点总体健康分数仍被平均值掩盖。
+
+因此，supervisor 内部应实现逻辑上的 **Local Safety Kernel（本地安全内核）**。它不是宣称可以消除所有故障的新组件，而是一个最小裁决层，用统一证据等级和状态规则决定系统能否 Running、是否降级、是否隔离对象、是否回滚配置，以及向 UI 展示什么状态。
+
+### 83.2 安全内核职责边界
+
+| 职责 | 安全内核负责 | 不由安全内核承担 |
+| --- | --- | --- |
+| 状态裁决 | 汇总心跳、帧、资源、存储、配置和通知证据 | 不直接解码视频或运行模型 |
+| 发布门禁 | 判断配置能否 Canary、Rolling、Active | 不替代人工审批制度 |
+| 故障隔离 | 标记单通道/单进程/单 NVR 故障范围 | 不直接删除客户数据 |
+| 降级控制 | 触发 Load Shedding 和资源优先级 | 不保证硬件容量无限 |
+| 回滚决策 | 满足阈值时要求恢复上一确认版本 | 不绕过数据库/文件系统事务 |
+| 健康输出 | 向 UI/诊断包输出统一状态和证据版本 | 不依赖 UI 是否打开 |
+| 审计 | 记录裁决原因、输入摘要和决策时间 | 不保存明文密钥 |
+
+安全内核应保持短小、可测试、可审计。业务功能越多地塞入该层，越容易形成新的单点复杂度。
+
+### 83.3 证据等级
+
+不同证据的可信度不同。安全内核按以下规则解释冲突：
+
+| 证据 | 强度 | 说明 |
+| --- | --- | --- |
+| 帧新鲜度和实际帧计数 | strong | 证明通道是否真的收到媒体 |
+| 数据库事务返回 | strong | 证明事件、审计、Outbox 是否提交 |
+| supervisor 独立心跳 | strong | 证明进程近期是否响应 |
+| 磁盘 UniqueId 和 ACL 检查 | strong | 证明数据盘身份和访问边界 |
+| 进程自报告 Running | moderate | 可能与实际工作队列或帧状态不一致 |
+| 单次资源采样 | moderate | 需要趋势和阈值配合 |
+| UI 缓存 | weak | 只能用于展示，不可作为运行事实 |
+| 人工口头确认 | weak / external | 可用于审批，不替代系统证据 |
+
+原则：**强证据覆盖弱证据；外部展示不能使用弱证据否定强证据。** 例如，媒体进程自报 Running 不能推翻帧新鲜度超时。
+
+### 83.4 输入对象
+
+```yaml
+safety_kernel_version: 1
+inputs:
+  service:
+    - scm_state
+    - service_control_request
+    - checkpoint_age_seconds
+  process:
+    - heartbeat_age_seconds
+    - process_exit_code
+    - restart_count
+  media:
+    - frame_freshness_seconds
+    - pts_status
+    - ffmpeg_exit_code
+  inference:
+    - backend_state
+    - warmup_result
+    - consecutive_failures
+    - queue_wait_ms
+  resources:
+    - cpu_percent
+    - private_bytes
+    - handle_count
+    - disk_io_latency_ms
+  storage:
+    - disk_unique_id_match
+    - volume_writable
+    - free_bytes
+    - acl_valid
+  configuration:
+    - schema_valid
+    - transaction_state
+    - current_pointer_version
+  notification:
+    - outbox_writable
+    - delivery_result
+    - escalation_available
+outputs:
+  - global_state
+  - affected_objects
+  - degradation_actions
+  - rollback_decision
+  - evidence_snapshot
+```
+
+所有输入都必须包含采样时间和来源。超过有效期的输入只能标记 stale，不能继续用于证明系统健康。
+
+### 83.5 全局状态定义
+
+| 状态 | 进入条件 | 用户可见解释 |
+| --- | --- | --- |
+| BootVerifying | 服务已启动，正在核验关键资源 | 尚未完成启动，不显示业务 Ready |
+| Running | 核心链路证据有效，无关键对象异常 | 系统按当前配置运行 |
+| DegradedRunning | 存在单通道/非关键故障或降级，但核心检测仍可继续 | 明确列出影响对象和实际能力 |
+| CapacityProtected | CPU、内存、磁盘、网络等触发保护 | 系统主动降低非关键负载 |
+| ConfigRollback | 配置灰度触发回滚条件 | 已恢复或正在恢复上一确认配置 |
+| StorageFault | 数据盘身份、ACL、容量或写入异常 | 不写错误磁盘，等待存储处置 |
+| MinimalService | 核心推理或媒体大面积异常，但服务仍保持故障可见 | 只保留控制、诊断和必要状态 |
+| Recovering | 崩溃、断电或服务重启后的恢复阶段 | 执行 WAL/Outbox/进程状态恢复 |
+
+不得把所有异常都映射为 Offline。只要服务还能观测和控制，就应输出具体故障状态；只有无法获得有效证据时，才显示不可用或未知。
+
+### 83.6 裁决规则表
+
+| 条件 | 裁决 | 动作 |
+| --- | --- | --- |
+| 帧新鲜度超时，进程自报 Running | Frozen 或 Degraded/Offline | 单路重启；多通道关联则分批恢复 |
+| GPU 连续失败但 CPU 可承载 | DegradedRunning | 熔断 GPU，切 CPU 并显示帧率 |
+| CPU/内存超过硬预算 | CapacityProtected | 降低非关键任务，必要时受控重启 worker |
+| 磁盘 UniqueId 不匹配 | StorageFault | 拒绝写入，要求维护处置 |
+| 配置 Schema 或引用错误 | ConfigRollback / Withdrawn | 保持旧配置，不进入 Active |
+| 审计事件无法提交 | 高风险操作失败 | 回滚对应操作 |
+| Outbox 可写但 Webhook 暂时失败 | DegradedRunning | 保存待发任务并限流重试 |
+| UI 健康数据过期 | UI Stale | 重连或只读，不改变后台状态 |
+| 心跳超时但进程仍存在 | Process Suspect | 先请求受控退出，再强制清理 |
+| 多个同 NVR 通道同时失败 | NVR/Network Suspect | 标记共同原因，按波次恢复 |
+
+### 83.7 安全内核不变量
+
+1. 没有当前时间、来源和有效期的证据不能证明 Running；
+2. 关闭 UI 不影响安全内核裁决和核心检测；
+3. 单通道故障不能拉垮全部通道，全站共同原因必须能被识别；
+4. 任何配置激活都必须通过 Schema、预检、审批和灰度门禁；
+5. 审计无法写入时，高风险配置和证据导出不得生效；
+6. 安全内核不能通过关闭告警、删除日志或放宽 ACL 解除故障；
+7. 降级状态必须列出实际帧率、通道范围和恢复条件；
+8. 进程退出、Job Object 清理和 Outbox 补偿必须可关联；
+9. 当前配置版本必须能回退到 Last Known Good；
+10. 任何“未知”状态必须持续重试并产生诊断证据。
+
+### 83.8 决策快照 JSON
+
+```json
+{
+  "version": 1,
+  "decisionId": "safety-20261007-150000",
+  "decidedAt": "2026-10-07T15:00:00+08:00",
+  "inputFreshness": {
+    "maxAcceptedAgeSeconds": 10,
+    "oldestUsedEvidenceAgeSeconds": 3
+  },
+  "globalState": "DegradedRunning",
+  "reasons": [
+    {
+      "stableCode": "FG-MEDIA-1204",
+      "objectId": "ch-001",
+      "evidenceStrength": "strong",
+      "message": "frame freshness threshold exceeded"
+    }
+  ],
+  "actions": [
+    {
+      "type": "restart_single_media_pipeline",
+      "target": "ch-001",
+      "boundedBackoff": true
+    }
+  ],
+  "configuration": {
+    "currentVersion": 43,
+    "lastKnownGoodVersion": 43,
+    "rollbackRequired": false
+  },
+  "affectedObjects": {
+    "channelIds": ["ch-001"],
+    "processRoles": [],
+    "nvrIds": []
+  },
+  "audit": {
+    "written": true,
+    "traceId": "trace-safety-0001"
+  }
+}
+```
+
+### 83.9 冲突处理示例
+
+| 冲突 | 错误处理 | 正确处理 |
+| --- | --- | --- |
+| 进程 Running 但无帧 | 继续显示在线 | 以帧新鲜度判定 Frozen/Offline |
+| UI 显示正常但服务版本较旧 | 接受 UI 状态 | 显示 UI Stale，重新同步 |
+| GPU 初始化成功但推理失败 | 一直重试 GPU | 有限重试后熔断并降级 CPU |
+| 单通道失败导致全站重启 | 简单粗暴恢复 | 单通道隔离，其他通道继续 |
+| 多通道同时失败仍逐路高频重连 | 形成连接风暴 | 识别共同原因，按批次和抖动恢复 |
+| 审计写入失败仍保存配置 | 产生无审计高风险变更 | 回滚配置操作 |
+| 磁盘身份不明但路径存在 | 按路径继续写入 | 拒绝生产写入 |
+
+### 83.10 安全内核测试矩阵
+
+| 测试 | 输入条件 | 通过标准 |
+| --- | --- | --- |
+| 强证据覆盖弱证据 | 进程 Running + 帧超时 | 输出 Frozen/Offline，不显示健康 |
+| 证据过期 | 所有输入超过有效期 | 状态为未知/验证中，不证明 Running |
+| 单通道隔离 | 一路帧超时 | 仅该通道降级或重启 |
+| 共同原因识别 | 同 NVR 多通道同时失败 | 标记 NVR/网络嫌疑并分批恢复 |
+| 资源保护 | CPU/内存达到阈值 | 非关键任务被降级 |
+| 配置回滚 | Canary 通知失败 | current pointer 恢复旧版本 |
+| 审计阻断 | 审计写入失败 | 高风险操作失败或回滚 |
+| UI 断开 | IPC 关闭 | 安全内核继续运行并记录状态 |
+| 崩溃恢复 | supervisor 重启 | 能从持久状态恢复裁决上下文 |
+| 冲突风暴 | 短时间大量状态变化 | 决策按版本处理，不覆盖旧审计 |
+
+### 83.11 发布门禁
+
+- 安全内核必须对关键状态使用强证据，不允许以 UI 缓存或进程自报告作为唯一依据；
+- 每个全局状态都必须有进入条件、退出条件、可见说明和审计记录；
+- 所有降级、隔离、回滚和恢复动作必须由安全内核输出结构化决策；
+- 关键输入过期时，系统不得显示完整 Running；
+- 安全内核自身必须通过冲突、过期、共同原因和崩溃恢复测试；
+- 现场实施和售后不得绕过安全内核手工标记健康。
+
+---
+
+## 84. 行业资料与标准依据
 
 以下资料用于支撑本报告中的协议、进程、可靠性、数据一致性和设备接入设计。实施时应以资料的最新版本为准，并在交付文档中记录实际采用版本。
 
-### 82.1 平台与可靠性资料
+### 84.1 平台与可靠性资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -10732,6 +11197,9 @@ approval:
 | Microsoft Learn：Enable Remote Desktop | 远程桌面、网络级别身份验证和访问入口 |
 | Axis Communications：system design and installation guidance | 摄像机点位、视场角、安装和画面质量参考 |
 | NIST AI Risk Management Framework | AI 风险治理、映射、测量和管理参考 |
+| IEC 60812 Failure Mode and Effects Analysis | FMEA 字段、故障影响分析和风险评价方法参考 |
+| IEC 61025 Fault Tree Analysis（方法名称参考） | 故障树、顶事件、中间事件和最小割集分析方法 |
+| NIST SP 800-30 Guide for Conducting Risk Assessments | 风险识别、发生可能性、影响和风险处置参考 |
 | Ready.gov Business Continuity Planning / ISO 22301 concepts | 业务连续性、影响分析、恢复演练参考 |
 | Atlassian IT Change Management | ITIL 变更分类、风险评估和变更回滚参考 |
 | Microsoft Learn：sc.exe config | 服务启动类型、二进制路径和账户配置复核 |
@@ -10809,7 +11277,7 @@ approval:
 | ONVIF Profile S Specification | IP 视频设备、媒体配置和 GetStreamUri 能力参考 |
 | ISA/IEC 62443 series | 工业控制系统安全分区、供应商和运维安全参考 |
 
-### 82.2 视频与设备协议资料
+### 84.2 视频与设备协议资料
 
 | 资料 | 用途 |
 | --- | --- |
@@ -10819,7 +11287,7 @@ approval:
 | GB/T 28181 相关公共安全视频监控联网标准 | 二期平台级联和协议扩展预研 |
 | GA/T 1400 相关公共安全视频图像信息系统标准 | 二期视图库、事件对象和平台对接预研 |
 
-### 82.3 主要链接
+### 84.3 主要链接
 
 - https://learn.microsoft.com/en-us/windows/win32/services/service-programs
 - https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w
@@ -10933,6 +11401,8 @@ approval:
 - https://learn.microsoft.com/en-us/windows-server/remote/remote-desktop-services/clients/remote-desktop-allow-access
 - https://www.axis.com/support
 - https://www.nist.gov/itl/ai-risk-management-framework
+- https://webstore.iec.ch/en/publication/26359
+- https://www.nist.gov/privacy-framework/nist-sp-800-30
 - https://www.ready.gov/business-continuity-planning
 - https://www.iso.org/standard/50038.html
 - https://www.atlassian.com/itsm/change-management
@@ -10990,6 +11460,7 @@ approval:
 
 ---
 
+## 附录：术语
 
 - **VLAN（Virtual Local Area Network，虚拟局域网）**：在物理网络上划分逻辑广播域，用于隔离摄像机、办公网和管理网流量。
 - **MTU（Maximum Transmission Unit，最大传输单元）**：单个网络报文可承载的最大字节数；以太网络常见 MTU 为 1500。
@@ -10999,10 +11470,6 @@ approval:
 - **媒体新鲜度**：根据最后一帧到达时间、帧间隔和 PTS 判断视频流是否仍在更新。
 - **链路抖动（Link Flap）**：网络链路短时间内反复 Up/Down，通常由线缆、端口、驱动、供电或配置问题导致。
 - **PoE（Power over Ethernet，以太网供电）**：交换机通过网线向摄像机等终端供电，需核验端口功率和总电源预算。
-
----
-
-
 - **处理器队列长度（Processor Queue Length）**：等待执行的线程数量；长期高队列通常说明 CPU 已出现调度拥塞。
 - **私有字节（Private Bytes）**：进程私有提交的内存大小，常用于判断内存泄漏趋势。
 - **工作集（Working Set）**：进程当前驻留在物理内存中的字节数，可能被系统回收。
@@ -11010,16 +11477,12 @@ approval:
 - **句柄泄漏（Handle Leak）**：文件、线程、套接字、管道等内核对象未及时关闭，导致句柄数持续增长。
 - **磁盘 I/O 延迟**：读/写请求从提交到完成所经历的时间，是判断磁盘响应能力的重要指标。
 - **资源硬限制**：通过 Job Object 等机制设置的进程内存、CPU 或活动进程上限，用于故障兜底。
-
-
 - **JSON Lines（JSONL）**：每行一个独立 JSON 对象的数据格式，适合结构化日志追加写入和逐行读取。
 - **日志序列号（Log Sequence Number）**：单个日志流内单调递增的序号，用于发现日志缺失和滚动边界问题。
 - **Bootstrap 日志**：系统服务启动极早期、独立数据盘尚未就绪时写入系统盘的小容量启动证据。
 - **日志背压**：当日志产生速度超过写入能力时，通过有界队列、采样和丢弃计数阻止内存无限增长。
 - **诊断包 Manifest**：记录诊断包文件范围、哈希、脱敏规则、采集时间和审批信息的清单文件。
 - **脱敏（Redaction）**：移除或替换日志、配置和诊断材料中的密码、令牌、Cookie、联系方式等敏感信息。
-
-
 - **SBOM（Software Bill of Materials，软件物料清单）**：记录软件组件、版本、来源、许可证、依赖关系和哈希的清单。
 - **Provenance（构建来源证明）**：说明软件制品由哪个源码、构建平台和构建流程生成的证据。
 - **可重复构建（Reproducible Build）**：在相同输入和工具链下多次构建得到一致结果，用于证明制品可由源码重建。
@@ -11028,9 +11491,14 @@ approval:
 - **Canary（金丝雀发布）**：先让少量低风险对象使用新版本或配置，通过观察后再逐步扩大范围。
 - **Last Known Good Configuration**：最近一次经过验证并可安全回退的配置版本。
 - **配置锁**：防止同一站点多个配置激活过程并发修改生产状态的受控锁。
-
-## 附录：术语
-
+- **FMEA（Failure Mode and Effects Analysis，故障模式与影响分析）**：识别故障模式、原因、影响、探测方式、隔离和恢复措施的方法。
+- **FTA（Fault Tree Analysis，故障树分析）**：从顶事件出发，逐层分解中间事件和基本事件的方法。
+- **顶事件（Top Event）**：故障树中被分析的不希望发生结果，本报告中重点分析布防期真实入侵未形成可追溯事件。
+\`- **最小割集（Minimal Cut Set）**：导致顶事件发生所需要的最少故障组合。
+- **故障覆盖矩阵**：将故障模式与检测、隔离、恢复、演练和证据逐项关联的矩阵。
+- **本地安全内核（Local Safety Kernel）**：supervisor 内部基于证据等级进行状态裁决、降级、隔离和回滚决策的最小逻辑层。
+- **证据优先级**：当多个状态来源冲突时，按证据可信度选择权威状态的规则。
+- **证据过期**：状态输入超过可接受年龄，不能再用于证明系统 Running。
 - **NVR**：网络硬盘录像机，负责摄像机视频接入与连续录像；
 - **RTSP**：实时流传输协议，本项目首版取流协议；
 - **ONVIF**：开放网络视频接口标准，用于设备管理与云台；
