@@ -1,112 +1,57 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual environments
+# Local Python environments and caches
+.conda/
 .venv/
 venv/
-env/
-ENV/
-.python-version
-
-# Test / coverage
+__pycache__/
+*.py[cod]
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
 .coverage
 .coverage.*
 htmlcov/
-.tox/
-.nox/
 coverage.xml
-*.cover
 
-# Jupyter
-.ipynb_checkpoints/
-
-# Node / front-end tooling
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# PyInstaller / NSIS / build artifacts
-*.spec.bak
-output/
-artifacts/
-installer/
-*.app/
-*.exe
-*.msi
-*.dmg
-*.pkg
-
-# ONNX / model cache (keep small fixtures only)
+# Local models and downloaded weights
 *.onnx
-*.pt
-*.pth
-*.engine
 models/cache/
 
-# Media and runtime data
+# Locally downloaded reference PDFs; paper/README.md keeps the source links
+paper/*.pdf
+
+# Runtime databases, logs and generated media
+data/
+events-media/
+exports/
+diagnostics/
+backups/
+runtime/
+logs/
+*.db
+*.db-shm
+*.db-wal
+*.log
 *.mp4
 *.mov
 *.avi
 *.mkv
-*.webm
 *.wav
-*.mp3
-*.h264
-*.h265
-media/
-recordings/
-clips/
-snapshots/
-events-media/
-data/
-logs/
-*.log
-*.jsonl
 
-# Local configuration and secrets
+# Local secrets and machine-specific configuration
 .env
 .env.*
 !.env.example
 config/local/
-*.secret
 secrets/
+*.secret
+*.pem
+*.key
 
-# OS / editor
+# Bundled FFmpeg and other local third-party binaries
+third_party/
+ffmpeg-*/
+
+# IDE and OS files
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
 desktop.ini
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# FFmpeg / runtime binaries
-bin/ffmpeg/
-bin/ffprobe/
-third_party/
