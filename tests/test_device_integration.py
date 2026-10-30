@@ -77,6 +77,44 @@ def _topology() -> EntityRegistry:
     )
 
 
+
+def test_device_health_snapshot_round_trip():
+    store = SQLiteStore(":memory:")
+    try:
+        topology = _topology()
+        device = topology.devices[0]
+        healthy = VideoDevice(
+            id=device.id,
+            site_id=device.site_id,
+            area_id=device.area_id,
+            name=device.name,
+            protocol=device.protocol,
+            endpoint=device.endpoint,
+            capabilities=device.capabilities,
+            analysis_policy=device.analysis_policy,
+            last_probe_at="2026-01-01T00:00:00+00:00",
+            last_ok_at="2026-01-01T00:00:01+00:00",
+            health_status="ready",
+            health_detail="ONVIF connected",
+        )
+        store.save_topology(
+            EntityRegistry(
+                sites=topology.sites,
+                areas=topology.areas,
+                devices=(healthy,),
+                cameras=topology.cameras,
+                streams=topology.streams,
+            )
+        )
+        restored = store.load_topology().devices[0]
+        assert restored.health_status == "ready"
+        assert restored.last_probe_at == "2026-01-01T00:00:00+00:00"
+        assert restored.last_ok_at == "2026-01-01T00:00:01+00:00"
+        assert restored.health_detail == "ONVIF connected"
+    finally:
+        store.close()
+
+
 def test_native_event_maps_to_existing_event_workflow_and_deduplicates_sources():
     store = SQLiteStore(":memory:")
     try:

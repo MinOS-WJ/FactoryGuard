@@ -230,7 +230,7 @@ if HAS_QT:
                     "支持" if caps.native_events else "—",
                     "支持" if caps.recording_search else "—",
                     str(device.analysis_policy).replace("_", " "),
-                    "待探测",
+                    f"{device.health_status} · {device.last_probe_at or '未探测'}",
                 )
                 row = table.rowCount()
                 table.insertRow(row)

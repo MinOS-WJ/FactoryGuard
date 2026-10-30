@@ -65,7 +65,11 @@ CREATE TABLE IF NOT EXISTS video_device (
   credential_ref TEXT,
   capabilities TEXT NOT NULL DEFAULT '{}',
   analysis_policy TEXT NOT NULL DEFAULT 'local_fallback',
-  enabled INTEGER NOT NULL DEFAULT 1
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_probe_at TEXT,
+  last_ok_at TEXT,
+  health_status TEXT NOT NULL DEFAULT 'unknown',
+  health_detail TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_device_area ON video_device(area_id, protocol);
 CREATE TABLE IF NOT EXISTS device_credential (
@@ -326,6 +330,15 @@ class SQLiteStore:
             )
             add_columns("video_stream", {"input_size": "INTEGER NOT NULL DEFAULT 640"})
             add_columns(
+                "video_device",
+                {
+                    "last_probe_at": "TEXT",
+                    "last_ok_at": "TEXT",
+                    "health_status": "TEXT NOT NULL DEFAULT 'unknown'",
+                    "health_detail": "TEXT NOT NULL DEFAULT ''",
+                },
+            )
+            add_columns(
                 "camera_device",
                 {"device_id": "TEXT", "channel_id": "TEXT NOT NULL DEFAULT ''"},
             )
@@ -429,6 +442,8 @@ class SQLiteStore:
                 self._upsert_site(connection, site)
             for area in topology.areas:
                 self._upsert_area(connection, area)
+            for device in topology.devices:
+                self._upsert_device(connection, device)
             for camera in topology.cameras:
                 self._upsert_camera(connection, camera)
             for stream in topology.streams:
@@ -471,6 +486,9 @@ class SQLiteStore:
                 "capabilities": device.capabilities.as_dict(),
                 "analysis_policy": str(device.analysis_policy),
                 "enabled": device.enabled,
+                "health_status": device.health_status,
+                "last_probe_at": device.last_probe_at,
+                "last_ok_at": device.last_ok_at,
             },
             upsert=lambda connection: self._upsert_device(connection, device),
         )
@@ -635,6 +653,10 @@ class SQLiteStore:
                 capabilities=DeviceCapabilities.from_dict(json.loads(row["capabilities"] or "{}")),
                 analysis_policy=str(row["analysis_policy"]),
                 enabled=bool(row["enabled"]),
+                last_probe_at=str(row["last_probe_at"]) if row["last_probe_at"] else None,
+                last_ok_at=str(row["last_ok_at"]) if row["last_ok_at"] else None,
+                health_status=str(row["health_status"] or "unknown"),
+                health_detail=str(row["health_detail"] or ""),
             )
             for row in connection.execute("SELECT * FROM video_device ORDER BY rowid")
         ]
@@ -1293,14 +1315,17 @@ class SQLiteStore:
         connection.execute(
             """INSERT INTO video_device
                (id, site_id, area_id, name, protocol, endpoint, vendor, model, firmware,
-                serial_number, device_id, credential_ref, capabilities, analysis_policy, enabled)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                serial_number, device_id, credential_ref, capabilities, analysis_policy, enabled,
+                last_probe_at, last_ok_at, health_status, health_detail)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET site_id=excluded.site_id, area_id=excluded.area_id,
                  name=excluded.name, protocol=excluded.protocol, endpoint=excluded.endpoint,
                  vendor=excluded.vendor, model=excluded.model, firmware=excluded.firmware,
                  serial_number=excluded.serial_number, device_id=excluded.device_id,
                  credential_ref=excluded.credential_ref, capabilities=excluded.capabilities,
-                 analysis_policy=excluded.analysis_policy, enabled=excluded.enabled""",
+                 analysis_policy=excluded.analysis_policy, enabled=excluded.enabled,
+                 last_probe_at=excluded.last_probe_at, last_ok_at=excluded.last_ok_at,
+                 health_status=excluded.health_status, health_detail=excluded.health_detail""",
             (
                 device.id,
                 device.site_id,
@@ -1317,6 +1342,10 @@ class SQLiteStore:
                 json.dumps(device.capabilities.as_dict(), ensure_ascii=False, separators=(",", ":")),
                 str(device.analysis_policy),
                 int(device.enabled),
+                device.last_probe_at,
+                device.last_ok_at,
+                device.health_status,
+                device.health_detail,
             ),
         )
 

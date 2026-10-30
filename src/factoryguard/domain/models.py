@@ -174,6 +174,10 @@ class VideoDevice:
     capabilities: DeviceCapabilities = DeviceCapabilities()
     analysis_policy: AnalysisPolicy | str = AnalysisPolicy.LOCAL_FALLBACK
     enabled: bool = True
+    last_probe_at: str | None = None
+    last_ok_at: str | None = None
+    health_status: str = "unknown"
+    health_detail: str = ""
 
     def __post_init__(self) -> None:
         if not self.id or not self.site_id or not self.area_id or not self.name.strip():
@@ -196,6 +200,12 @@ class VideoDevice:
         object.__setattr__(self, "analysis_policy", policy)
         if not isinstance(self.capabilities, DeviceCapabilities):
             object.__setattr__(self, "capabilities", DeviceCapabilities.from_dict(self.capabilities))
+        for field_name in ("last_probe_at", "last_ok_at"):
+            value = getattr(self, field_name)
+            if isinstance(value, datetime):
+                object.__setattr__(self, field_name, value.astimezone(UTC).isoformat())
+        if self.health_status not in {"unknown", "ready", "degraded", "offline"}:
+            raise ValueError("device health_status must be unknown, ready, degraded or offline")
 
 
 @dataclass(frozen=True, slots=True)

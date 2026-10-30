@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import replace
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from factoryguard.devices.base import DeviceAdapter, DeviceCredentials, ProbeResult
@@ -106,9 +107,20 @@ class DeviceManager:
     def probe(self, device: VideoDevice, *, timeout: float = 5.0) -> ProbeResult:
         adapter = self.adapter_for(device)
         try:
-            return adapter.probe(timeout=timeout)
+            result = adapter.probe(timeout=timeout)
         finally:
             adapter.close()
+        now = datetime.now(UTC).isoformat()
+        updated = replace(
+            device,
+            capabilities=result.capabilities if result.ok else device.capabilities,
+            last_probe_at=now,
+            last_ok_at=now if result.ok else device.last_ok_at,
+            health_status="ready" if result.ok else "degraded",
+            health_detail=result.detail,
+        )
+        self.store.save_device(updated, actor="device-probe")
+        return result
 
     def discover_onvif(self, *, timeout: float = 3.0) -> tuple[Any, ...]:
         return OnvifDiscovery().discover(timeout=timeout)
