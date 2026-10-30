@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 from uuid import uuid4
 
 
@@ -70,6 +71,39 @@ class NotificationDestination:
         )
 
 
+def destination_channel_map(destinations: Iterable[NotificationDestination]) -> dict[str, str]:
+    """Map destination IDs to their concrete outbox channel keys."""
+    return {destination.id: destination.outbox_channel for destination in destinations}
+
+
+def resolve_notification_channels(
+    destination_ids: Iterable[str],
+    *,
+    fallback_channels: Iterable[str],
+    destination_channels: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Resolve rule-scoped destinations, falling back to global channels.
+
+    An empty ``destination_ids`` list means the rule has no special target and
+    therefore uses the global notification channels.  When IDs are present,
+    only channels owned by those destination instances are returned.
+    """
+    mapping = dict(destination_channels or {})
+    requested = [str(value).strip() for value in destination_ids]
+    if requested:
+        channels: list[str] = []
+        for destination_id in requested:
+            channel = mapping.get(destination_id)
+            if channel and channel not in channels:
+                channels.append(str(channel).strip().lower())
+        return tuple(channels)
+    channels = []
+    for value in fallback_channels:
+        normalized = str(value).strip().lower()
+        if normalized and normalized not in channels:
+            channels.append(normalized)
+    return tuple(channels)
+
 def new_destination_id(kind: str) -> str:
     normalized = str(kind).strip().lower()
     if normalized not in _DESTINATION_KINDS:
@@ -96,4 +130,10 @@ def default_destination(kind: str, *, enabled: bool, provider: str | None = None
     )
 
 
-__all__ = ["NotificationDestination", "default_destination", "new_destination_id"]
+__all__ = [
+    "NotificationDestination",
+    "default_destination",
+    "destination_channel_map",
+    "new_destination_id",
+    "resolve_notification_channels",
+]

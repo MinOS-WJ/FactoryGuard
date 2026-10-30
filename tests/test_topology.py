@@ -13,6 +13,7 @@ from factoryguard.domain import (
     VideoStream,
 )
 from factoryguard.domain.rules import RuleEvaluator
+from factoryguard.inference.profiles import ModelBinding, ModelProfile
 from factoryguard.storage.sqlite import SQLiteStore
 from factoryguard.ui.worker import MonitorConfig, StreamRuntimeConfig
 
@@ -41,6 +42,8 @@ def test_nested_stream_path_and_runtime_config():
 
     config = MonitorConfig(topology=topology)
     assert {item.stream_id for item in config.resolved_streams()} == {"stream-main", "stream-sub"}
+    global_model = MonitorConfig(topology=topology, model="models/global.onnx")
+    assert {item.model for item in global_model.resolved_streams()} == {"models/global.onnx"}
     explicit = MonitorConfig(
         streams=(StreamRuntimeConfig(stream_id="stream-main", url="rtsp://override"),),
     )
@@ -101,3 +104,21 @@ def test_topology_entity_enable_state_controls_runtime_and_audit(tmp_path):
     ).fetchone()
     assert tuple(audit) == ("topology.enabled.changed", "kind=camera; enabled=0")
     store.close()
+
+
+def test_model_bindings_override_runtime_model_by_scope_and_priority():
+    topology = _topology()
+    profiles = (
+        ModelProfile("model-camera", "Camera model", model_uri="models/camera.onnx", confidence=0.4),
+        ModelProfile("model-stream", "Stream model", model_uri="models/stream.onnx", confidence=0.6),
+    )
+    bindings = (
+        ModelBinding("binding-camera", "model-camera", "camera", "camera-1", priority=10),
+        ModelBinding("binding-stream", "model-stream", "stream", "stream-main", priority=20),
+    )
+    config = MonitorConfig(topology=topology, model_profiles=profiles, model_bindings=bindings)
+    runtimes = {runtime.stream_id: runtime for runtime in config.resolved_streams()}
+    assert runtimes["stream-main"].model == "models/stream.onnx"
+    assert runtimes["stream-main"].confidence == 0.6
+    assert runtimes["stream-sub"].model == "models/camera.onnx"
+    assert runtimes["stream-sub"].confidence == 0.4

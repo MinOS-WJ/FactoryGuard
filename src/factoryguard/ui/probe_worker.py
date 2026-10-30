@@ -16,6 +16,7 @@ if HAS_QT:
 
     class StreamProbeWorker(QObject):
         status_changed = Signal(str)
+        resolution_ready = Signal(int, int)
         finished = Signal(bool, str)
 
         def __init__(
@@ -59,12 +60,17 @@ if HAS_QT:
                     height=self.height,
                     fps=self.fps,
                 )
+                probe_resolution = getattr(ffmpeg, "probe_resolution", None)
+                source_resolution = probe_resolution(self.url, timeout=self.timeout) if probe_resolution else None
                 frame = capture.capture_one(timeout=self.timeout)
                 if self._stop.is_set():
                     self.finished.emit(False, "测试已取消")
                     return
                 height, width = frame.image.shape[:2]
-                self.finished.emit(True, f"连接成功 · 收到 {width}×{height} 首帧")
+                source_text = f"源 {source_resolution[0]}×{source_resolution[1]} · " if source_resolution else ""
+                resolution = source_resolution or (width, height)
+                self.resolution_ready.emit(resolution[0], resolution[1])
+                self.finished.emit(True, f"连接成功 · {source_text}处理 {width}×{height} 首帧")
             except Exception as exc:  # noqa: BLE001 - show the concrete probe failure in the UI
                 self.finished.emit(False, str(exc))
 

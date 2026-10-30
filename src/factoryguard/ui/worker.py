@@ -1,24 +1,34 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 """Background RTSP monitoring worker used by the Qt control panel."""
 
 import threading
+import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from math import isfinite
 from pathlib import Path
 from typing import Any
 
+from factoryguard.app.native_events import decide_analysis
 from factoryguard.app.pipeline import DetectionPipeline
-from factoryguard.domain.models import Frame, Rule, RuleType, VideoStream
+from factoryguard.domain.models import (
+    AnalysisPolicy,
+    DeviceCapabilities,
+    Frame,
+    Rule,
+    RuleMode,
+    RuleType,
+    VideoStream,
+)
 from factoryguard.domain.topology import EntityRegistry
 from factoryguard.domain.rules import RuleEvaluator
-from factoryguard.inference.remote import CentralInferenceClient
 from factoryguard.inference.yolo_onnx import YoloOnnxEngine
 from factoryguard.media.ffmpeg import encode_raw_clip, require_ffmpeg
 from factoryguard.media.rtsp import RTSPCapture
-from factoryguard.notifications.destinations import NotificationDestination
+from factoryguard.notifications.actions import execute_http_action
+from factoryguard.notifications.destinations import NotificationDestination, destination_channel_map
 from factoryguard.storage.sqlite import SQLiteStore
 
 from .qt import HAS_QT
@@ -41,10 +51,16 @@ class StreamRuntimeConfig:
     height: int = 720
     fps: float = 2.0
     confidence: float = 0.25
+    input_size: int = 640
     site_id: str | None = None
     area_id: str | None = None
     camera_id: str | None = None
     name: str = "default stream"
+    device_id: str | None = None
+    analysis_policy: AnalysisPolicy | str = AnalysisPolicy.LOCAL_FALLBACK
+    native_event_codes: tuple[str, ...] = ()
+    capabilities: DeviceCapabilities = DeviceCapabilities()
+    native_subscription_healthy: bool = False
 
     def __post_init__(self) -> None:
         if not self.stream_id or not self.url.strip() or not self.model.strip():
@@ -55,21 +71,44 @@ class StreamRuntimeConfig:
             raise ValueError("stream fps must be positive")
         if not isfinite(self.confidence) or not 0 < self.confidence <= 1:
             raise ValueError("stream confidence must be between 0 and 1")
+        if isinstance(self.input_size, bool) or not 64 <= int(self.input_size) <= 4096:
+            raise ValueError("stream input_size must be between 64 and 4096")
+        object.__setattr__(self, "input_size", int(self.input_size))
+        try:
+            policy = (
+                self.analysis_policy
+                if isinstance(self.analysis_policy, AnalysisPolicy)
+                else AnalysisPolicy(str(self.analysis_policy))
+            )
+        except ValueError as exc:
+            raise ValueError("stream analysis policy is invalid") from exc
+        object.__setattr__(self, "analysis_policy", policy)
+        object.__setattr__(
+            self,
+            "native_event_codes",
+            tuple(dict.fromkeys(str(value).strip().lower() for value in self.native_event_codes if str(value).strip())),
+        )
 
     @classmethod
-    def from_video_stream(cls, stream: VideoStream, *, site_id: str | None = None, area_id: str | None = None, camera_id: str | None = None) -> StreamRuntimeConfig:
+    def from_video_stream(cls, stream: VideoStream, *, site_id: str | None = None, area_id: str | None = None, camera_id: str | None = None, fallback_model: str = "models/yolo11n.onnx", capabilities: DeviceCapabilities = DeviceCapabilities(), native_subscription_healthy: bool = False, device_policy: AnalysisPolicy | str | None = None) -> StreamRuntimeConfig:
         return cls(
             stream_id=stream.id,
             url=stream.url,
-            model=stream.model or "models/yolo11n.onnx",
+            model=stream.model or fallback_model,
             width=stream.width,
             height=stream.height,
             fps=stream.fps,
             confidence=stream.confidence,
+            input_size=stream.input_size,
             site_id=site_id,
             area_id=area_id,
             camera_id=camera_id or stream.camera_id,
             name=stream.name,
+            device_id=stream.device_id,
+            analysis_policy=stream.analysis_policy or device_policy or AnalysisPolicy.LOCAL_FALLBACK,
+            native_event_codes=stream.native_event_codes,
+            capabilities=capabilities,
+            native_subscription_healthy=native_subscription_healthy,
         )
 
 
@@ -81,6 +120,7 @@ class MonitorConfig:
     width: int = 1280
     height: int = 720
     confidence: float = 0.25
+    input_size: int = 640
     confirm_frames: int = 3
     fps: float = 2.0
     media_dir: str = "events-media"
@@ -88,10 +128,8 @@ class MonitorConfig:
     clip_timeout: float = 30.0
     streams: tuple[StreamRuntimeConfig | VideoStream, ...] = ()
     topology: EntityRegistry | None = None
-    inference_mode: str = "central"
-    central_inference_url: str = "http://127.0.0.1:8765"
-    central_inference_api_key: str = ""
-    central_inference_timeout: float = 10.0
+    model_profiles: tuple[ModelProfile, ...] = ()
+    model_bindings: tuple[ModelBinding, ...] = ()
     webhook_provider: str = "custom"
     webhook_url: str = ""
     webhook_secret: str = ""
@@ -114,16 +152,17 @@ class MonitorConfig:
     notification_channels: tuple[str, ...] = ("webhook",)
     notification_interval: float = 5.0
     notification_batch: int = 50
+    analysis_policy: AnalysisPolicy | str = AnalysisPolicy.LOCAL_FALLBACK
+    gb28181_enabled: bool = False
+    gb28181_platform_id: str = "340200000000000000"
+    gb28181_domain: str = "3402000000"
+    gb28181_password: str = ""
+    gb28181_port: int = 5060
 
     def __post_init__(self) -> None:
-        mode = str(self.inference_mode).strip().lower()
-        if mode not in {"central", "local"}:
-            raise ValueError("inference mode must be central or local")
-        object.__setattr__(self, "inference_mode", mode)
-        if not str(self.central_inference_url).strip():
-            raise ValueError("central inference URL is required")
-        if not isfinite(self.central_inference_timeout) or self.central_inference_timeout <= 0:
-            raise ValueError("central inference timeout must be positive")
+        if isinstance(self.input_size, bool) or not 64 <= int(self.input_size) <= 4096:
+            raise ValueError("input_size must be between 64 and 4096")
+        object.__setattr__(self, "input_size", int(self.input_size))
         if not isfinite(self.notification_interval) or self.notification_interval <= 0:
             raise ValueError("notification interval must be positive")
         if isinstance(self.notification_batch, bool) or self.notification_batch < 1:
@@ -140,8 +179,6 @@ class MonitorConfig:
                 raise ValueError("notification channel must not be empty")
             if normalized not in channels:
                 channels.append(normalized)
-        if not channels:
-            raise ValueError("at least one notification channel is required")
         object.__setattr__(self, "notification_channels", tuple(channels))
         destinations = tuple(self.delivery_destinations)
         channel_keys: list[str] = []
@@ -153,6 +190,33 @@ class MonitorConfig:
                 raise ValueError(f"duplicate notification destination: {key}")
             channel_keys.append(key)
         object.__setattr__(self, "delivery_destinations", destinations)
+
+    def _apply_model_binding(self, runtime: StreamRuntimeConfig) -> StreamRuntimeConfig:
+        profiles = {profile.id: profile for profile in self.model_profiles if profile.enabled}
+        specificity = {"site": 0, "area": 1, "camera": 2, "stream": 3}
+        bindings = sorted(
+            self.model_bindings,
+            key=lambda binding: (binding.priority, specificity.get(binding.scope_type, -1)),
+            reverse=True,
+        )
+        for binding in bindings:
+            profile = profiles.get(binding.model_profile_id)
+            if profile is None:
+                continue
+            if not binding.matches(
+                site_id=runtime.site_id,
+                area_id=runtime.area_id,
+                camera_id=runtime.camera_id,
+                stream_id=runtime.stream_id,
+            ):
+                continue
+            return replace(
+                runtime,
+                model=profile.model_uri or runtime.model,
+                confidence=profile.confidence,
+                input_size=min(profile.input_width, profile.input_height),
+            )
+        return runtime
 
     def resolved_streams(self) -> tuple[StreamRuntimeConfig, ...]:
         """Return all enabled streams, with legacy single-stream fallback."""
@@ -177,11 +241,15 @@ class MonitorConfig:
                             site_id=site_id,
                             area_id=area_id,
                             camera_id=camera_id,
+                            fallback_model=self.model or "models/yolo11n.onnx",
+                            capabilities=path.device.capabilities if path.device else DeviceCapabilities(live_video=True),
+                            native_subscription_healthy=path.device.capabilities.native_events if path.device else False,
+                            device_policy=path.device.analysis_policy if path.device else None,
                         )
                     )
                     continue
                 raise TypeError("MonitorConfig.streams must contain StreamRuntimeConfig or VideoStream")
-            return tuple(result)
+            return tuple(self._apply_model_binding(runtime) for runtime in result)
         if self.topology is not None and self.topology.streams:
             result: list[StreamRuntimeConfig] = []
             for stream in self.topology.streams:
@@ -196,11 +264,15 @@ class MonitorConfig:
                         site_id=path.site.id,
                         area_id=path.area.id,
                         camera_id=path.camera.id,
+                        fallback_model=self.model or "models/yolo11n.onnx",
+                        capabilities=path.device.capabilities if path.device else DeviceCapabilities(live_video=True),
+                        native_subscription_healthy=path.device.capabilities.native_events if path.device else False,
+                        device_policy=path.device.analysis_policy if path.device else None,
                     )
                 )
-            return tuple(result)
+            return tuple(self._apply_model_binding(runtime) for runtime in result)
         return (
-            StreamRuntimeConfig(
+            self._apply_model_binding(StreamRuntimeConfig(
                 stream_id="CH01",
                 url=self.url,
                 model=self.model,
@@ -208,7 +280,8 @@ class MonitorConfig:
                 height=self.height,
                 fps=self.fps,
                 confidence=self.confidence,
-            ),
+                input_size=self.input_size,
+            )),
         )
 
 
@@ -232,6 +305,8 @@ if HAS_QT:
             super().__init__()
             self.config = config
             self._stop = threading.Event()
+            self._engine_lock = threading.Lock()
+            self._engine_cache = {}
 
         def request_stop(self) -> None:
             """Thread-safe stop request; called directly by the GUI thread."""
@@ -241,7 +316,9 @@ if HAS_QT:
         def run(self) -> None:
             try:
                 runtimes = self.config.resolved_streams()
-                engine_label = "中心推理" if self.config.inference_mode == "central" else "本地 CPU"
+                with self._engine_lock:
+                    self._engine_cache.clear()
+                engine_label = "本机 ONNX Runtime"
                 self.status_changed.emit("starting", f"正在初始化 {len(runtimes)} 路 FFmpeg / {engine_label}")
                 ffmpeg = require_ffmpeg()
                 workers = [
@@ -283,60 +360,101 @@ if HAS_QT:
                 self._stop.wait(retry_delay)
                 retry_delay = min(30.0, retry_delay * 2.0)
 
+        def _shared_engine(self, runtime: StreamRuntimeConfig):
+            model_path = str(Path(runtime.model).expanduser().resolve())
+            key = (model_path, float(runtime.confidence), int(runtime.input_size))
+            with self._engine_lock:
+                cached = self._engine_cache.get(key)
+                if cached is None:
+                    engine = YoloOnnxEngine(model_path, confidence=runtime.confidence, input_size=runtime.input_size)
+                    health = engine.health_check()
+                    self._engine_cache[key] = (engine, health)
+                    return engine, health
+                engine, health = cached
+                if health.state != "ready":
+                    engine.reset()
+                    health = engine.health_check()
+                    self._engine_cache[key] = (engine, health)
+                return engine, health
+
         def _run_stream_once(self, ffmpeg: Any, runtime: StreamRuntimeConfig) -> None:
-            """Run one independent capture/inference chain for one stream."""
+            """Run preview plus only the analysis required by the device policy."""
             frame_no = 0
             store: SQLiteStore | None = None
             last_status: str | None = None
+            last_health_persist = 0.0
 
             def report(status: str, detail: str) -> None:
-                nonlocal last_status
+                nonlocal last_status, last_health_persist
                 changed = status != last_status
                 last_status = status
                 if changed:
                     self.stream_status_changed.emit(runtime.stream_id, status, detail)
-                if store is not None:
+                now = time.monotonic()
+                if store is not None and (changed or now - last_health_persist >= 10.0):
                     store.set_stream_health(runtime.stream_id, status, detail, actor="worker")
+                    last_health_persist = now
 
             try:
-                report("starting", "初始化推理与视频连接")
-                if self.config.inference_mode == "central":
-                    engine = CentralInferenceClient(
-                        self.config.central_inference_url,
-                        api_key=self.config.central_inference_api_key,
-                        timeout=self.config.central_inference_timeout,
-                    )
-                else:
-                    engine = YoloOnnxEngine(runtime.model, confidence=runtime.confidence)
-                health = engine.health_check()
-                if health.state != "ready":
-                    raise RuntimeError(health.detail or f"推理服务不可用: {runtime.stream_id}")
-                report("ready", f"{health.provider} 推理已就绪，等待视频帧")
+                report("starting", "初始化视频连接")
                 store = SQLiteStore(self.config.db)
-                store.set_stream_health(runtime.stream_id, "ready", "模型已就绪，等待视频帧", actor="worker")
-                persisted_rules = store.load_rules(stream_id=runtime.stream_id)
-                rules = [rule for rule in persisted_rules if rule.enabled]
-                if not persisted_rules:
-                    default_rule = Rule(
-                        id=f"qt-full-frame-{runtime.stream_id}",
-                        stream_id=runtime.stream_id,
-                        name="full-frame person detection",
-                        type=RuleType.POLYGON,
-                        geometry=((0, 0), (runtime.width, 0), (runtime.width, runtime.height), (0, runtime.height)),
-                        confirm_frames=self.config.confirm_frames,
-                        site_id=runtime.site_id,
-                        area_id=runtime.area_id,
-                        camera_id=runtime.camera_id,
-                    )
-                    store.save_rule(default_rule)
-                    rules = [default_rule]
-                armed = store.get_stream_armed(runtime.stream_id, default=True)
-                schedule = store.get_arming_schedule(runtime.stream_id)
-                pipeline = DetectionPipeline(
-                    RuleEvaluator(rules),
-                    store,
-                    outbox_channels=self.config.notification_channels,
+                persisted_rules = store.load_rules(stream_id=runtime.stream_id, published_only=True)
+                analysis_rules = [
+                    rule for rule in persisted_rules if rule.enabled and rule.trigger_mode is not RuleMode.NATIVE_EVENT
+                ]
+                native_rules = [
+                    rule for rule in persisted_rules if rule.enabled and rule.trigger_mode is RuleMode.NATIVE_EVENT
+                ]
+                subscription_state = (
+                    getattr(store, "list_device_subscriptions", dict)().get(runtime.device_id, {}).get("state")
+                    if runtime.device_id
+                    else None
                 )
+                native_healthy = runtime.native_subscription_healthy and subscription_state != "degraded"
+                decision = decide_analysis(
+                    policy=runtime.analysis_policy,
+                    capabilities=runtime.capabilities,
+                    native_subscription_healthy=native_healthy,
+                    native_rules=native_rules,
+                    analysis_rules=analysis_rules,
+                )
+                engine = None
+                pipeline = None
+                rules_by_id: dict[str, Rule] = {}
+
+                def enable_local_analysis() -> None:
+                    nonlocal engine, pipeline, rules_by_id, analysis_rules
+                    local_engine, health = self._shared_engine(runtime)
+                    if health.state != "ready":
+                        raise RuntimeError(health.detail or f"本机备用分析不可用: {runtime.stream_id}")
+                    if not persisted_rules:
+                        default_rule = Rule(
+                            id=f"qt-full-frame-{runtime.stream_id}",
+                            stream_id=runtime.stream_id,
+                            name="全画面人员检测",
+                            type=RuleType.POLYGON,
+                            geometry=((0, 0), (runtime.width, 0), (runtime.width, runtime.height), (0, runtime.height)),
+                            confirm_frames=self.config.confirm_frames,
+                            site_id=runtime.site_id,
+                            area_id=runtime.area_id,
+                            camera_id=runtime.camera_id,
+                        )
+                        store.save_rule(default_rule)
+                        analysis_rules = [default_rule]
+                    engine = local_engine
+                    pipeline = DetectionPipeline(
+                        RuleEvaluator(analysis_rules),
+                        store,
+                        outbox_channels=self.config.notification_channels,
+                        destination_channels=destination_channel_map(
+                            destination for destination in self.config.delivery_destinations if destination.enabled
+                        ),
+                    )
+                    rules_by_id = {rule.id: rule for rule in analysis_rules}
+
+                if decision.use_local:
+                    enable_local_analysis()
+                report("ready", f"{decision.label} · 等待视频帧")
                 capture = RTSPCapture(
                     ffmpeg,
                     runtime.url,
@@ -347,71 +465,141 @@ if HAS_QT:
                 frame_buffer: deque[Any] = deque(
                     maxlen=max(1, round(runtime.fps * max(0.0, self.config.prebuffer_seconds)))
                 )
+                retry_delay = 1.0
+                armed = store.get_stream_armed(runtime.stream_id, default=True)
+                schedule = store.get_arming_schedule(runtime.stream_id)
                 while not self._stop.is_set():
                     try:
-                        raw = next(capture.capture(1, timeout=12.0), None)
-                        if raw is None:
-                            raise RuntimeError("FFmpeg 未返回视频帧")
-                        report("running", "视频帧接收正常")
-                        detections = engine.infer_image(raw.image)
-                        frame_buffer.append(raw.image.copy())
-                        self.preview_ready.emit(raw.image.copy(), detections)
-                        self.stream_preview_ready.emit(runtime.stream_id, raw.image.copy(), detections)
-                        now = datetime.now(UTC)
-                        frame = Frame(
-                            runtime.stream_id,
-                            frame_no,
-                            now,
-                            runtime.width,
-                            runtime.height,
-                            nvr_time=now,
-                            site_id=runtime.site_id,
-                            area_id=runtime.area_id,
-                            camera_id=runtime.camera_id,
-                        )
-                        if frame_no % max(1, round(runtime.fps * 2)) == 0:
-                            armed = store.get_stream_armed(runtime.stream_id, default=True)
-                            schedule = store.get_arming_schedule(runtime.stream_id)
-                        schedule_armed = schedule is None or schedule.is_armed(now)
-                        result = pipeline.process(frame, detections, armed=armed and schedule_armed)
-                        self.frame_processed.emit(frame_no, result.detections)
-                        self.stream_frame_processed.emit(runtime.stream_id, frame_no, result.detections)
-                        for event in result.events:
-                            snapshot_uri = self._save_event_snapshot(raw.image, event)
-                            clip_uri = self._save_event_clip(
-                                ffmpeg,
-                                list(frame_buffer),
-                                event,
-                                width=runtime.width,
-                                height=runtime.height,
-                                fps=runtime.fps,
-                            )
-                            if store is not None and (snapshot_uri is not None or clip_uri is not None):
-                                store.update_event_media(
-                                    event.id,
-                                    snapshot_uri=snapshot_uri,
-                                    clip_uri=clip_uri,
-                                    clip_status="ready" if clip_uri is not None else "snapshot_only",
-                                )
-                            payload = _event_payload(event)
-                            payload["snapshot_uri"] = snapshot_uri
-                            payload["clip_uri"] = clip_uri
-                            payload["clip_status"] = "ready" if clip_uri is not None else "snapshot_only"
-                            self.event_created.emit(payload)
-                        frame_no += 1
+                        with capture.stream(timeout=12.0) as raw_frames:
+                            while not self._stop.is_set():
+                                raw = next(raw_frames, None)
+                                if raw is None:
+                                    raise RuntimeError("FFmpeg 直播流已结束")
+                                retry_delay = 1.0
+                                report("running", decision.label)
+                                detections = engine.infer_image(raw.image) if engine is not None else ()
+                                frame_buffer.append(raw.image.copy())
+                                self.preview_ready.emit(raw.image.copy(), detections)
+                                self.stream_preview_ready.emit(runtime.stream_id, raw.image.copy(), detections)
+                                result_events: tuple[Any, ...] = ()
+                                result_count = len(detections)
+                                if frame_no % max(1, round(runtime.fps * 2)) == 0:
+                                    subscription_state = (
+                                        getattr(store, "list_device_subscriptions", dict)()
+                                        .get(runtime.device_id, {})
+                                        .get("state")
+                                        if runtime.device_id
+                                        else None
+                                    )
+                                    updated_decision = decide_analysis(
+                                        policy=runtime.analysis_policy,
+                                        capabilities=runtime.capabilities,
+                                        native_subscription_healthy=(
+                                            runtime.native_subscription_healthy
+                                            and subscription_state != "degraded"
+                                        ),
+                                        native_rules=native_rules,
+                                        analysis_rules=analysis_rules,
+                                    )
+                                    if updated_decision.use_local != decision.use_local:
+                                        if updated_decision.use_local:
+                                            enable_local_analysis()
+                                        else:
+                                            engine = None
+                                            pipeline = None
+                                            rules_by_id = {}
+                                        decision = updated_decision
+                                        report("running", decision.label)
+                                    armed = store.get_stream_armed(runtime.stream_id, default=True)
+                                    schedule = store.get_arming_schedule(runtime.stream_id)
+                                now = datetime.now(UTC)
+                                if pipeline is not None:
+                                    frame = Frame(
+                                        runtime.stream_id,
+                                        frame_no,
+                                        now,
+                                        runtime.width,
+                                        runtime.height,
+                                        nvr_time=now,
+                                        site_id=runtime.site_id,
+                                        area_id=runtime.area_id,
+                                        camera_id=runtime.camera_id,
+                                    )
+                                    schedule_armed = schedule is None or schedule.is_armed(now)
+                                    result = pipeline.process(frame, detections, armed=armed and schedule_armed)
+                                    result_events = tuple(result.events)
+                                    result_count = int(result.detections)
+                                self.frame_processed.emit(frame_no, result_count)
+                                self.stream_frame_processed.emit(runtime.stream_id, frame_no, result_count)
+                                for event in result_events:
+                                    actions = rules_by_id.get(event.rule_id).actions if event.rule_id in rules_by_id else ("snapshot", "clip")
+                                    snapshot_uri = self._save_event_snapshot(raw.image, event) if "snapshot" in actions else None
+                                    clip_uri = (
+                                        self._save_event_clip(
+                                            ffmpeg,
+                                            list(frame_buffer),
+                                            event,
+                                            width=runtime.width,
+                                            height=runtime.height,
+                                            fps=runtime.fps,
+                                        )
+                                        if "clip" in actions
+                                        else None
+                                    )
+                                    clip_status = (
+                                        "ready"
+                                        if clip_uri is not None
+                                        else "snapshot_only"
+                                        if snapshot_uri is not None
+                                        else "pending"
+                                    )
+                                    event_with_media = replace(
+                                        event,
+                                        snapshot_uri=snapshot_uri,
+                                        clip_uri=clip_uri,
+                                        clip_status=clip_status,
+                                    )
+                                    if snapshot_uri is not None or clip_uri is not None:
+                                        store.update_event_media(
+                                            event.id,
+                                            snapshot_uri=snapshot_uri,
+                                            clip_uri=clip_uri,
+                                            clip_status=clip_status,
+                                        )
+                                    rule = rules_by_id.get(event.rule_id)
+                                    if "http" in actions and rule is not None:
+                                        ok, detail = execute_http_action(
+                                            event_with_media,
+                                            url=rule.http_action_url,
+                                            timeout=rule.http_action_timeout,
+                                        )
+                                        if not ok:
+                                            self.error.emit(f"{runtime.stream_id} 外部 HTTP 动作失败：{detail}")
+                                    self.event_created.emit(_event_payload(event_with_media))
+                                frame_no += 1
+                        if not self._stop.is_set():
+                            raise RuntimeError("FFmpeg 直播流已结束")
                     except Exception as exc:  # noqa: BLE001 - keep each stream alive on transient RTSP loss
                         if self._stop.is_set():
                             break
-                        report("degraded", str(exc))
-                        self.status_changed.emit("degraded", f"{runtime.stream_id} 视频流暂时不可用：{exc}")
-                        self.error.emit(f"{runtime.stream_id}: {exc}")
-                        self._stop.wait(1.0)
+                        detail = f"{exc}；{retry_delay:g}秒后自动重试"
+                        report("degraded", detail)
+                        self.status_changed.emit(
+                            "degraded",
+                            f"{runtime.stream_id} 视频流暂时不可用：{detail}",
+                        )
+                        self.error.emit(f"{runtime.stream_id}: {detail}")
+                        self._stop.wait(retry_delay)
+                        retry_delay = min(30.0, retry_delay * 2.0)
             except Exception as exc:  # noqa: BLE001 - isolate one bad stream from its siblings
                 report("offline", str(exc))
                 self.status_changed.emit("error", f"{runtime.stream_id}: {exc}")
                 self.error.emit(f"{runtime.stream_id}: {exc}")
             finally:
-                report("stopped" if self._stop.is_set() else (last_status or "offline"), "监控已停止" if self._stop.is_set() else "推流线程已退出")
+                report(
+                    "stopped" if self._stop.is_set() else (last_status or "offline"),
+                    "监控已停止" if self._stop.is_set() else "推流线程已退出",
+                )
                 if store is not None:
                     store.close()
 

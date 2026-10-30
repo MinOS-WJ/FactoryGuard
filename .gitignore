@@ -26,6 +26,9 @@ backups/
 runtime/
 logs/
 *.db
+*.sqlite
+*.sqlite3
+*.pid
 *.db-shm
 *.db-wal
 *.log

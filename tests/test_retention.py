@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import UTC, datetime, timedelta
 
@@ -28,6 +29,10 @@ def test_media_retention_removes_old_files_but_keeps_event(tmp_path):
     )
     assert store.create_event_with_outbox(event)
     assert store.update_event_media(event.id, snapshot_uri=str(snapshot), clip_uri=str(clip), clip_status="ready")
+    event_row = store.get_event(event.id)
+    outbox_row = store.list_pending_outbox()[0]
+    assert outbox_row["payload_hash"] == hashlib.sha256(event_row["payload"].encode("utf-8")).hexdigest()
+    assert any(row["action"] == "event.media.updated" for row in store.list_audit())
     report = MediaRetentionManager(media_root=media).cleanup(store, retention_days=3)
 
     assert report.removed == 2
@@ -39,9 +44,36 @@ def test_media_retention_removes_old_files_but_keeps_event(tmp_path):
     assert row["snapshot_uri"] is None
     assert row["clip_uri"] is None
     assert row["clip_status"] == "expired"
+    expired_event_row = store.get_event(event.id)
+    expired_outbox_row = store.list_pending_outbox()[0]
+    assert expired_outbox_row["payload_hash"] == hashlib.sha256(expired_event_row["payload"].encode("utf-8")).hexdigest()
+    assert any(item["action"] == "event.media.expired" for item in store.list_audit())
     assert len(store.list_events()) == 1
     store.close()
 
+
+def test_clear_event_media_marks_remaining_clip_as_ready(tmp_path):
+    store = SQLiteStore(tmp_path / "media-status.db")
+    event = Event.create(
+        rule=Rule("status-rule", "stream-1", "status", RuleType.POLYGON, ((0, 0), (10, 0), (10, 10))),
+        frame=Frame("stream-1", 1, datetime.now(UTC), 20, 20),
+        detection=Detection("person", 0.9, (1, 1, 4, 8)),
+    )
+    assert store.create_event_with_outbox(event)
+    assert store.update_event_media(
+        event.id,
+        snapshot_uri="snapshot.png",
+        clip_uri="clip.mp4",
+        clip_status="ready",
+    )
+
+    assert store.clear_event_media(event.id, snapshot=True, actor="test")
+    row = store.get_event(event.id)
+    assert row is not None
+    assert row["snapshot_uri"] is None
+    assert row["clip_uri"] == "clip.mp4"
+    assert row["clip_status"] == "ready"
+    store.close()
 
 def test_media_retention_dry_run_does_not_delete(tmp_path):
     media = tmp_path / "events-media"

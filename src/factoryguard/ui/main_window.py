@@ -9,30 +9,46 @@ import re
 import shutil
 import sqlite3
 import sys
+import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from factoryguard.domain.models import Area, CameraDevice, EventStatus, Rule, RuleType, Site, StreamRole, VideoStream
+from factoryguard.domain.models import AnalysisPolicy, Area, CameraDevice, DeviceCapabilities, EventStatus, Rule, RuleMode, RuleType, Site, StreamRole, VideoDevice, VideoStream
 from factoryguard.domain.permissions import Permission, ROLE_LABELS, UserRole, can, role_from_value
 from factoryguard.domain.schedules import ArmingSchedule
 from factoryguard.domain.topology import EntityRegistry
+from factoryguard.rule_templates import BUILTIN_RULE_TEMPLATES
+from factoryguard.inference.profiles import ModelBinding, ModelProfile, new_model_binding_id, new_model_profile_id
+from factoryguard.system_metrics import ResourceSampler, classify_resource_state, format_bytes
 from factoryguard.topology_io import topology_from_csv, topology_to_csv
 from .preview import PreviewWidget
 from .probe_worker import StreamProbeWorker
 from .qt import HAS_QT, require_qt
-from .rule_dialog import RuleEditorDialog
 from .schedule_dialog import ScheduleEditorDialog
-from .notification_worker import NotificationDispatchOnceWorker, NotificationWorker
+from .camera_dialog import CameraQuickAddDialog
+from .rule_dialog import RuleEditorDialog
+from .native_rule_dialog import NativeRuleDialog
+from .rule_history_dialogs import RuleReviewHistoryDialog, RuleVersionHistoryDialog
+from .theme import THEMES as _THEMES, apply_theme
+from .icon import application_icon
+from .notification_worker import NotificationDispatchOnceWorker, NotificationTestWorker, NotificationWorker
+from .model_worker import ModelHealthWorker
+from .device_pages import DevicePagesMixin
 from .settings_pages import SettingsPagesMixin
 from .worker import MonitorConfig, MonitorWorker, StreamRuntimeConfig
 from factoryguard.storage.sqlite import SQLiteStore
+from factoryguard.app.device_manager import DeviceManager
+from factoryguard.devices.gb28181.server import Gb28181Platform
 from factoryguard.storage.retention import MediaRetentionManager
 from factoryguard.media.ffmpeg import find_ffmpeg
+
 from factoryguard.notifications.adapters import (
     EmailAdapter,
     SmsHttpAdapter,
+    WebhookAdapter,
     parse_phone_recipients,
     parse_recipients,
 )
@@ -40,8 +56,33 @@ from factoryguard.notifications.destinations import (
     NotificationDestination,
     default_destination,
     new_destination_id,
+
 )
 
+RULE_CONDITION_LABELS = {
+    "intrusion": "区域入侵",
+    "line_cross": "绊线穿越",
+    "line_count": "过线计数",
+    "occupancy": "区域人数",
+    "dwell": "区域滞留",
+}
+
+RULE_DIRECTION_LABELS = {
+    "both": "\u53cc\u5411",
+    "up": "\u5411\u4e0a",
+    "down": "\u5411\u4e0b",
+    "left": "\u5411\u5de6",
+    "right": "\u5411\u53f3",
+}
+
+RULE_ACTION_LABELS = {
+    "event": "事件",
+    "snapshot": "截图",
+    "clip": "短视频",
+    "notify": "通知",
+    "audit": "审计",
+    "http": "HTTP",
+}
 if HAS_QT:
     from .qt import (
         QApplication,
@@ -49,6 +90,7 @@ if HAS_QT:
         QCloseEvent,
         QComboBox,
         QDesktopServices,
+        QDialog,
         QDoubleSpinBox,
         QFileDialog,
         QFrame,
@@ -94,81 +136,14 @@ if HAS_QT:
             current = self.currentWidget()
             return current.minimumSizeHint() if current is not None else super().minimumSizeHint()
 
+        def hasHeightForWidth(self):  # type: ignore[override]
+            current = self.currentWidget()
+            return current.hasHeightForWidth() if current is not None else super().hasHeightForWidth()
 
-_THEMES = {
-    "浅色": """
-        QMainWindow, QWidget { background: #f4f7fb; color: #172033; }
-        QGroupBox { border: 1px solid #d7e0ec; border-radius: 10px; margin-top: 10px; padding: 12px; background: #ffffff; }
-        QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #52627a; }
-        QLabel#title { font-size: 24px; font-weight: 700; color: #132238; }
-        QLabel#subtitle, QLabel#muted { color: #687991; }
-        QLabel#status { padding: 6px 12px; border-radius: 14px; background: #e6edf6; color: #536176; }
-        QLabel#channelStatus { color: #536176; padding: 5px 8px; }
-        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { padding: 6px 8px; border: 1px solid #cbd7e6; border-radius: 6px; background: #ffffff; }
-        QPushButton { padding: 7px 14px; border: 1px solid #cbd7e6; border-radius: 6px; background: #ffffff; }
-        QPushButton:hover { border-color: #3984e8; }
-        QPushButton#primary { background: #1f6feb; color: #ffffff; border-color: #1f6feb; }
-        QPushButton#secondary { color: #245fa8; }
-        QPushButton:disabled { color: #9aa6b8; }
-        QTableWidget { border: 1px solid #d7e0ec; gridline-color: #edf1f6; background: #ffffff; alternate-background-color: #f8fafd; }
-        QHeaderView::section { padding: 7px; background: #edf3fa; color: #52627a; border: 0; }
-        QSplitter::handle { background: #dbe4ef; }
-        QWidget#sidebar { background: #ffffff; border-right: 1px solid #d7e0ec; }
-        QLabel#brand { font-size: 18px; font-weight: 700; color: #132238; }
-        QLabel#navSection { color: #8795aa; font-size: 11px; font-weight: 700; padding: 12px 10px 4px; }
-        QPushButton#navButton { text-align: left; padding: 9px 12px; border: 0; border-radius: 6px; color: #52627a; background: transparent; }
-        QPushButton#navButton:hover { background: #f0f4f9; }
-        QPushButton#navButton:checked { color: #1f6feb; background: #e8f0ff; font-weight: 600; }
-    """,
-    "深色": """
-        QMainWindow, QWidget { background: #141a24; color: #e8eef7; }
-        QGroupBox { border: 1px solid #303c50; border-radius: 10px; margin-top: 10px; padding: 12px; background: #1b2432; }
-        QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #aebbd0; }
-        QLabel#title { font-size: 24px; font-weight: 700; color: #f3f7fc; }
-        QLabel#subtitle, QLabel#muted { color: #95a5bc; }
-        QLabel#status { padding: 6px 12px; border-radius: 14px; background: #293549; color: #c6d3e6; }
-        QLabel#channelStatus { color: #aebbd0; padding: 5px 8px; }
-        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { padding: 6px 8px; border: 1px solid #3b4a61; border-radius: 6px; background: #202b3c; color: #e8eef7; }
-        QPushButton { padding: 7px 14px; border: 1px solid #3b4a61; border-radius: 6px; background: #202b3c; color: #e8eef7; }
-        QPushButton:hover { border-color: #65a3f5; }
-        QPushButton#primary { background: #287be8; color: #ffffff; border-color: #287be8; }
-        QPushButton#secondary { color: #9bc4fb; }
-        QPushButton:disabled { color: #687890; }
-        QTableWidget { border: 1px solid #303c50; gridline-color: #2a3547; background: #1b2432; alternate-background-color: #202b3c; }
-        QHeaderView::section { padding: 7px; background: #27354a; color: #c6d3e6; border: 0; }
-        QSplitter::handle { background: #303c50; }
-        QWidget#sidebar { background: #1b2432; border-right: 1px solid #303c50; }
-        QLabel#brand { font-size: 18px; font-weight: 700; color: #f3f7fc; }
-        QLabel#navSection { color: #8190a8; font-size: 11px; font-weight: 700; padding: 12px 10px 4px; }
-        QPushButton#navButton { text-align: left; padding: 9px 12px; border: 0; border-radius: 6px; color: #aebbd0; background: transparent; }
-        QPushButton#navButton:hover { background: #27354a; }
-        QPushButton#navButton:checked { color: #9bc4fb; background: #2a4264; font-weight: 600; }
-    """,
-    "海蓝": """
-        QMainWindow, QWidget { background: #eef8fa; color: #12313b; }
-        QGroupBox { border: 1px solid #b9dce2; border-radius: 10px; margin-top: 10px; padding: 12px; background: #ffffff; }
-        QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #3c707c; }
-        QLabel#title { font-size: 24px; font-weight: 700; color: #0b3e4d; }
-        QLabel#subtitle, QLabel#muted { color: #5d8992; }
-        QLabel#status { padding: 6px 12px; border-radius: 14px; background: #d9f1f3; color: #2f707a; }
-        QLabel#channelStatus { color: #3c707c; padding: 5px 8px; }
-        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { padding: 6px 8px; border: 1px solid #afd1d8; border-radius: 6px; background: #ffffff; }
-        QPushButton { padding: 7px 14px; border: 1px solid #afd1d8; border-radius: 6px; background: #ffffff; color: #195563; }
-        QPushButton:hover { border-color: #168fa0; }
-        QPushButton#primary { background: #078c9c; color: #ffffff; border-color: #078c9c; }
-        QPushButton#secondary { color: #14798b; }
-        QPushButton:disabled { color: #91abb1; }
-        QTableWidget { border: 1px solid #b9dce2; gridline-color: #e0f0f2; background: #ffffff; alternate-background-color: #f3fbfc; }
-        QHeaderView::section { padding: 7px; background: #d9f1f3; color: #3c707c; border: 0; }
-        QSplitter::handle { background: #b9dce2; }
-        QWidget#sidebar { background: #ffffff; border-right: 1px solid #b9dce2; }
-        QLabel#brand { font-size: 18px; font-weight: 700; color: #0b3e4d; }
-        QLabel#navSection { color: #6e9ca5; font-size: 11px; font-weight: 700; padding: 12px 10px 4px; }
-        QPushButton#navButton { text-align: left; padding: 9px 12px; border: 0; border-radius: 6px; color: #3c707c; background: transparent; }
-        QPushButton#navButton:hover { background: #e8f5f7; }
-        QPushButton#navButton:checked { color: #078c9c; background: #d9f1f3; font-weight: 600; }
-    """,
-}
+        def heightForWidth(self, width: int):  # type: ignore[override]
+            current = self.currentWidget()
+            return current.heightForWidth(width) if current is not None else super().heightForWidth(width)
+
 
 _EVENT_STATUS_LABELS = {
     "open": "待处理",
@@ -189,7 +164,7 @@ _STREAM_STATUS_LABELS = {
 
 if HAS_QT:
 
-    class MainWindow(SettingsPagesMixin, QMainWindow):
+    class MainWindow(DevicePagesMixin, SettingsPagesMixin, QMainWindow):
         """Desktop monitor with live overlays and event review tools."""
 
         def __init__(self, *, config: MonitorConfig | None = None, start_hidden: bool = False) -> None:
@@ -201,6 +176,12 @@ if HAS_QT:
             self._notification_worker: NotificationWorker | None = None
             self._notification_once_thread: QThread | None = None
             self._notification_once_worker: NotificationDispatchOnceWorker | None = None
+            self._notification_test_thread: QThread | None = None
+            self._notification_test_worker: NotificationTestWorker | None = None
+            self._model_test_thread: QThread | None = None
+            self._model_test_worker: ModelHealthWorker | None = None
+            self._model_test_status_label: QLabel | None = None
+            self._model_test_button: QPushButton | None = None
             self._notification_reports = 0
             self._notification_last_detail = "未启动"
             self._notification_state = "disabled"
@@ -212,29 +193,35 @@ if HAS_QT:
             self._quit_after_stop = False
             self._frames = 0
             self._events = 0
+            self._last_detections = 0
+            self._resource_sampler = ResourceSampler()
+            self._monitor_started_monotonic = time.monotonic()
             self._event_records: list[dict[str, Any]] = []
             self._visible_records: list[dict[str, Any]] = []
-            self._audit_records: list[dict[str, Any]] = []
-            self._visible_audit_records: list[dict[str, Any]] = []
             self._audit_loaded = False
             self._stream_states: dict[str, tuple[str, str]] = {}
             self._stream_health_history: dict[str, dict[str, Any]] = {}
-            self._stream_metrics: dict[str, dict[str, int]] = {}
+            self._stream_metrics: dict[str, dict[str, Any]] = {}
             self._arming_states: dict[str, bool] = {}
             self._preview_grid_widgets: dict[str, PreviewWidget] = {}
             self._preview_grid_cells: dict[str, QWidget] = {}
             self._preview_grid_layout: QGridLayout | None = None
             self._selected_event: dict[str, Any] | None = None
             self._selected_stream_id: str | None = None
+            self._preview_stream_id: str | None = None
+            self._rule_status_by_id: dict[str, str] = {}
             self._topology = self._base_config.topology
             self._loaded_db_path: str | None = None
             self._replay_locked = False
+            self._preview_stream_id = None
             self._settings = QSettings("FactoryGuard", "FactoryGuard")
             self._local_settings_path = self._resolve_local_settings_path()
             self._local_settings = self._read_local_settings()
+            self._device_manager: DeviceManager | None = None
+            self._gb28181_platform: Gb28181Platform | None = None
+            self._initialize_device_services()
             self._initialize_notification_destinations()
-            saved_theme = str(self._settings.value("theme", "浅色"))
-            self._saved_theme = saved_theme if saved_theme in _THEMES else "浅色"
+            self._initialize_model_profiles()
             self.setWindowTitle("FactoryGuard · 本地视频安全监控")
             screen = QApplication.primaryScreen()
             if screen is not None:
@@ -246,8 +233,9 @@ if HAS_QT:
             else:
                 self.resize(1180, 820)
             self.setMinimumSize(720, 480)
+            saved_theme = str(self._settings.value("theme", "浅色"))
+            self._saved_theme = saved_theme if saved_theme in _THEMES else "浅色"
             self._build_ui()
-            self.theme_combo.setCurrentText(self._saved_theme)
             self._tray: TrayController | None = None
             if TrayController is not None and QSystemTrayIcon_available():
                 self._tray = TrayController(
@@ -259,7 +247,6 @@ if HAS_QT:
                 self._tray.show()
                 self._tray.set_running(False)
             self._apply_theme(self._saved_theme)
-            self._set_status("ready", "就绪 · 等待启动监控")
             self._refresh_timer = QTimer(self)
             self._refresh_timer.setInterval(5000)
             self._refresh_timer.timeout.connect(self._refresh_runtime_surfaces)
@@ -309,21 +296,21 @@ if HAS_QT:
             nav("▣  监控中心", "monitor")
             section("网络与设备")
             nav("⌘  拓扑与设备", "topology")
+            nav("◉  设备发现", "device-discovery")
+            nav("▣  设备能力", "device-capabilities")
+            nav("▤  录像检索", "recordings")
+            nav("⚠  协议诊断", "diagnostics")
             nav("◷  事件审计", "events")
             nav("▤  系统审计", "audit")
             nav("⇄  通知中心", "notifications")
             section("系统")
             nav("☷  常规设置", "settings-general")
-            nav("◎  集中推理", "settings-inference")
-            nav("↗  Webhook 通道", "settings-webhook")
+            nav("◎  本机备用分析", "local-analysis")
             nav("✉  邮件 SMTP", "settings-email")
             nav("▤  短信通知服务", "settings-sms")
             nav("▣  存储与媒体", "settings-storage")
-            nav("◎  健康诊断", "settings-health")
+            nav("▥  资源监控", "settings-health")
             layout.addStretch(1)
-            footer = QLabel("本地部署 · SQLite\nCPU 推理 · RTSP")
-            footer.setObjectName("muted")
-            layout.addWidget(footer)
             return sidebar
 
         def _build_ui(self) -> None:
@@ -361,17 +348,22 @@ if HAS_QT:
             header.addWidget(self.channel_status_label)
             outer.addLayout(header)
 
-            top = QWidget()
-            top_layout = QHBoxLayout(top)
-            top_layout.setContentsMargins(0, 0, 0, 0)
-            preview_group = QGroupBox("实时预览 · 检测框")
+            monitor_page = QWidget()
+            monitor_layout = QHBoxLayout(monitor_page)
+            monitor_layout.setContentsMargins(0, 0, 0, 0)
+            monitor_layout.setSpacing(10)
+            left_splitter = QSplitter(Qt.Vertical)
+            left_splitter.setChildrenCollapsible(False)
+            left_splitter.setHandleWidth(6)
+            monitor_layout.addWidget(left_splitter, 3)
+            preview_group = QGroupBox("实时预览")
             preview_layout = QVBoxLayout(preview_group)
             self.preview = PreviewWidget()
             preview_layout.addWidget(self.preview, 1)
             self.preview_info = QLabel("等待视频流")
             self.preview_info.setObjectName("muted")
             preview_layout.addWidget(self.preview_info)
-            top_layout.addWidget(preview_group, 3)
+            left_splitter.addWidget(preview_group)
 
             side = QWidget()
             side_layout = QVBoxLayout(side)
@@ -387,6 +379,15 @@ if HAS_QT:
             self.height_spin = QSpinBox()
             self.height_spin.setRange(120, 4320)
             self.height_spin.setValue(self._base_config.height)
+            self.analysis_fps_spin = QDoubleSpinBox()
+            self.analysis_fps_spin.setRange(0.5, 30.0)
+            self.analysis_fps_spin.setSingleStep(0.5)
+            self.analysis_fps_spin.setDecimals(1)
+            self.analysis_fps_spin.setValue(self._base_config.fps)
+            self.model_input_size_combo = QComboBox()
+            for value in (320, 416, 640, 960):
+                self.model_input_size_combo.addItem(f"{value} × {value}", value)
+            self.model_input_size_combo.setCurrentIndex(max(0, self.model_input_size_combo.findData(self._base_config.input_size)))
             self.confidence_spin = QDoubleSpinBox()
             self.confidence_spin.setRange(0.01, 1.0)
             self.confidence_spin.setSingleStep(0.05)
@@ -403,8 +404,15 @@ if HAS_QT:
             size_row.addWidget(QLabel("高"))
             size_row.addWidget(self.height_spin)
             form.addRow("画面尺寸", size_row)
+            form.addRow("分析帧率", self.analysis_fps_spin)
+            form.addRow("模型输入尺寸", self.model_input_size_combo)
             form.addRow("置信度", self.confidence_spin)
             form.addRow("确认帧数", self.confirm_spin)
+            for advanced in (self.model_edit, self.model_input_size_combo, self.confidence_spin, self.confirm_spin):
+                advanced.setVisible(False)
+                label = form.labelForField(advanced)
+                if label is not None:
+                    label.setVisible(False)
             self.monitor_scope_combo = QComboBox()
             self.monitor_scope_combo.addItem("全部启用推流", "all")
             self.monitor_scope_combo.addItem("当前选中推流", "selected")
@@ -441,17 +449,14 @@ if HAS_QT:
             self.open_db_button = QPushButton("打开数据库目录")
             side_layout.addWidget(self.open_db_button)
             side_layout.addStretch(1)
-            top_layout.addWidget(side, 2)
+            monitor_layout.addWidget(side, 2)
 
             multiview_group = QGroupBox("多路预览 · 独立状态")
             self._preview_grid_layout = QGridLayout(multiview_group)
             self._preview_grid_layout.setContentsMargins(8, 8, 8, 8)
             self._preview_grid_layout.setSpacing(8)
-            monitor_page = QWidget()
-            monitor_layout = QVBoxLayout(monitor_page)
-            monitor_layout.setContentsMargins(0, 0, 0, 0)
-            monitor_layout.addWidget(top, 3)
-            monitor_layout.addWidget(multiview_group, 2)
+            left_splitter.addWidget(multiview_group)
+            left_splitter.setSizes([440, 260])
 
             events_group = QGroupBox("事件记录 · 搜索 / 筛选")
             events_layout = QVBoxLayout(events_group)
@@ -477,12 +482,14 @@ if HAS_QT:
             self.time_filter.addItem("最近 24 小时", 86400)
             self.time_filter.addItem("最近 7 天", 604800)
             self.refresh_button = QPushButton("刷新")
+            self.clear_filters_button = QPushButton("\u6e05\u9664\u7b5b\u9009")
             filters.addWidget(self.search_edit, 1)
             filters.addWidget(self.level_filter)
             filters.addWidget(self.status_filter)
             filters.addWidget(self.channel_filter)
             filters.addWidget(self.time_filter)
             filters.addWidget(self.refresh_button)
+            filters.addWidget(self.clear_filters_button)
             events_layout.addLayout(filters)
             entity_filters = QHBoxLayout()
             self.site_filter = QComboBox()
@@ -494,10 +501,19 @@ if HAS_QT:
             entity_filters.addWidget(self.site_filter)
             entity_filters.addWidget(self.area_filter)
             entity_filters.addWidget(self.camera_filter)
+            self.event_limit_combo = QComboBox()
+            self.event_limit_combo.addItem("最近 200 条", 200)
+            self.event_limit_combo.addItem("最近 500 条", 500)
+            self.event_limit_combo.addItem("最近 1000 条", 1000)
+            self.event_limit_combo.addItem("最近 3000 条", 3000)
+            self.event_limit_combo.setCurrentIndex(self.event_limit_combo.findData(200))
+            self.event_limit_combo.setToolTip("事件页只加载最近 N 条；筛选和导出基于当前加载结果。")
+            entity_filters.addWidget(QLabel("加载"))
+            entity_filters.addWidget(self.event_limit_combo)
             entity_filters.addStretch(1)
             events_layout.addLayout(entity_filters)
-            self.events_table = QTableWidget(0, 6)
-            self.events_table.setHorizontalHeaderLabels(["时间", "级别", "实体路径", "目标", "状态", "媒体"])
+            self.events_table = QTableWidget(0, 8)
+            self.events_table.setHorizontalHeaderLabels(["时间", "级别", "实体路径", "规则", "目标", "状态", "值班人员", "媒体"])
             self.events_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
             self.events_table.setSelectionBehavior(QAbstractItemView.SelectRows)
             self.events_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -510,12 +526,14 @@ if HAS_QT:
             self.close_event_button = QPushButton("关闭事件")
             self.export_events_button = QPushButton("导出事件 CSV")
             self.export_audit_button = QPushButton("导出审计 JSON")
+            self.replay_rule_button = QPushButton("轨迹试运行")
+            self.replay_rule_button.setEnabled(False)
             for button in (self.confirm_event_button, self.false_positive_button, self.close_event_button):
                 button.setEnabled(False)
                 review_controls.addWidget(button)
+            review_controls.addWidget(self.replay_rule_button)
             review_controls.addWidget(self.export_events_button)
             review_controls.addWidget(self.export_audit_button)
-            review_controls.addStretch(1)
             events_layout.addLayout(review_controls)
             inspector_group = QGroupBox("事件详情")
             inspector_layout = QVBoxLayout(inspector_group)
@@ -538,13 +556,20 @@ if HAS_QT:
                 "notifications": 5,
                 "settings-general": 6,
                 "settings-inference": 7,
-                "settings-webhook": 8,
-                "settings-email": 9,
-                "settings-sms": 10,
-                "settings-storage": 11,
-                "settings-health": 12,
+                "settings-models": 8,
+                "settings-webhook": 9,
+                "settings-email": 10,
+                "settings-sms": 11,
+                "settings-storage": 12,
+                "settings-health": 13,
+                "device-discovery": 14,
+                "device-capabilities": 15,
+                "recordings": 16,
+                "diagnostics": 17,
+                "local-analysis": 18,
             }
             self.page_stack = ResponsiveStackedWidget()
+            self.page_stack.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
             self.page_stack.addWidget(self._build_overview_page())
             self.page_stack.addWidget(monitor_page)
             self.page_stack.addWidget(self._build_topology_page())
@@ -553,15 +578,19 @@ if HAS_QT:
             self.page_stack.addWidget(self._build_notification_center_page())
             self.page_stack.addWidget(self._build_general_settings_page())
             self.page_stack.addWidget(self._build_inference_settings_page())
+            self.page_stack.addWidget(self._build_model_settings_page())
             self.page_stack.addWidget(self._build_webhook_settings_page())
             self.page_stack.addWidget(self._build_email_settings_page())
             self.page_stack.addWidget(self._build_sms_settings_page())
             self.page_stack.addWidget(self._build_storage_settings_page())
             self.page_stack.addWidget(self._build_health_settings_page())
-            self.page_stack.setMinimumHeight(680)
+            self.page_stack.addWidget(self._build_device_discovery_page())
+            self.page_stack.addWidget(self._build_device_capabilities_page())
+            self.page_stack.addWidget(self._build_recordings_page())
+            self.page_stack.addWidget(self._build_protocol_diagnostics_page())
+            self.page_stack.addWidget(self._build_local_analysis_page())
             self.page_scroll = QScrollArea()
             self.page_scroll.setObjectName("pageScroll")
-            self.page_scroll.setFrameShape(QFrame.NoFrame)
             self.page_scroll.setWidgetResizable(True)
             self.page_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
             self.page_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -574,6 +603,8 @@ if HAS_QT:
             self.start_button.clicked.connect(self.start_monitor)
             self.stop_button.clicked.connect(self.stop_monitor)
             self.refresh_button.clicked.connect(self._refresh_events)
+            self.clear_filters_button.clicked.connect(self._clear_event_filters)
+            self.event_limit_combo.currentIndexChanged.connect(self._refresh_events)
             self.refresh_button.clicked.connect(self._refresh_entity_tree)
             self.refresh_button.clicked.connect(self._refresh_audit)
             self.search_edit.textChanged.connect(self._apply_event_filters)
@@ -592,7 +623,7 @@ if HAS_QT:
             self.export_events_button.clicked.connect(self._export_events_csv)
             self.export_audit_button.clicked.connect(self._export_audit_json)
             self.replay_button.clicked.connect(self._show_selected_replay)
-            self.live_button.clicked.connect(self._show_live_preview)
+            self.replay_rule_button.clicked.connect(self._replay_selected_rule_track)
             self.open_db_button.clicked.connect(self._open_database)
 
         def _build_audit_page(self) -> QWidget:
@@ -708,8 +739,8 @@ if HAS_QT:
             layout.addWidget(status)
             health_group = QGroupBox("推流健康概览")
             health_layout = QVBoxLayout(health_group)
-            self.overview_stream_table = QTableWidget(0, 6)
-            self.overview_stream_table.setHorizontalHeaderLabels(["推流", "实体路径", "状态", "帧 / 检测", "最近成功", "重连次数"])
+            self.overview_stream_table = QTableWidget(0, 7)
+            self.overview_stream_table.setHorizontalHeaderLabels(["推流", "实体路径", "状态", "帧 / 检测", "处理帧率", "最近成功", "重连次数"])
             self.overview_stream_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
             self.overview_stream_table.setSelectionBehavior(QAbstractItemView.SelectRows)
             self.overview_stream_table.setAlternatingRowColors(True)
@@ -758,6 +789,7 @@ if HAS_QT:
             self.add_site_button = QPushButton("新增厂区")
             self.add_area_button = QPushButton("新增区域")
             self.add_camera_button = QPushButton("新增摄像头")
+            self.quick_add_camera_button = QPushButton("快速接入摄像头")
             self.add_stream_button = QPushButton("新增推流")
             self.add_bulk_stream_button = QPushButton("批量新增推流")
             self.import_topology_button = QPushButton("导入 CSV")
@@ -772,6 +804,7 @@ if HAS_QT:
             actions.addWidget(self.add_site_button)
             actions.addWidget(self.add_area_button)
             actions.addWidget(self.add_camera_button)
+            actions.addWidget(self.quick_add_camera_button)
             actions.addWidget(self.add_stream_button)
             actions.addWidget(self.add_bulk_stream_button)
             actions.addWidget(self.import_topology_button)
@@ -803,6 +836,7 @@ if HAS_QT:
             streams_layout.addWidget(self.stream_table, 3)
             rule_actions = QHBoxLayout()
             self.add_rule_button = QPushButton("新增规则")
+            self.add_native_rule_button = QPushButton("设备事件规则")
             self.edit_rule_button = QPushButton("编辑选中规则")
             self.toggle_rule_button = QPushButton("启用/停用选中规则")
             self.refresh_rules_button = QPushButton("刷新规则")
@@ -812,14 +846,26 @@ if HAS_QT:
             self.disarm_all_button = QPushButton("全部撤防")
             self.schedule_button = QPushButton("时间表")
             self.probe_stream_button = QPushButton("测试连接")
+            self.submit_rule_button = QPushButton("提交审核")
+            self.approve_rule_button = QPushButton("审核通过")
+            self.reject_rule_button = QPushButton("驳回")
+            self.review_history_button = QPushButton("审核记录")
+            self.version_history_button = QPushButton("版本历史")
             self.add_rule_button.setEnabled(False)
+            self.add_native_rule_button.setEnabled(False)
             self.edit_rule_button.setEnabled(False)
             self.toggle_rule_button.setEnabled(False)
             self.arm_button.setEnabled(False)
             self.disarm_button.setEnabled(False)
             self.schedule_button.setEnabled(False)
             self.probe_stream_button.setEnabled(False)
+            self.submit_rule_button.setEnabled(False)
+            self.approve_rule_button.setEnabled(False)
+            self.reject_rule_button.setEnabled(False)
+            self.review_history_button.setEnabled(False)
+            self.version_history_button.setEnabled(False)
             rule_actions.addWidget(self.add_rule_button)
+            rule_actions.addWidget(self.add_native_rule_button)
             rule_actions.addWidget(self.edit_rule_button)
             rule_actions.addWidget(self.toggle_rule_button)
             rule_actions.addWidget(self.refresh_rules_button)
@@ -831,8 +877,18 @@ if HAS_QT:
             rule_actions.addWidget(self.probe_stream_button)
             rule_actions.addStretch(1)
             streams_layout.addLayout(rule_actions)
-            self.rule_table = QTableWidget(0, 5)
-            self.rule_table.setHorizontalHeaderLabels(["规则", "推流", "类型", "确认帧", "状态"])
+            rule_workflow_actions = QHBoxLayout()
+            rule_workflow_actions.addWidget(self.submit_rule_button)
+            rule_workflow_actions.addWidget(self.approve_rule_button)
+            rule_workflow_actions.addWidget(self.reject_rule_button)
+            rule_workflow_actions.addWidget(self.review_history_button)
+            rule_workflow_actions.addWidget(self.version_history_button)
+            rule_workflow_hint = QLabel("草稿提交后，需两名不同审核人通过才会发布。")
+            rule_workflow_hint.setObjectName("muted")
+            rule_workflow_actions.addWidget(rule_workflow_hint, 1)
+            streams_layout.addLayout(rule_workflow_actions)
+            self.rule_table = QTableWidget(0, 7)
+            self.rule_table.setHorizontalHeaderLabels(["规则", "推流", "类型", "条件组件", "参数", "状态", "动作"])
             self.rule_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
             self.rule_table.setSelectionBehavior(QAbstractItemView.SelectRows)
             self.rule_table.setAlternatingRowColors(True)
@@ -846,6 +902,7 @@ if HAS_QT:
             self.add_site_button.clicked.connect(self._add_site)
             self.add_area_button.clicked.connect(self._add_area)
             self.add_camera_button.clicked.connect(self._add_camera)
+            self.quick_add_camera_button.clicked.connect(self._quick_add_camera)
             self.add_stream_button.clicked.connect(self._add_stream)
             self.add_bulk_stream_button.clicked.connect(self._add_bulk_streams)
             self.import_topology_button.clicked.connect(self._import_topology_csv)
@@ -854,9 +911,15 @@ if HAS_QT:
             self.edit_entity_button.clicked.connect(self._edit_selected_entity)
             self.toggle_entity_button.clicked.connect(self._toggle_selected_entity)
             self.add_rule_button.clicked.connect(self._add_default_rule)
+            self.add_native_rule_button.clicked.connect(self._add_native_rule)
             self.edit_rule_button.clicked.connect(self._edit_selected_rule)
             self.toggle_rule_button.clicked.connect(self._toggle_selected_rule)
             self.refresh_rules_button.clicked.connect(self._refresh_rule_table)
+            self.submit_rule_button.clicked.connect(self._submit_selected_rule)
+            self.approve_rule_button.clicked.connect(self._approve_selected_rule)
+            self.reject_rule_button.clicked.connect(self._reject_selected_rule)
+            self.review_history_button.clicked.connect(self._show_rule_review_history)
+            self.version_history_button.clicked.connect(self._show_rule_version_history)
             self.arm_button.clicked.connect(lambda: self._set_stream_armed(True))
             self.disarm_button.clicked.connect(lambda: self._set_stream_armed(False))
             self.arm_all_button.clicked.connect(lambda: self._set_all_streams_armed(True))
@@ -909,6 +972,14 @@ if HAS_QT:
                 else:
                     raise ValueError(f"{destination.name}: 不支持的通知类型 {destination.kind}")
 
+        def _webhook_secret_value(self) -> str:
+            return self.webhook_secret_edit.text() or self._base_config.webhook_secret
+
+        def _email_password_value(self) -> str:
+            return self.email_password_edit.text() or self._base_config.email_password
+
+        def _sms_token_value(self) -> str:
+            return self.sms_token_edit.text() or self._base_config.sms_token
         def _email_security_settings(self) -> tuple[bool, bool]:
             mode = str(self.email_security_combo.currentData() or "starttls")
             if mode == "ssl":
@@ -929,19 +1000,128 @@ if HAS_QT:
             except ValueError:
                 return ()
 
+        def _start_model_health_check(
+            self,
+            *,
+            model_path: str,
+            status_label: QLabel,
+            button: QPushButton,
+            confidence: float = 0.25,
+            iou: float = 0.45,
+        ) -> None:
+            if self._model_test_thread is not None and self._model_test_thread.isRunning():
+                self.statusBar().showMessage("模型检查仍在进行", 5000)
+                return
+            self._model_test_status_label = status_label
+            self._model_test_button = button
+            status_label.setText("正在检查模型…")
+            button.setEnabled(False)
+            self._model_test_thread = QThread(self)
+            self._model_test_worker = ModelHealthWorker(
+                model_path,
+                confidence=confidence,
+                iou=iou,
+            )
+            self._model_test_worker.moveToThread(self._model_test_thread)
+            self._model_test_thread.started.connect(self._model_test_worker.run)
+            self._model_test_worker.result_ready.connect(self._on_model_test_result)
+            self._model_test_worker.finished.connect(self._model_test_thread.quit)
+            self._model_test_worker.finished.connect(self._model_test_worker.deleteLater)
+            self._model_test_thread.finished.connect(self._on_model_test_finished)
+            self._model_test_thread.finished.connect(self._model_test_thread.deleteLater)
+            self._model_test_thread.start()
+
+        def _on_model_test_result(self, _ok: bool, detail: str) -> None:
+            if self._model_test_status_label is not None:
+                self._model_test_status_label.setText(detail)
+
+        def _on_model_test_finished(self) -> None:
+            if self._model_test_button is not None:
+                self._model_test_button.setEnabled(True)
+            self._model_test_status_label = None
+            self._model_test_button = None
+            self._model_test_worker = None
+            self._model_test_thread = None
+            self._maybe_quit_after_workers()
+        def _send_notification_test(self, kind: str) -> None:
+            if not self._require_permission(Permission.MANAGE_SYSTEM, "通知测试"):
+                return
+            if self._notification_test_thread is not None and self._notification_test_thread.isRunning():
+                self.statusBar().showMessage("通知测试仍在进行", 5000)
+                return
+            try:
+                if kind == "webhook":
+                    adapter = WebhookAdapter(
+                        url=self.webhook_url_edit.text().strip(),
+                        secret=self._webhook_secret_value(),
+                    )
+                    label = "测试 Webhook"
+                elif kind == "email":
+                    use_ssl, starttls = self._email_security_settings()
+                    adapter = EmailAdapter(
+                        host=self.email_host_edit.text(),
+                        port=self.email_port_spin.value(),
+                        username=self.email_username_edit.text(),
+                        password=self._email_password_value(),
+                        sender=self.email_sender_edit.text(),
+                        recipients=parse_recipients(self.email_recipients_edit.text()),
+                        use_ssl=use_ssl,
+                        starttls=starttls,
+                    )
+                    label = "测试邮件"
+                elif kind == "sms":
+                    adapter = SmsHttpAdapter(
+                        endpoint=self.sms_endpoint_edit.text(),
+                        recipients=parse_phone_recipients(self.sms_recipients_edit.text()),
+                        provider=str(self.sms_provider_combo.currentData() or "custom_http"),
+                        token=self._sms_token_value(),
+                        sender=self.sms_sender_edit.text(),
+                        template_id=self.sms_template_edit.text(),
+                    )
+                    label = "测试短信"
+                else:
+                    raise ValueError(f"unsupported notification test: {kind}")
+            except (TypeError, ValueError) as exc:
+                self.statusBar().showMessage(f"{kind} 配置无效：{exc}", 7000)
+                return
+
+            self.webhook_test_button.setEnabled(False)
+            self.email_test_button.setEnabled(False)
+            self.sms_test_button.setEnabled(False)
+            self.statusBar().showMessage(f"正在发送{label}…", 7000)
+            self._notification_test_thread = QThread(self)
+            self._notification_test_worker = NotificationTestWorker(adapter)
+            self._notification_test_worker.moveToThread(self._notification_test_thread)
+            self._notification_test_thread.started.connect(self._notification_test_worker.run)
+            self._notification_test_worker.result_ready.connect(self._on_notification_test_result)
+            self._notification_test_worker.finished.connect(self._notification_test_thread.quit)
+            self._notification_test_worker.finished.connect(self._notification_test_worker.deleteLater)
+            self._notification_test_thread.finished.connect(self._on_notification_test_finished)
+            self._notification_test_thread.finished.connect(self._notification_test_thread.deleteLater)
+            self._notification_test_thread.start()
+
+        def _on_notification_test_result(self, ok: bool, detail: str) -> None:
+            prefix = "通知测试成功" if ok else "通知测试失败"
+            self.statusBar().showMessage(f"{prefix}：{detail}", 10000)
+
+        def _on_notification_test_finished(self) -> None:
+            self._notification_test_worker = None
+            self._notification_test_thread = None
+            self.webhook_test_button.setEnabled(True)
+            self.email_test_button.setEnabled(True)
+            self.sms_test_button.setEnabled(True)
+            self._maybe_quit_after_workers()
         def _save_notification_settings(self) -> None:
             """Persist non-sensitive notification settings in the local data directory."""
             if not self._require_permission(Permission.MANAGE_SYSTEM, "通知配置"):
                 return
             channels = self._notification_channels_from_form()
-            if not channels:
-                self.statusBar().showMessage("请至少启用一个通知通道，未保存", 6000)
-                return
-            try:
-                self._validate_notification_destinations()
-            except (TypeError, ValueError) as exc:
-                self.statusBar().showMessage(f"通知配置无效：{exc}", 7000)
-                return
+            if channels:
+                try:
+                    self._validate_notification_destinations()
+                except (TypeError, ValueError) as exc:
+                    self.statusBar().showMessage(f"通知配置无效：{exc}", 7000)
+                    return
             url = self.webhook_url_edit.text().strip()
             if "webhook" in channels and not url:
                 self.statusBar().showMessage("请填写 Webhook 回调地址，未保存", 6000)
@@ -957,7 +1137,7 @@ if HAS_QT:
                         host=self.email_host_edit.text(),
                         port=self.email_port_spin.value(),
                         username=self.email_username_edit.text(),
-                        password=self.email_password_edit.text(),
+                        password=self._email_password_value(),
                         sender=self.email_sender_edit.text(),
                         recipients=recipients,
                         use_ssl=use_ssl,
@@ -973,7 +1153,7 @@ if HAS_QT:
                         endpoint=self.sms_endpoint_edit.text(),
                         recipients=sms_recipients,
                         provider=str(self.sms_provider_combo.currentData() or "custom_http"),
-                        token=self.sms_token_edit.text(),
+                        token=self._sms_token_value(),
                         sender=self.sms_sender_edit.text(),
                         template_id=self.sms_template_edit.text(),
                     )
@@ -1016,10 +1196,12 @@ if HAS_QT:
             self._refresh_destination_table("webhook")
             self._refresh_destination_table("email")
             self._refresh_destination_table("sms")
-            self.statusBar().showMessage(
-                "通知配置已保存（Webhook 密钥、SMTP 密码和短信令牌仅保留在当前进程）",
-                6000,
+            saved_message = (
+                "通知配置已保存（当前为本地事件模式，未启用通知通道）"
+                if not channels
+                else "通知配置已保存（Webhook 密钥、SMTP 密码和短信令牌仅保留在当前进程）"
             )
+            self.statusBar().showMessage(saved_message, 6000)
 
         def _save_operator_settings(self) -> None:
             actor = self._current_actor()
@@ -1061,6 +1243,80 @@ if HAS_QT:
                 f"当前角色“{ROLE_LABELS[role]}”没有“{action}”权限", 6000
             )
             return False
+
+        def _model_profile_by_id(self, profile_id: str | None) -> ModelProfile | None:
+            return next((profile for profile in self._model_profiles if profile.id == profile_id), None)
+
+        def _initialize_device_services(self) -> None:
+            if self._base_config.db == ":memory:":
+                return
+            try:
+                platform = Gb28181Platform(
+                    platform_id=self._base_config.gb28181_platform_id,
+                    domain=self._base_config.gb28181_domain,
+                    password=self._base_config.gb28181_password,
+                    port=self._base_config.gb28181_port,
+                    on_native_event=self._handle_native_device_event,
+                )
+                self._device_manager = DeviceManager(SQLiteStore(self._base_config.db), gb_platform=platform)
+                self._gb28181_platform = platform
+                if self._base_config.gb28181_enabled:
+                    self._device_manager.start_gb_service(port=self._base_config.gb28181_port)
+            except (OSError, RuntimeError, ValueError):
+                self._device_manager = None
+                self._gb28181_platform = None
+
+        def _handle_native_device_event(self, event: object) -> None:
+            self.statusBar().showMessage(f"收到设备事件：{getattr(event, 'title', '设备事件')}", 5000)
+
+        def _initialize_model_profiles(self) -> None:
+            saved = self._local_settings.get("models", {})
+            try:
+                db_path = self._base_config.db
+                if db_path != ":memory:":
+                    store = SQLiteStore(db_path)
+                    try:
+                        db_profiles, db_bindings = store.load_model_configuration()
+                    finally:
+                        store.close()
+                    if db_profiles:
+                        self._model_profiles = list(db_profiles)
+                        self._model_bindings = list(db_bindings)
+                        self._selected_model_profile_id = self._model_profiles[0].id
+                        self._model_table_refreshing = False
+                        return
+            except (OSError, RuntimeError, ValueError, TypeError):
+                pass
+            raw_profiles = saved.get("profiles", []) if isinstance(saved, dict) else []
+            raw_bindings = saved.get("bindings", []) if isinstance(saved, dict) else []
+            self._model_profiles = []
+            self._model_bindings = []
+            for value in raw_profiles:
+                if isinstance(value, dict):
+                    try:
+                        self._model_profiles.append(ModelProfile.from_public_dict(value))
+                    except (TypeError, ValueError):
+                        continue
+            for value in raw_bindings:
+                if isinstance(value, dict):
+                    try:
+                        self._model_bindings.append(ModelBinding.from_public_dict(value))
+                    except (TypeError, ValueError):
+                        continue
+            for profile in self._model_profiles:
+                if profile.backend != "onnx_cpu":
+                    profile.backend = "onnx_cpu"
+                    if profile.model_uri.lower().startswith(("http://", "https://")):
+                        profile.model_uri = self._base_config.model
+            if not self._model_profiles:
+                self._model_profiles.append(ModelProfile(
+                    id=new_model_profile_id(),
+                    name="默认本地模型",
+                    backend="onnx_cpu",
+                    model_uri=self._base_config.model,
+                ))
+            self._selected_model_profile_id = self._model_profiles[0].id
+            self._model_table_refreshing = False
 
         def _initialize_notification_destinations(self) -> None:
             """Load multi-instance destinations with single-channel migration."""
@@ -1196,11 +1452,15 @@ if HAS_QT:
             usage = shutil.disk_usage(disk_root)
             integrity = "not_checked"
             pending_notifications = 0
+            rules_loaded = 0
+            active_rules_loaded = 0
             if database is not None and database.exists():
                 store = SQLiteStore(database)
                 try:
                     integrity = store.integrity_check()
                     pending_notifications = len(store.list_pending_outbox())
+                    rules_loaded = len(store.load_rules())
+                    active_rules_loaded = len(store.load_rules(enabled_only=True, published_only=True))
                 finally:
                     store.close()
             topology = self._topology
@@ -1241,6 +1501,8 @@ if HAS_QT:
                     "polls": self._notification_reports,
                 },
                 "events_loaded": len(self._event_records),
+                "rules_loaded": rules_loaded,
+                "active_rules_loaded": active_rules_loaded,
                 "monitoring": self._thread is not None and self._thread.isRunning(),
                 "preflight": self._preflight_checks(database=database, disk_root=disk_root),
             }
@@ -1260,6 +1522,25 @@ if HAS_QT:
                 add("SQLite 数据库", "error", "完整性检查未通过")
             else:
                 add("SQLite 数据库", "warn", "数据库尚未创建，启动监控时会自动初始化")
+
+            if database is not None and database.exists():
+                rule_store = SQLiteStore(database)
+                try:
+                    total_rules = len(rule_store.load_rules())
+                    active_rules = len(rule_store.load_rules(enabled_only=True, published_only=True))
+                except (OSError, RuntimeError, sqlite3.Error, ValueError):
+                    add("规则运行状态", "error", "无法读取规则库存")
+                else:
+                    if active_rules:
+                        add("规则运行状态", "ok", f"{active_rules} 条启用且已发布的规则")
+                    elif total_rules:
+                        add("规则运行状态", "warn", "存在规则但没有启用且已发布的规则")
+                    else:
+                        add("规则运行状态", "warn", "尚未配置规则")
+                finally:
+                    rule_store.close()
+            else:
+                add("规则运行状态", "warn", "数据库尚未创建，暂时无法统计规则")
 
             ffmpeg = find_ffmpeg()
             if ffmpeg is None:
@@ -1294,10 +1575,10 @@ if HAS_QT:
                 add("媒体目录", "error", str(exc))
 
             webhook_url = self.webhook_url_edit.text().strip()
-            webhook_secret = self.webhook_secret_edit.text()
+            webhook_secret = self._webhook_secret_value()
             channels = self._notification_channels_from_form()
             if not channels:
-                add("通知配置", "warn", "未启用通知通道，事件仍会写入本地 Outbox")
+                add("通知配置", "ok", "本地模式：事件、截图和短视频只保存在本机，不创建通知任务")
             else:
                 try:
                     self._validate_notification_destinations()
@@ -1320,7 +1601,7 @@ if HAS_QT:
                 email_recipients = self._email_recipients_from_form()
                 if not email_host or not email_sender or not email_recipients:
                     add("邮件通知", "warn", "SMTP 主机、发件人或收件人尚未配置完整")
-                elif self.email_username_edit.text().strip() and not self.email_password_edit.text():
+                elif self.email_username_edit.text().strip() and not self._email_password_value():
                     add("邮件通知", "warn", "已配置 SMTP 账号，但当前进程缺少密码或授权码")
                 else:
                     add("邮件通知", "ok", f"SMTP {email_host}:{self.email_port_spin.value()} 已配置")
@@ -1358,20 +1639,52 @@ if HAS_QT:
         def _refresh_health(self) -> None:
             try:
                 snapshot = self._health_snapshot()
-                disk = snapshot["disk"]
-                topology = snapshot["topology"]
-                self.health_label.setText(
-                    f"数据库：{snapshot['database_integrity']} · 待发送通知：{snapshot['pending_notifications']}\n"
-                    f"磁盘：{disk['free_gb']} GB 可用 / {disk['total_gb']} GB · "
-                    f"实体：{topology['sites']} 厂区、{topology['areas']} 区域、"
-                    f"{topology['cameras']} 摄像头、{topology['streams']} 推流\n"
-                    f"运行状态：{'监控中' if snapshot['monitoring'] else '待机'} · "
-                    f"通知：{snapshot['notifications']['status']}\n"
-                    + "预检："
-                    + " · ".join(
-                        f"{item['name']}={item['state']}" for item in snapshot.get("preflight", [])
-                    )
+                path_text = self.db_edit.text().strip() or self._base_config.db
+                disk_root = (
+                    Path(path_text).expanduser().resolve().parent
+                    if path_text != ":memory:"
+                    else Path.cwd()
                 )
+                resources = self._resource_sampler.sample(disk_root)
+                topology = snapshot["topology"]
+                model_sessions = len(getattr(self._worker, "_engine_cache", {})) if self._worker is not None else 0
+                active_streams = sum(
+                    state in {"ready", "running"}
+                    for state, _detail in self._stream_states.values()
+                )
+                self.health_label.setText(
+                    f"CPU {resources.cpu_percent:.1f}% · 内存 {resources.memory_used_percent:.1f}% · "
+                    f"FactoryGuard {format_bytes(resources.process_memory_bytes)} · "
+                    f"磁盘 {format_bytes(resources.disk_free_bytes)} 可用"
+                )
+                resource_state = {"ok": "正常", "warn": "注意", "error": "异常"}[classify_resource_state(resources)]
+                rows = (
+                    ("资源状态", resource_state),
+                    ("CPU 使用率", f"{resources.cpu_percent:.1f}%"),
+                    ("物理内存", f"{format_bytes(resources.memory_total_bytes - resources.memory_available_bytes)} / {format_bytes(resources.memory_total_bytes)}"),
+                    ("FactoryGuard 内存", format_bytes(resources.process_memory_bytes)),
+                    ("FactoryGuard CPU", f"{resources.process_cpu_percent:.1f}%"),
+                    ("逻辑处理器", str(resources.logical_cpu_count)),
+                    ("磁盘可用空间", f"{format_bytes(resources.disk_free_bytes)} / {format_bytes(resources.disk_total_bytes)}"),
+                    ("当前线程", str(resources.thread_count)),
+                    ("运行推流", f"{active_streams} / {max(len(self._stream_states), topology['streams'])}"),
+                    ("ONNX 模型会话", str(model_sessions)),
+                    ("分析帧率", f"{self.analysis_fps_spin.value():.1f} fps"),
+                    ("模型输入尺寸", f"{int(self.model_input_size_combo.currentData() or 640)} px"),
+                    ("已记录事件", str(snapshot["events_loaded"])),
+                    ("待发送通知", str(snapshot["pending_notifications"])),
+                    ("规则总数", str(snapshot["rules_loaded"])),
+                    ("生效规则", str(snapshot["active_rules_loaded"])),
+                    ("配置规模", str(snapshot["topology"]["sites"]) + " 厂区 · " + str(snapshot["topology"]["areas"]) + " 区域 · " + str(snapshot["topology"]["cameras"]) + " 摄像头 · " + str(snapshot["topology"]["streams"]) + " 推流"),
+                    ("数据库完整性", str(snapshot["database_integrity"])),
+                )
+                if hasattr(self, "resource_table"):
+                    self.resource_table.setRowCount(0)
+                    for name, value in rows:
+                        row = self.resource_table.rowCount()
+                        self.resource_table.insertRow(row)
+                        self.resource_table.setItem(row, 0, QTableWidgetItem(name))
+                        self.resource_table.setItem(row, 1, QTableWidgetItem(value))
                 state_labels = {"ok": "正常", "warn": "注意", "error": "异常"}
                 self.preflight_table.setRowCount(0)
                 for check in snapshot.get("preflight", []):
@@ -1386,10 +1699,11 @@ if HAS_QT:
                     ):
                         self.preflight_table.setItem(row, column, QTableWidgetItem(value))
             except (OSError, sqlite3.Error, ValueError) as exc:
-                self.health_label.setText(f"健康检查失败：{exc}")
+                self.health_label.setText(f"资源刷新失败：{exc}")
+                if hasattr(self, "resource_table"):
+                    self.resource_table.setRowCount(0)
                 if hasattr(self, "preflight_table"):
                     self.preflight_table.setRowCount(0)
-
         def _export_diagnostics(self) -> None:
             try:
                 snapshot = self._health_snapshot()
@@ -1424,15 +1738,20 @@ if HAS_QT:
                 4: ("系统审计", "配置变更、健康状态和操作记录"),
                 5: ("通知中心", "通道开关 · Outbox 队列 · 投递调度"),
                 6: ("常规设置", "操作身份、运行策略与界面外观"),
-                7: ("集中推理", "中心模型服务与低成本部署"),
-                8: ("Webhook 通道", "HTTPS 回调地址与签名凭据"),
-                9: ("邮件 SMTP", "发件账号、收件人与传输加密"),
-                10: ("短信通知服务", "短信网关、签名、模板与接收号码"),
-                11: ("存储与媒体", "数据库备份、配置包与媒体保留"),
-                12: ("健康诊断", "部署预检、运行状态与诊断导出"),
+                7: ("推理设置", "本机 ONNX Runtime 与分析性能参数"),
+                8: ("模型接入", "模型注册、后端、标签与健康检查"),
+                9: ("Webhook 通道", "HTTPS 回调地址与签名凭据"),
+                10: ("邮件 SMTP", "发件账号、收件人与传输加密"),
+                11: ("短信通知服务", "短信网关、签名、模板与接收号码"),
+                12: ("存储与媒体", "数据库备份、配置包与媒体保留"),
+                13: ("资源监控", "本机资源、进程占用与关键组件状态"),
+                14: ("设备发现", "ONVIF、RTSP 与 GB/T 28181 接入"),
+                15: ("设备能力", "连接、通道、录像与原生事件"),
+                16: ("录像检索", "按设备与时间查询录像"),
+                17: ("协议诊断", "连接、注册、订阅与流状态"),
+                18: ("本机备用分析", "设备能力不足时的本机 ONNX 兜底"),
             }
             title, subtitle = titles.get(index, titles[0])
-            self.header_title.setText(title)
             self.header_subtitle.setText(subtitle)
             if index == 0:
                 self._refresh_overview()
@@ -1442,10 +1761,10 @@ if HAS_QT:
                 self._refresh_events()
             elif index == 4:
                 self._refresh_audit()
+            elif index == 13:
+                self._refresh_health()
             elif index == 5:
                 self._refresh_notification_queue()
-            elif index == 12:
-                self._refresh_health()
 
         def _refresh_overview(self) -> None:
             if not hasattr(self, "_overview_labels"):
@@ -1462,26 +1781,35 @@ if HAS_QT:
                 self._overview_labels[key].setText(str(value))
             if hasattr(self, "overview_stream_table"):
                 self.overview_stream_table.setRowCount(0)
-                if topology is not None:
-                    for stream in topology.streams:
-                        path = topology.stream_path(stream.id)
-                        state, _detail = self._stream_states.get(stream.id, ("", ""))
-                        health = self._stream_health_history.get(stream.id, {})
-                        row = self.overview_stream_table.rowCount()
-                        self.overview_stream_table.insertRow(row)
-                        values = (
-                            stream.name,
-                            path.display_name,
-                            _STREAM_STATUS_LABELS.get(state, "未启动"),
-                            f"{self._stream_metrics.get(stream.id, {}).get('frames', 0)} / "
-                            f"{self._stream_metrics.get(stream.id, {}).get('detections', 0)}",
-                            str(health.get("last_ok_at") or "—"),
-                            str(health.get("reconnect_count", 0)),
-                        )
-                        for column, value in enumerate(values):
-                            item = QTableWidgetItem(value)
-                            item.setData(Qt.UserRole, stream.id)
-                            self.overview_stream_table.setItem(row, column, item)
+                if topology is not None and topology.streams:
+                    stream_rows = [
+                        (stream.id, stream.name, topology.stream_path(stream.id).display_name, stream.fps)
+                        for stream in topology.streams
+                    ]
+                else:
+                    stream_rows = [
+                        (stream_id, stream_id, "未配置拓扑的本地推流", self._base_config.fps)
+                        for stream_id in sorted(self._stream_states)
+                    ]
+                for stream_id, stream_name, display_name, target_fps in stream_rows:
+                    state, _detail = self._stream_states.get(stream_id, ("", ""))
+                    health = self._stream_health_history.get(stream_id, {})
+                    row = self.overview_stream_table.rowCount()
+                    self.overview_stream_table.insertRow(row)
+                    values = (
+                        stream_name,
+                        display_name,
+                        _STREAM_STATUS_LABELS.get(state, "未启动"),
+                        f"{self._stream_metrics.get(stream_id, {}).get('frames', 0)} / "
+                        f"{self._stream_metrics.get(stream_id, {}).get('detections', 0)}",
+                        f"{self._stream_fps(stream_id):.1f}/{target_fps:.1f} fps",
+                        str(health.get("last_ok_at") or "—"),
+                        str(health.get("reconnect_count", 0)),
+                    )
+                    for column, value in enumerate(values):
+                        item = QTableWidgetItem(value)
+                        item.setData(Qt.UserRole, stream_id)
+                        self.overview_stream_table.setItem(row, column, item)
             running = self._thread is not None and self._thread.isRunning()
             if running and self._stream_states:
                 healthy = sum(state in {"ready", "running"} for state, _detail in self._stream_states.values())
@@ -1546,7 +1874,7 @@ if HAS_QT:
                 self._refresh_audit()
             elif current_page == 5:
                 self._refresh_notification_queue()
-            elif current_page == 12:
+            elif current_page == 13:
                 self._refresh_health()
 
         def _select_overview_stream(self, row: int) -> None:
@@ -1594,7 +1922,7 @@ if HAS_QT:
                     path.camera.name,
                     stream.name,
                     str(stream.role),
-                    stream.url,
+                    _redact_text(stream.url),
                     (
                         "停用"
                         if not stream.enabled
@@ -1890,7 +2218,8 @@ if HAS_QT:
                     role=existing.role,
                     width=self.width_spin.value(),
                     height=self.height_spin.value(),
-                    fps=existing.fps,
+                    fps=self.analysis_fps_spin.value(),
+                    input_size=int(self.model_input_size_combo.currentData() or 640),
                     model=model_text,
                     confidence=self.confidence_spin.value(),
                     enabled=existing.enabled,
@@ -2056,7 +2385,7 @@ if HAS_QT:
                 finally:
                     store.close()
                 dialog = ScheduleEditorDialog(stream_id=stream_id, schedule=schedule, parent=self)
-                if dialog.exec() != dialog.Accepted or dialog.schedule is None:
+                if dialog.exec() != QDialog.DialogCode.Accepted or dialog.schedule is None:
                     return
                 store = SQLiteStore(path)
                 try:
@@ -2067,17 +2396,25 @@ if HAS_QT:
             except (OSError, sqlite3.Error, ValueError) as exc:
                 self.statusBar().showMessage(f"时间表保存失败：{exc}", 5000)
 
-        def _refresh_rule_table(self) -> None:
+        def _refresh_rule_table(self, select_rule_id: str | None = None) -> None:
             if not hasattr(self, "rule_table"):
                 return
+            selected_before = self._selected_rule_id()
+            scroll_value = self.rule_table.verticalScrollBar().value()
             self.rule_table.setRowCount(0)
+            self._rule_status_by_id.clear()
+            self.submit_rule_button.setEnabled(False)
+            self.approve_rule_button.setEnabled(False)
+            self.reject_rule_button.setEnabled(False)
             self.toggle_rule_button.setEnabled(False)
             self.edit_rule_button.setEnabled(False)
             stream_id = self._selected_stream_id
             if not stream_id:
                 self.add_rule_button.setEnabled(False)
+                self.add_native_rule_button.setEnabled(False)
                 return
             self.add_rule_button.setEnabled(True)
+            self.add_native_rule_button.setEnabled(True)
             path = self.db_edit.text().strip() or self._base_config.db
             if path == ":memory:":
                 return
@@ -2090,21 +2427,64 @@ if HAS_QT:
             finally:
                 store.close()
             type_labels = {RuleType.POLYGON.value: "多边形", RuleType.LINE.value: "绊线"}
+            direction_labels = RULE_DIRECTION_LABELS
             for rule in rules:
                 row = self.rule_table.rowCount()
                 self.rule_table.insertRow(row)
+                self._rule_status_by_id[rule.id] = rule.publication_status
+                condition_label = RULE_CONDITION_LABELS.get(rule.condition, rule.condition)
+                if rule.condition == "line_count":
+                    parameter = (
+                        f"{rule.window_seconds:g} \u79d2\u5185 \u2265 {rule.count_threshold} \u6b21 \u00b7 "
+                        f"{direction_labels.get(rule.direction, rule.direction)}"
+                    )
+                elif rule.condition == "occupancy":
+                    parameter = f"≥ {rule.count_threshold} 人"
+                elif rule.condition == "dwell":
+                    parameter = f"≥ {rule.dwell_seconds:g} 秒"
+                elif rule.condition == "line_cross":
+                    parameter = direction_labels.get(rule.direction, rule.direction)
+                else:
+                    parameter = "—"
+                action_text = " / ".join(
+                    RULE_ACTION_LABELS.get(action, action) for action in rule.actions
+                ) or "—"
+                if rule.publication_status == "published":
+                    status_text = "已发布" if rule.enabled else "已发布 · 已停用"
+                elif rule.publication_status == "pending_review":
+                    status_text = "待审核（未运行）"
+                else:
+                    status_text = "草稿（未运行）"
+                trigger_label = "设备事件" if rule.trigger_mode is RuleMode.NATIVE_EVENT else type_labels.get(rule.type.value if rule.type else "", "画面")
+                if rule.trigger_mode is RuleMode.NATIVE_EVENT:
+                    condition_label = "设备事件"
+                    parameter = ", ".join(rule.native_event_codes)
                 values = (
                     rule.name,
                     rule.stream_id,
-                    type_labels.get(rule.type.value, rule.type.value),
-                    str(rule.confirm_frames),
-                    "启用" if rule.enabled else "停用",
+                    trigger_label,
+                    condition_label,
+                    parameter,
+                    status_text,
+                    action_text,
                 )
+                tooltip = f"规则 ID：{rule.id}\n版本：v{rule.version}\n发布状态：{status_text}"
+                if rule.destination_ids:
+                    tooltip += f"\n通知实例：{', '.join(rule.destination_ids)}"
                 for column, value in enumerate(values):
                     item = QTableWidgetItem(value)
                     item.setData(Qt.UserRole, rule.id)
+                    item.setToolTip(tooltip)
                     self.rule_table.setItem(row, column, item)
-
+            target_rule_id = select_rule_id or selected_before
+            if target_rule_id:
+                for row in range(self.rule_table.rowCount()):
+                    item = self.rule_table.item(row, 0)
+                    if item is not None and item.data(Qt.UserRole) == target_rule_id:
+                        self.rule_table.selectRow(row)
+                        self.rule_table.scrollToItem(item)
+                        break
+            self.rule_table.verticalScrollBar().setValue(scroll_value)
         def _selected_rule_id(self) -> str | None:
             selected = self.rule_table.selectedItems()
             if not selected:
@@ -2113,9 +2493,50 @@ if HAS_QT:
             return str(value) if value else None
 
         def _on_rule_selected(self) -> None:
-            selected = self._selected_rule_id() is not None
+            rule_id = self._selected_rule_id()
+            selected = rule_id is not None
             self.toggle_rule_button.setEnabled(selected)
             self.edit_rule_button.setEnabled(selected)
+            self.review_history_button.setEnabled(selected)
+            self.version_history_button.setEnabled(selected)
+            status = self._rule_status_by_id.get(rule_id or "", "")
+            self.submit_rule_button.setEnabled(selected and status == "draft")
+            can_publish = can(self._current_role(), Permission.PUBLISH_RULES)
+            self.approve_rule_button.setEnabled(selected and status == "pending_review" and can_publish)
+            self.reject_rule_button.setEnabled(selected and status == "pending_review" and can_publish)
+
+        def _add_native_rule(self) -> None:
+            if not self._require_permission(Permission.MANAGE_RULES, "新增设备事件规则"):
+                return
+            stream_id = self._selected_stream_id
+            topology = self._topology
+            if not stream_id or topology is None:
+                self.statusBar().showMessage("请先选择一个推流", 5000)
+                return
+            try:
+                path = topology.stream_path(stream_id)
+                dialog = NativeRuleDialog(
+                    path=path,
+                    destinations=tuple(self._destinations),
+                    allow_publish=can(self._current_role(), Permission.PUBLISH_RULES),
+                    parent=self,
+                )
+                if dialog.exec() != QDialog.DialogCode.Accepted or dialog.rule is None:
+                    return
+                rule = replace(dialog.rule, id=f"rule-{uuid4().hex[:10]}")
+                path_text = self.db_edit.text().strip() or self._base_config.db
+                if path_text == ":memory:":
+                    self.statusBar().showMessage("内存数据库无法持久化规则", 5000)
+                    return
+                store = SQLiteStore(path_text)
+                try:
+                    store.save_rule(rule, actor=self._current_actor())
+                finally:
+                    store.close()
+                self._refresh_rule_table(rule.id)
+                self.statusBar().showMessage(f"已保存设备事件规则：{rule.name}", 5000)
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                self.statusBar().showMessage(f"设备事件规则保存失败：{exc}", 6000)
 
         def _add_default_rule(self) -> None:
             if not self._require_permission(Permission.MANAGE_RULES, "新增规则"):
@@ -2130,28 +2551,10 @@ if HAS_QT:
             except (KeyError, ValueError) as exc:
                 self.statusBar().showMessage(f"无法解析推流实体：{exc}", 5000)
                 return
-            dialog = RuleEditorDialog(path=path, parent=self)
-            if dialog.exec() != dialog.Accepted or dialog.rule is None:
+            dialog = RuleEditorDialog(path=path, allow_publish=can(self._current_role(), Permission.PUBLISH_RULES), reference_image=self._rule_reference_image(path.stream.id), destinations=tuple(self._destinations), parent=self)
+            if dialog.exec() != QDialog.DialogCode.Accepted or dialog.rule is None:
                 return
-            rule = Rule(
-                id=f"rule-{uuid4().hex[:10]}",
-                channel_id=dialog.rule.channel_id,
-                name=dialog.rule.name,
-                type=dialog.rule.type,
-                geometry=dialog.rule.geometry,
-                target_labels=dialog.rule.target_labels,
-                min_confidence=dialog.rule.min_confidence,
-                min_box_height=dialog.rule.min_box_height,
-                confirm_frames=dialog.rule.confirm_frames,
-                cooldown_seconds=dialog.rule.cooldown_seconds,
-                direction=dialog.rule.direction,
-                enabled=dialog.rule.enabled,
-                version=dialog.rule.version,
-                stream_id=path.stream.id,
-                site_id=path.site.id,
-                area_id=path.area.id,
-                camera_id=path.camera.id,
-            )
+            rule = replace(dialog.rule, id=f"rule-{uuid4().hex[:10]}")
             path_text = self.db_edit.text().strip() or self._base_config.db
             if path_text == ":memory:":
                 self.statusBar().showMessage("内存数据库无法持久化规则", 5000)
@@ -2162,8 +2565,8 @@ if HAS_QT:
                     store.save_rule(rule, actor=self._current_actor())
                 finally:
                     store.close()
-                self._refresh_rule_table()
-                self.statusBar().showMessage(f"已保存规则：{name}", 5000)
+                self._refresh_rule_table(rule.id)
+                self.statusBar().showMessage(f"已保存规则：{rule.name}（{'已发布' if rule.publication_status == 'published' else '草稿，需提交审核'}）", 5000)
             except (OSError, sqlite3.Error, ValueError) as exc:
                 self.statusBar().showMessage(f"规则保存失败：{exc}", 5000)
 
@@ -2186,15 +2589,19 @@ if HAS_QT:
                 if rule is None:
                     return
                 path = topology.stream_path(rule.stream_id)
-                dialog = RuleEditorDialog(path=path, rule=rule, parent=self)
-                if dialog.exec() != dialog.Accepted or dialog.rule is None:
+                dialog = (
+                    NativeRuleDialog(path=path, rule=rule, allow_publish=can(self._current_role(), Permission.PUBLISH_RULES), destinations=tuple(self._destinations), parent=self)
+                    if rule.trigger_mode is RuleMode.NATIVE_EVENT
+                    else RuleEditorDialog(path=path, rule=rule, allow_publish=can(self._current_role(), Permission.PUBLISH_RULES), reference_image=self._rule_reference_image(path.stream.id), destinations=tuple(self._destinations), parent=self)
+                )
+                if dialog.exec() != QDialog.DialogCode.Accepted or dialog.rule is None:
                     return
                 store = SQLiteStore(path_text)
                 try:
                     store.save_rule(dialog.rule, actor=self._current_actor())
                 finally:
                     store.close()
-                self._refresh_rule_table()
+                self._refresh_rule_table(dialog.rule.id)
                 self.statusBar().showMessage(f"规则已更新：{dialog.rule.name}", 5000)
             except (OSError, sqlite3.Error, ValueError, json.JSONDecodeError) as exc:
                 self.statusBar().showMessage(f"规则更新失败：{exc}", 5000)
@@ -2219,11 +2626,168 @@ if HAS_QT:
                         return
                 finally:
                     store.close()
-                self._refresh_rule_table()
+                self._refresh_rule_table(rule.id)
                 self.statusBar().showMessage(f"规则已{'启用' if not rule.enabled else '停用'}", 5000)
             except (OSError, sqlite3.Error, ValueError) as exc:
                 self.statusBar().showMessage(f"规则状态更新失败：{exc}", 5000)
 
+        def _submit_selected_rule(self) -> None:
+            self._review_selected_rule("submit")
+
+        def _approve_selected_rule(self) -> None:
+            self._review_selected_rule("approve")
+
+        def _reject_selected_rule(self) -> None:
+            self._review_selected_rule("reject")
+
+        def _review_selected_rule(self, action: str) -> None:
+            permission = Permission.MANAGE_RULES if action == "submit" else Permission.PUBLISH_RULES
+            label = {"submit": "提交审核", "approve": "审核通过", "reject": "驳回"}.get(action)
+            if label is None:
+                return
+            if not self._require_permission(permission, label):
+                return
+            rule_id = self._selected_rule_id()
+            if not rule_id:
+                return
+            path = self.db_edit.text().strip() or self._base_config.db
+            if path == ":memory:":
+                self.statusBar().showMessage("内存数据库无法保存审核状态", 5000)
+                return
+            note, accepted = QInputDialog.getMultiLineText(
+                self,
+                label,
+                "审核说明（可选）",
+                "",
+            )
+            if not accepted:
+                return
+            note = note.strip()
+            if action == "reject" and not note:
+                QMessageBox.warning(self, "驳回原因必填", "驳回规则时必须填写原因，便于后续审计。")
+                return
+            try:
+                store = SQLiteStore(path)
+                try:
+                    rule = next((item for item in store.load_rules() if item.id == rule_id), None)
+                    if rule is None:
+                        self.statusBar().showMessage("找不到要处理的规则，请刷新后重试", 5000)
+                        return
+                    if action == "submit":
+                        if rule.publication_status != "draft":
+                            self.statusBar().showMessage("只有草稿规则可以提交审核", 5000)
+                            return
+                        updated = store.submit_rule_for_review(rule.id, actor=self._current_actor(), note=note)
+                        message = "规则已提交审核，需两名不同审核人通过后才会发布"
+                    elif action == "approve":
+                        if rule.publication_status != "pending_review":
+                            self.statusBar().showMessage("只有待审核规则可以通过审核", 5000)
+                            return
+                        updated = store.approve_rule(rule.id, actor=self._current_actor(), note=note)
+                        if updated.publication_status == "published":
+                            message = f"规则已由两名审核人通过并发布：{updated.name}"
+                        else:
+                            message = "审核意见已记录，还需另一名不同审核人通过"
+                    else:
+                        if rule.publication_status != "pending_review":
+                            self.statusBar().showMessage("只有待审核规则可以驳回", 5000)
+                            return
+                        updated = store.reject_rule(rule.id, actor=self._current_actor(), note=note)
+                        message = f"规则已驳回并退回草稿：{updated.name}"
+                finally:
+                    store.close()
+                self._refresh_rule_table(rule_id)
+                self.statusBar().showMessage(message, 7000)
+            except (OSError, sqlite3.Error, ValueError, json.JSONDecodeError) as exc:
+                self.statusBar().showMessage(f"规则审核操作失败：{exc}", 7000)
+
+        def _show_rule_review_history(self) -> None:
+            if not self._require_permission(Permission.VIEW, "查看规则审核记录"):
+                return
+            rule_id = self._selected_rule_id()
+            if not rule_id:
+                return
+            path = self.db_edit.text().strip() or self._base_config.db
+            if path == ":memory:":
+                self.statusBar().showMessage("内存数据库没有可查询的审核记录", 5000)
+                return
+            try:
+                store = SQLiteStore(path)
+                try:
+                    rule = next((item for item in store.load_rules() if item.id == rule_id), None)
+                    if rule is None:
+                        self.statusBar().showMessage("找不到要查看的规则，请刷新后重试", 5000)
+                        return
+                    rows = store.list_rule_reviews(rule_id)
+                    approvers = store.rule_approval_actors(rule_id)
+                finally:
+                    store.close()
+                dialog = RuleReviewHistoryDialog(
+                    rule_name=rule.name,
+                    rows=rows,
+                    approvers=approvers,
+                    parent=self,
+                )
+                dialog.exec()
+            except (OSError, sqlite3.Error, ValueError, json.JSONDecodeError) as exc:
+                self.statusBar().showMessage(f"读取规则审核记录失败：{exc}", 7000)
+
+        def _show_rule_version_history(self) -> None:
+            if not self._require_permission(Permission.VIEW, "查看规则版本历史"):
+                return
+            rule_id = self._selected_rule_id()
+            if not rule_id:
+                return
+            path = self.db_edit.text().strip() or self._base_config.db
+            if path == ":memory:":
+                self.statusBar().showMessage("内存数据库没有可查询的版本记录", 5000)
+                return
+            try:
+                store = SQLiteStore(path)
+                try:
+                    rule = next((item for item in store.load_rules() if item.id == rule_id), None)
+                    if rule is None:
+                        self.statusBar().showMessage("找不到要查看的规则，请刷新后重试", 5000)
+                        return
+                    rows = store.list_rule_versions(rule_id)
+                finally:
+                    store.close()
+                allow_restore = can(self._current_role(), Permission.MANAGE_RULES)
+                dialog = RuleVersionHistoryDialog(
+                    rule_name=rule.name,
+                    rows=rows,
+                    allow_restore=allow_restore,
+                    parent=self,
+                )
+                if dialog.exec() != QDialog.DialogCode.Accepted or dialog.selected_version is None:
+                    return
+                if not self._require_permission(Permission.MANAGE_RULES, "恢复规则版本"):
+                    return
+                answer = QMessageBox.question(
+                    self,
+                    "恢复规则版本",
+                    f"恢复 v{dialog.selected_version} 会生成一个新版本，是否继续？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                store = SQLiteStore(path)
+                try:
+                    restored = store.restore_rule_version(
+                        rule_id,
+                        dialog.selected_version,
+                        actor=self._current_actor(),
+                    )
+                finally:
+                    store.close()
+                self._refresh_rule_table(restored.id)
+                self.statusBar().showMessage(
+                    f"已从 v{dialog.selected_version} 恢复并生成 v{restored.version}",
+                    7000,
+                )
+            except (OSError, sqlite3.Error, ValueError, json.JSONDecodeError) as exc:
+                self.statusBar().showMessage(f"恢复规则版本失败：{exc}", 7000)
         def _clear_preview_grid(self) -> None:
             if self._preview_grid_layout is None:
                 return
@@ -2337,39 +2901,54 @@ if HAS_QT:
             return None, None, None
 
         def _persist_topology_entity(self, entity: Site | Area | CameraDevice | VideoStream) -> None:
-            """Write one newly-created topology entity to SQLite and memory."""
+            self._persist_topology_entities([entity])
+
+        def _persist_topology_entities(
+            self,
+            entities: list[Site | Area | VideoDevice | CameraDevice | VideoStream] | tuple[Site | Area | VideoDevice | CameraDevice | VideoStream, ...],
+        ) -> None:
+            """Write new topology entities to SQLite and memory in one UI action."""
+            if not entities:
+                return
             if not self._require_permission(Permission.MANAGE_TOPOLOGY, "修改拓扑"):
                 raise PermissionError("当前角色没有修改拓扑权限")
             path = self.db_edit.text().strip() or self._base_config.db
             if path != ":memory:":
                 store = SQLiteStore(path)
                 try:
-                    if isinstance(entity, Site):
-                        store.save_site(entity, actor=self._current_actor())
-                    elif isinstance(entity, Area):
-                        store.save_area(entity, actor=self._current_actor())
-                    elif isinstance(entity, CameraDevice):
-                        store.save_camera(entity, actor=self._current_actor())
-                    else:
-                        store.save_stream(entity, actor=self._current_actor())
+                    for entity in entities:
+                        if isinstance(entity, Site):
+                            store.save_site(entity, actor=self._current_actor())
+                        elif isinstance(entity, Area):
+                            store.save_area(entity, actor=self._current_actor())
+                        elif isinstance(entity, VideoDevice):
+                            store.save_device(entity, actor=self._current_actor())
+                        elif isinstance(entity, CameraDevice):
+                            store.save_camera(entity, actor=self._current_actor())
+                        else:
+                            store.save_stream(entity, actor=self._current_actor())
                 finally:
                     store.close()
 
+            remaining = list(entities)
             if self._topology is None:
-                if not isinstance(entity, Site):
+                first = remaining.pop(0)
+                if not isinstance(first, Site):
                     raise ValueError("请先创建厂区")
-                self._topology = EntityRegistry(sites=(entity,))
-            elif isinstance(entity, Site):
-                self._topology.add_site(entity)
-            elif isinstance(entity, Area):
-                self._topology.add_area(entity)
-            elif isinstance(entity, CameraDevice):
-                self._topology.add_camera(entity)
-            else:
-                self._topology.add_stream(entity)
+                self._topology = EntityRegistry(sites=(first,))
+            for entity in remaining:
+                if isinstance(entity, Site):
+                    self._topology.add_site(entity)
+                elif isinstance(entity, Area):
+                    self._topology.add_area(entity)
+                elif isinstance(entity, VideoDevice):
+                    self._topology.add_device(entity)
+                elif isinstance(entity, CameraDevice):
+                    self._topology.add_camera(entity)
+                else:
+                    self._topology.add_stream(entity)
             self._refresh_entity_tree()
             self._refresh_overview()
-
         def _prompt_name(self, title: str, label: str) -> str | None:
             value, accepted = QInputDialog.getText(self, title, label)
             value = value.strip()
@@ -2420,6 +2999,63 @@ if HAS_QT:
             except (OSError, sqlite3.Error, ValueError) as exc:
                 self._show_topology_error(str(exc))
 
+        def _quick_add_camera(self) -> None:
+            if not self._require_permission(Permission.MANAGE_TOPOLOGY, "快速接入摄像头"):
+                return
+            site_id, area_id, _camera_id = self._selection_context()
+            if not site_id or not area_id or self._topology is None:
+                self._show_topology_error("请先在实体树中选择一个区域")
+                return
+            try:
+                site = self._topology.get_site(site_id)
+                area = self._topology.get_area(area_id)
+            except (KeyError, ValueError) as exc:
+                self._show_topology_error(f"无法解析目标区域：{exc}")
+                return
+            dialog = CameraQuickAddDialog(
+                site_id=site_id,
+                area_id=area_id,
+                area_label=f"{site.name} / {area.name}",
+                default_model=self.model_edit.text().strip() or self._base_config.model,
+                default_width=self.width_spin.value(),
+                default_height=self.height_spin.value(),
+                default_fps=self._base_config.fps,
+                parent=self,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted or dialog.camera is None:
+                return
+            try:
+                device = getattr(dialog, "device", None)
+                credentials = getattr(dialog, "credentials", None)
+                if device is not None and credentials is not None and not credentials.is_empty and self._device_manager is not None:
+                    device = self._device_manager.save_credentials(
+                        device,
+                        credentials,
+                        actor=self._current_actor(),
+                    )
+                    dialog.device = device
+                    if dialog.camera is not None:
+                        dialog.camera = CameraDevice(
+                            id=dialog.camera.id,
+                            area_id=dialog.camera.area_id,
+                            name=dialog.camera.name,
+                            vendor=dialog.camera.vendor,
+                            address=dialog.camera.address,
+                            enabled=dialog.camera.enabled,
+                            device_id=device.id,
+                            channel_id=dialog.camera.channel_id,
+                        )
+                entities = [item for item in (getattr(dialog, "device", None), dialog.camera, dialog.stream) if item is not None]
+                self._persist_topology_entities(entities)
+                if dialog.stream is not None:
+                    self._select_entity_in_tree("stream", dialog.stream.id)
+                self.statusBar().showMessage(
+                    f"已接入设备 {dialog.camera.name}" + (f"，推流 {dialog.stream.name}" if dialog.stream is not None else ""),
+                    7000,
+                )
+            except (OSError, sqlite3.Error, PermissionError, ValueError) as exc:
+                self._show_topology_error(str(exc))
+
         def _add_stream(self) -> None:
             _site_id, _area_id, camera_id = self._selection_context()
             if not camera_id:
@@ -2450,6 +3086,7 @@ if HAS_QT:
             )
             try:
                 self._persist_topology_entity(stream)
+                self._select_entity_in_tree("stream", stream.id)
                 self.statusBar().showMessage(f"已新增推流：{name}", 5000)
             except (OSError, sqlite3.Error, ValueError) as exc:
                 self._show_topology_error(str(exc))
@@ -2501,6 +3138,8 @@ if HAS_QT:
                     saved += 1
                 except (OSError, sqlite3.Error, ValueError) as exc:
                     errors.append(f"{stream.name}：{exc}")
+            if saved:
+                self._select_entity_in_tree("stream", streams[0].id)
             detail = f"已批量新增 {saved} 路推流"
             if errors:
                 detail += "；部分行未保存：" + "；".join(errors)
@@ -2581,6 +3220,8 @@ if HAS_QT:
             self.model_edit.setText(stream.model or self._base_config.model)
             self.width_spin.setValue(stream.width)
             self.height_spin.setValue(stream.height)
+            self.analysis_fps_spin.setValue(stream.fps)
+            self.model_input_size_combo.setCurrentIndex(max(0, self.model_input_size_combo.findData(stream.input_size)))
             self.confidence_spin.setValue(stream.confidence)
             self.channel_status_label.setText(f"{path.display_name} · 已选择")
             self._refresh_rule_table()
@@ -2598,11 +3239,18 @@ if HAS_QT:
         def _config_from_form(self) -> MonitorConfig:
             selected_streams = ()
             if self.monitor_scope_combo.currentData() == "selected" and self._selected_stream_id:
-                site_id = area_id = camera_id = None
+                site_id = area_id = camera_id = device_id = None
+                analysis_policy = AnalysisPolicy.LOCAL_FALLBACK
+                capabilities = DeviceCapabilities(live_video=True)
+                native_codes: tuple[str, ...] = ()
                 if self._topology is not None:
                     try:
                         path = self._topology.stream_path(self._selected_stream_id)
                         site_id, area_id, camera_id = path.site.id, path.area.id, path.camera.id
+                        device_id = path.device.id if path.device else None
+                        capabilities = path.device.capabilities if path.device else capabilities
+                        analysis_policy = path.stream.analysis_policy or path.device.analysis_policy if path.device else path.stream.analysis_policy or analysis_policy
+                        native_codes = path.stream.native_event_codes
                     except (KeyError, ValueError):
                         pass
                 selected_streams = (
@@ -2612,11 +3260,17 @@ if HAS_QT:
                         model=self.model_edit.text().strip(),
                         width=self.width_spin.value(),
                         height=self.height_spin.value(),
-                        fps=self._base_config.fps,
+                        fps=self.analysis_fps_spin.value(),
                         confidence=self.confidence_spin.value(),
+                        input_size=int(self.model_input_size_combo.currentData() or 640),
                         site_id=site_id,
                         area_id=area_id,
                         camera_id=camera_id,
+                        device_id=device_id,
+                        analysis_policy=analysis_policy,
+                        native_event_codes=native_codes,
+                        capabilities=capabilities,
+                        native_subscription_healthy=capabilities.native_events,
                     ),
                 )
             email_use_ssl, email_starttls = self._email_security_settings()
@@ -2629,29 +3283,26 @@ if HAS_QT:
                 height=self.height_spin.value(),
                 confidence=self.confidence_spin.value(),
                 confirm_frames=self.confirm_spin.value(),
-                fps=self._base_config.fps,
+                fps=self.analysis_fps_spin.value(),
+                input_size=int(self.model_input_size_combo.currentData() or 640),
                 media_dir=self._base_config.media_dir,
                 streams=selected_streams,
                 topology=self._topology,
-                inference_mode=str(self.inference_mode_combo.currentData() or "central"),
-                central_inference_url=self.inference_url_edit.text().strip(),
-                central_inference_api_key=self.inference_api_key_edit.text(),
-                central_inference_timeout=self.inference_timeout_spin.value(),
                 webhook_provider=str(self.webhook_provider_combo.currentData() or "custom"),
                 webhook_url=self.webhook_url_edit.text().strip(),
-                webhook_secret=self.webhook_secret_edit.text(),
+                webhook_secret=self._webhook_secret_value(),
                 email_provider=str(self.email_provider_combo.currentData() or "custom"),
                 email_host=self.email_host_edit.text().strip(),
                 email_port=self.email_port_spin.value(),
                 email_username=self.email_username_edit.text().strip(),
-                email_password=self.email_password_edit.text(),
+                email_password=self._email_password_value(),
                 email_sender=self.email_sender_edit.text().strip(),
                 email_recipients=self._email_recipients_from_form(),
                 email_use_ssl=email_use_ssl,
                 email_starttls=email_starttls,
                 sms_provider=str(self.sms_provider_combo.currentData() or "custom_http"),
                 sms_endpoint=self.sms_endpoint_edit.text().strip(),
-                sms_token=self.sms_token_edit.text(),
+                sms_token=self._sms_token_value(),
                 sms_sender=self.sms_sender_edit.text().strip(),
                 sms_template_id=self.sms_template_edit.text().strip(),
                 sms_recipients=self._sms_recipients_from_form(),
@@ -2659,22 +3310,65 @@ if HAS_QT:
                 notification_channels=notification_channels,
                 notification_interval=self.notification_interval_spin.value(),
                 notification_batch=self.notification_batch_spin.value(),
+                analysis_policy=str(self._local_settings.get("analysis_policy", AnalysisPolicy.LOCAL_FALLBACK.value)),
+                gb28181_enabled=self._base_config.gb28181_enabled,
+                gb28181_platform_id=self._base_config.gb28181_platform_id,
+                gb28181_domain=self._base_config.gb28181_domain,
+                gb28181_password=self._base_config.gb28181_password,
+                gb28181_port=self._base_config.gb28181_port,
             )
+
+        def _monitor_start_error(self, config: MonitorConfig) -> str | None:
+            try:
+                runtimes = config.resolved_streams()
+            except (TypeError, ValueError) as exc:
+                return f"\u76d1\u63a7\u914d\u7f6e\u65e0\u6548\uff1a{exc}"
+            if not runtimes:
+                return "\u6ca1\u6709\u53ef\u8fd0\u884c\u7684\u542f\u7528\u63a8\u6d41\uff0c\u8bf7\u5148\u5728\u201c\u62d3\u6251\u4e0e\u8bbe\u5907\u201d\u9875\u542f\u7528\u81f3\u5c11\u4e00\u8def"
+            missing_models: list[str] = []
+            for runtime in runtimes:
+                if not runtime.url.lower().startswith(("rtsp://", "rtsps://")):
+                    return f"{runtime.stream_id} \u7684\u5730\u5740\u5fc5\u987b\u4f7f\u7528 rtsp:// \u6216 rtsps://"
+                needs_local_model = (
+                    runtime.analysis_policy is AnalysisPolicy.LOCAL_PRIMARY
+                    or (
+                        runtime.analysis_policy is AnalysisPolicy.LOCAL_FALLBACK
+                        and not runtime.capabilities.native_events
+                    )
+                )
+                if needs_local_model:
+                    model_path = Path(runtime.model).expanduser()
+                    if not model_path.is_file():
+                        missing_models.append(str(model_path))
+            if missing_models:
+                unique = sorted(set(missing_models))
+                return "\u672c\u5730 ONNX \u6a21\u578b\u4e0d\u5b58\u5728\uff1a" + "\uff1b".join(unique)
+            return None
 
         def start_monitor(self) -> None:
             if self._thread is not None and self._thread.isRunning():
                 return
-            if not self._notification_channels_from_form():
-                self._set_status("error", "请至少启用一个通知通道")
-                return
             config = self._config_from_form()
-            if not config.url or not config.model:
-                self._set_status("error", "RTSP 地址和模型路径不能为空")
+            if not config.notification_channels:
+                self.statusBar().showMessage("\u672a\u542f\u7528\u901a\u77e5\u901a\u9053\uff0c\u672c\u6b21\u4ec5\u8bb0\u5f55\u672c\u5730\u4e8b\u4ef6", 6000)
+            error = self._monitor_start_error(config)
+            if error:
+                self._set_status("error", error)
+                self.statusBar().showMessage(error, 8000)
                 return
             if config.db != ":memory:":
-                Path(config.db).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    Path(config.db).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    message = f"\u65e0\u6cd5\u521b\u5efa\u4e8b\u4ef6\u6570\u636e\u5e93\u76ee\u5f55\uff1a{exc}"
+                    self._set_status("error", message)
+                    self.statusBar().showMessage(message, 8000)
+                    return
             self._frames = 0
             self._events = 0
+            self._last_detections = 0
+            self._resource_sampler = ResourceSampler()
+            self._monitor_started_monotonic = time.monotonic()
             self._stream_metrics.clear()
             self._replay_locked = False
             self._thread = QThread(self)
@@ -2692,9 +3386,42 @@ if HAS_QT:
             self._worker.finished.connect(self._worker.deleteLater)
             self._thread.finished.connect(self._on_thread_finished)
             self._thread.finished.connect(self._thread.deleteLater)
+            self._start_native_device_events(config)
             self._set_controls(True)
             self._start_notification_dispatcher(config)
             self._thread.start()
+
+        def _start_native_device_events(self, config: MonitorConfig) -> None:
+            manager = self._device_manager
+            topology = self._topology
+            if manager is None or topology is None or config.db == ":memory:":
+                return
+            try:
+                store = SQLiteStore(config.db)
+                try:
+                    rules = store.load_rules(enabled_only=True)
+                finally:
+                    store.close()
+                for device in topology.devices:
+                    if not device.enabled or not device.capabilities.native_events:
+                        continue
+                    if str(device.analysis_policy) == AnalysisPolicy.DISABLED.value:
+                        continue
+                    manager.start_native_subscription(
+                        device,
+                        rules,
+                        channels=config.notification_channels,
+                    )
+            except (OSError, sqlite3.Error, RuntimeError, ValueError) as exc:
+                self.statusBar().showMessage(f"设备事件服务启动失败：{exc}", 8000)
+
+        def _stop_native_device_events(self) -> None:
+            manager = self._device_manager
+            topology = self._topology
+            if manager is None or topology is None:
+                return
+            for device in topology.devices:
+                manager.stop_native_subscription(device.id)
 
         def stop_monitor(self) -> None:
             if self._worker is not None:
@@ -2704,6 +3431,7 @@ if HAS_QT:
                 self._notification_worker.request_stop()
             if self._probe_worker is not None:
                 self._probe_worker.request_stop()
+            self._stop_native_device_events()
 
         def quit_application(self) -> None:
             self._allow_quit = True
@@ -2725,8 +3453,8 @@ if HAS_QT:
             channels = config.notification_channels
             if not channels:
                 self._notification_state = "disabled"
-                self._notification_detail = "未启用通知通道"
-                self.notification_status.setText("未启动 · 请至少启用一个通知通道")
+                self._notification_detail = "未启用通知通道，仅记录本地事件"
+                self.notification_status.setText("本地模式 · 仅记录事件，不创建通知任务")
                 return
             if config.delivery_destinations:
                 try:
@@ -2954,6 +3682,8 @@ if HAS_QT:
                     self._thread,
                     self._notification_thread,
                     self._notification_once_thread,
+                    self._notification_test_thread,
+                    self._model_test_thread,
                     self._probe_thread,
                 )
             )
@@ -2974,7 +3704,12 @@ if HAS_QT:
                 return
             values = tuple(detections) if detections is not None else ()
             self.preview.set_frame(image, values)
-            self.preview_info.setText(f"实时 · 检测框 {len(values)} 个")
+            self.preview_info.setText(f"实时 · 本机分析目标 {len(values)} 个")
+
+        def _rule_reference_image(self, stream_id: str) -> QImage | None:
+            if self._replay_locked or self._preview_stream_id != stream_id or not self.preview.has_image:
+                return None
+            return self.preview.current_image()
 
         def _on_stream_preview(self, stream_id: str, image: object, detections: object) -> None:
             values = tuple(detections) if detections is not None else ()
@@ -2983,8 +3718,11 @@ if HAS_QT:
                 grid_preview.set_frame(image, values)
             if self._selected_stream_id and stream_id != self._selected_stream_id:
                 return
+            if self._selected_stream_id is None and self._preview_stream_id not in {None, stream_id}:
+                return
+            self._preview_stream_id = stream_id
             self._on_preview(image, detections)
-            self.preview_info.setText(f"{stream_id} · 实时 · 检测框 {len(values)} 个")
+            self.preview_info.setText(f"{stream_id} · 实时 · 本机分析目标 {len(values)} 个")
 
         def _on_stream_status(self, stream_id: str, status: str, detail: str) -> None:
             self._stream_states[stream_id] = (status, detail)
@@ -2998,12 +3736,30 @@ if HAS_QT:
                 )
             self._refresh_overview()
 
+        def _overall_fps(self) -> float:
+            elapsed = time.monotonic() - self._monitor_started_monotonic
+            return self._frames / elapsed if elapsed > 0 else 0.0
+
+        def _stream_fps(self, stream_id: str) -> float:
+            metrics = self._stream_metrics.get(stream_id, {})
+            started = float(metrics.get("started_monotonic", 0.0))
+            elapsed = time.monotonic() - started if started else 0.0
+            return float(metrics.get("frames", 0)) / elapsed if elapsed > 0 else 0.0
+
         def _on_frame(self, _frame_no: int, detections: int) -> None:
+            if self._frames == 0:
+                self._monitor_started_monotonic = time.monotonic()
             self._frames += 1
-            self.runtime_label.setText(f"帧数 {self._frames} · 检测 {detections} · 事件 {self._events}")
+            self._last_detections = int(detections)
+            self.runtime_label.setText(
+                f"帧数 {self._frames} · 检测 {self._last_detections} · 事件 {self._events} · 平均 {self._overall_fps():.1f} fps"
+            )
 
         def _on_stream_frame(self, stream_id: str, _frame_no: int, detections: int) -> None:
-            metrics = self._stream_metrics.setdefault(stream_id, {"frames": 0, "detections": 0})
+            metrics = self._stream_metrics.setdefault(
+                stream_id,
+                {"frames": 0, "detections": 0, "started_monotonic": time.monotonic()},
+            )
             metrics["frames"] += 1
             metrics["detections"] += int(detections)
             self._refresh_overview()
@@ -3015,7 +3771,9 @@ if HAS_QT:
                 self._refresh_channel_options()
                 self._refresh_event_entity_filters()
             self._apply_event_filters()
-            self.runtime_label.setText(f"帧数 {self._frames} · 检测中 · 事件 {self._events}")
+            self.runtime_label.setText(
+                f"帧数 {self._frames} · 检测 {self._last_detections} · 事件 {self._events} · 平均 {self._overall_fps():.1f} fps"
+            )
             self._refresh_overview()
             if self._tray is not None:
                 self._tray.notify("FactoryGuard 事件", "检测到目标进入规则区域")
@@ -3070,7 +3828,7 @@ if HAS_QT:
                 self._selected_stream_id = (
                     selected_stream_id
                     if selected_stream_id and any(stream.id == selected_stream_id for stream in topology.streams)
-                    else None
+                    else (topology.streams[0].id if topology.streams else None)
                 )
                 self._refresh_preview_grid()
                 self._refresh_stream_table()
@@ -3125,6 +3883,32 @@ if HAS_QT:
                 if child.parent_id == area.id:
                     self._append_area_item(item, topology, child.id)
 
+        def _find_entity_tree_item(self, kind: str, entity_id: str, parent=None):
+            if parent is None:
+                items = [self.entity_tree.topLevelItem(index) for index in range(self.entity_tree.topLevelItemCount())]
+            else:
+                items = [parent.child(index) for index in range(parent.childCount())]
+            for item in items:
+                metadata = item.data(0, Qt.UserRole) or {}
+                if metadata.get("kind") == kind and metadata.get("id") == entity_id:
+                    return item
+                found = self._find_entity_tree_item(kind, entity_id, item)
+                if found is not None:
+                    return found
+            return None
+
+        def _select_entity_in_tree(self, kind: str, entity_id: str) -> bool:
+            item = self._find_entity_tree_item(kind, entity_id)
+            if item is None:
+                return False
+            parent = item.parent()
+            while parent is not None:
+                parent.setExpanded(True)
+                parent = parent.parent()
+            self.entity_tree.setCurrentItem(item)
+            self.entity_tree.scrollToItem(item)
+            return True
+
         def _on_entity_selected(self) -> None:
             selected = self.entity_tree.selectedItems()
             if not selected or self._topology is None:
@@ -3147,10 +3931,24 @@ if HAS_QT:
             self.status_label.setText(labels.get(state, state))
             colors = {"running": ("#dff5e7", "#19703b"), "degraded": ("#fff0cf", "#916000"), "error": ("#ffe1e1", "#a52626"), "starting": ("#dfebff", "#2457a6")}
             bg, fg = colors.get(state, ("#e6edf6", "#536176"))
-            self.status_label.setStyleSheet(f"padding: 6px 12px; border-radius: 14px; background: {bg}; color: {fg};")
+            self.status_label.setStyleSheet(f"padding: 6px 12px; border-radius: 0px; background: {bg}; color: {fg};")
             stream_label = self._selected_stream_id or "多路推流"
             self.channel_status_label.setText(f"{stream_label} · {labels.get(state, state)}")
             self.statusBar().showMessage(detail)
+
+        def _clear_event_filters(self) -> None:
+            self.search_edit.clear()
+            for combo in (
+                self.level_filter,
+                self.status_filter,
+                self.channel_filter,
+                self.time_filter,
+                self.site_filter,
+                self.area_filter,
+                self.camera_filter,
+            ):
+                combo.setCurrentIndex(0)
+            self._apply_event_filters()
 
         def _refresh_events(self) -> None:
             path = self.db_edit.text().strip() or self._base_config.db
@@ -3163,7 +3961,10 @@ if HAS_QT:
             try:
                 with sqlite3.connect(path) as connection:
                     connection.row_factory = sqlite3.Row
-                    rows = connection.execute("SELECT * FROM event ORDER BY occurred_at DESC LIMIT 1000").fetchall()
+                    limit = int(self.event_limit_combo.currentData() or 200)
+                    rows = connection.execute(
+                        "SELECT * FROM event ORDER BY occurred_at DESC LIMIT ?", (limit,)
+                    ).fetchall()
                 self._event_records = [_event_record(row) for row in rows]
                 self._refresh_channel_options()
                 self._refresh_event_entity_filters()
@@ -3467,23 +4268,29 @@ if HAS_QT:
                 row = self.events_table.rowCount()
                 self.events_table.insertRow(row)
                 target = record.get("target") or {}
+                rule_name = str(target.get("rule_name") or record.get("rule_id") or "—")
                 values = (
-                    str(record.get("occurred_at", "")),
+                    _format_event_time(record.get("occurred_at")),
                     str(record.get("level", "")),
                     _record_entity_text(record),
+                    rule_name,
                     _target_text(target),
                     _EVENT_STATUS_LABELS.get(str(record.get("status", "open")), str(record.get("status", "open"))),
+                    ", ".join(str(item) for item in (target.get("assignees") or [])) or "—",
                     "可回放" if _media_path(record) else "无媒体",
                 )
                 for column, value in enumerate(values):
                     self.events_table.setItem(row, column, QTableWidgetItem(value))
-            self.event_detail.setText(f"已显示 {len(visible)} 条记录 · 双击可查看回放媒体")
+            self.event_detail.setText(
+                f"已显示 {len(visible)} 条记录 · 最近加载 {len(self._event_records)} 条 · 双击可查看回放媒体"
+            )
 
         def _on_event_selected(self) -> None:
             records = self._selected_event_records()
             if not records:
                 self._selected_event = None
                 self.replay_button.setEnabled(False)
+                self.replay_rule_button.setEnabled(False)
                 self.confirm_event_button.setEnabled(False)
                 self.false_positive_button.setEnabled(False)
                 self.close_event_button.setEnabled(False)
@@ -3492,6 +4299,7 @@ if HAS_QT:
             if len(records) > 1:
                 self._selected_event = None
                 self.replay_button.setEnabled(False)
+                self.replay_rule_button.setEnabled(False)
                 self.confirm_event_button.setEnabled(
                     any(str(record.get("status", "open")) in {"open", "false_positive"} for record in records)
                 )
@@ -3510,6 +4318,7 @@ if HAS_QT:
             snapshot = _existing_path(record.get("snapshot_uri"))
             clip = _existing_path(record.get("clip_uri"))
             self.replay_button.setEnabled(snapshot is not None or clip is not None)
+            self.replay_rule_button.setEnabled(bool(record.get("rule_id")) and bool(record.get("track")))
             current_status = str(record.get("status", "open"))
             self.confirm_event_button.setEnabled(current_status in {"open", "false_positive"})
             self.false_positive_button.setEnabled(current_status in {"open", "confirmed"})
@@ -3518,23 +4327,88 @@ if HAS_QT:
             status_text = _EVENT_STATUS_LABELS.get(current_status, current_status)
             media_text = "已生成媒体，可查看回放" if snapshot or clip else "该事件没有可用媒体"
             detail_text = (
-                f"{record.get('occurred_at', '')}\n{entity_text} · {target.get('label', 'object')} · "
+                f"{_format_event_time(record.get('occurred_at'))}\n{entity_text} · {target.get('label', 'object')} · "
                 f"置信度 {float(target.get('confidence', 0.0)):.0%} · {status_text}\n{media_text}"
             )
             self.event_detail.setText(detail_text)
             bbox = target.get("bbox") or ()
             track_id = target.get("track_id") or "—"
+            raw_condition = str(target.get("condition") or "")
+            condition_text = RULE_CONDITION_LABELS.get(raw_condition, raw_condition or "—")
+            if target.get("count") is not None:
+                condition_text += f" \u00b7 \u6570\u91cf {target.get('count')} / \u9608\u503c {target.get('threshold', '\u2014')}"
+                if raw_condition == "line_count":
+                    direction = RULE_DIRECTION_LABELS.get(
+                        str(target.get("direction") or "both"),
+                        str(target.get("direction") or "both"),
+                    )
+                    condition_text += f" \u00b7 {direction}"
+                    if target.get("window_seconds") is not None:
+                        condition_text += f" \u00b7 \u7edf\u8ba1\u7a97\u53e3 {target.get('window_seconds')} \u79d2"
+            elif target.get("dwell_seconds") is not None:
+                condition_text += f" · 滞留 {target.get('dwell_seconds')} 秒"
             self.event_inspector.setText(
                 f"事件 ID：{record.get('id', '—')}\n"
-                f"规则：{record.get('rule_id', '—')}\n"
+                f"来源：{record.get('source', 'local_inference')}\n"
+                f"规则：{target.get('rule_name') or '—'}（{record.get('rule_id', '—')}）\n"
                 f"实体路径：{entity_text or '—'}\n"
                 f"目标：{target.get('label', 'object')} · 置信度 {float(target.get('confidence', 0.0)):.1%} · "
                 f"轨迹 {track_id}\n"
+                f"值班人员：{'、'.join(str(item) for item in (target.get('assignees') or [])) or '—'}\n"
+                f"条件：{condition_text}\n"
                 f"边界框：{bbox or '—'}\n"
-                f"发生时间：{record.get('occurred_at', '—')} · 状态：{status_text}\n"
+                f"发生时间：{_format_event_time(record.get('occurred_at')) or '—'} · 状态：{status_text}\n"
                 f"快照：{record.get('snapshot_uri') or '—'}\n"
                 f"片段：{record.get('clip_uri') or '—'}"
             )
+
+        def _replay_selected_rule_track(self) -> None:
+            if not self._require_permission(Permission.REVIEW_EVENTS, "规则轨迹试运行"):
+                return
+            record = self._selected_event
+            if not record:
+                return
+            rule_id = str(record.get("rule_id") or "")
+            track = record.get("track") or ()
+            if not rule_id or not track:
+                self.statusBar().showMessage("当前事件没有可回放的规则或轨迹", 5000)
+                return
+            path = self.db_edit.text().strip() or self._base_config.db
+            if path == ":memory:":
+                return
+            try:
+                store = SQLiteStore(path)
+                try:
+                    rule = next((item for item in store.load_rules() if item.id == rule_id), None)
+                finally:
+                    store.close()
+                if rule is None:
+                    self.statusBar().showMessage("找不到该事件对应的规则", 5000)
+                    return
+                target = record.get("target") or {}
+                width, height = 1280, 720
+                if self._topology is not None:
+                    stream_key = record.get("stream_id") or record.get("channel_id")
+                    for stream in self._topology.streams:
+                        if stream.id == stream_key:
+                            width, height = stream.width, stream.height
+                            break
+                try:
+                    confidence = float(target.get("confidence") or 0.95)
+                except (TypeError, ValueError):
+                    confidence = 0.95
+                report = replay_rule_from_track(
+                    rule,
+                    track=track,
+                    label=str(target.get("label") or "person"),
+                    confidence=confidence,
+                    width=width,
+                    height=height,
+                    occurred_at=record.get("occurred_at"),
+                )
+                QMessageBox.information(self, "历史轨迹试运行", report.summary)
+            except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+                self.statusBar().showMessage(f"历史轨迹试运行失败：{exc}", 6000)
 
         def _selected_event_records(self) -> list[dict[str, Any]]:
             rows = sorted({index.row() for index in self.events_table.selectionModel().selectedRows()})
@@ -3684,10 +4558,12 @@ if HAS_QT:
                 return
             if self.preview.set_image_file(snapshot, [record], mode="事件回放"):
                 self._replay_locked = True
-                self.preview_info.setText(f"事件回放 · {record.get('occurred_at', '')}")
+                self._preview_stream_id = None
+                self.preview_info.setText(f"事件回放 · {_format_event_time(record.get('occurred_at'))}")
 
         def _show_live_preview(self) -> None:
             self._replay_locked = False
+            self._preview_stream_id = None
             self.preview.clear("等待下一帧实时画面")
             self.preview_info.setText("已返回实时预览")
 
@@ -3850,22 +4726,15 @@ if HAS_QT:
                 self.statusBar().showMessage(f"媒体清理失败：{exc}", 8000)
 
         def _apply_theme(self, name: str) -> None:
-            if name in _THEMES:
-                QApplication.instance().setStyleSheet(
-                    _THEMES[name]
-                    + """
-                    QFrame#metricCard {
-                        background: palette(base);
-                        border: 1px solid palette(mid);
-                        border-left: 3px solid #4a78a8;
-                        border-radius: 4px;
-                    }
-                    QLabel#metricCaption { color: palette(mid); font-size: 12px; }
-                    QLabel#metricValue { color: palette(text); font-size: 25px; font-weight: 600; }
-                    QLabel#metricDetail { color: palette(mid); font-size: 11px; }
-                    QScrollArea#pageScroll { background: transparent; }
-                    """
-                )
+            application = QApplication.instance()
+            apply_theme(application, name)
+            icon = application_icon(name)
+            if icon is not None and not icon.isNull():
+                self.setWindowIcon(icon)
+                if application is not None:
+                    application.setWindowIcon(icon)
+                if self._tray is not None:
+                    self._tray.set_icon(icon)
 
         def _show_from_tray(self) -> None:
             self.showNormal()
@@ -3886,9 +4755,11 @@ if HAS_QT:
                 event.ignore()
                 return
             self.stop_monitor()
+            if self._device_manager is not None:
+                self._device_manager.close()
+                self._device_manager = None
+            self._gb28181_platform = None
             event.accept()
-
-
     def QSystemTrayIcon_available() -> bool:
         from .qt import QSystemTrayIcon
 
@@ -3905,12 +4776,24 @@ else:
         return False
 
 
+def _set_windows_app_user_model_id() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("FactoryGuard.Desktop")
+    except (AttributeError, OSError):
+        pass
+
 def launch(*, config: MonitorConfig | None = None, start_hidden: bool = False, argv: list[str] | None = None) -> int:
     """Start the Qt application and return its event-loop exit code."""
     require_qt()
+    _set_windows_app_user_model_id()
     app = QApplication.instance() or QApplication(argv or [])
     app.setApplicationName("FactoryGuard")
-    app.setQuitOnLastWindowClosed(False)
+    app.setWindowIcon(application_icon("浅色"))
+    app.setStyle("Fusion")
     window = MainWindow(config=config, start_hidden=start_hidden)
     if not start_hidden or window._tray is None:  # type: ignore[attr-defined]
         window.show()
@@ -3939,6 +4822,7 @@ def _search_text(record: dict[str, Any]) -> str:
             record.get("area_id", ""),
             record.get("camera_id", ""),
             record.get("level", ""),
+            record.get("source", ""),
             record.get("rule_id", ""),
             target.get("label", ""),
             target.get("track_id", ""),
@@ -3955,6 +4839,18 @@ def _record_entity_text(record: dict[str, Any]) -> str:
         entity.get("stream_id") or record.get("stream_id") or record.get("channel_id"),
     )
     return " / ".join(str(value) for value in values if value)
+
+
+def _format_event_time(value: Any) -> str:
+    if not value:
+        return ""
+    try:
+        occurred = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)
+    if occurred.tzinfo is None:
+        occurred = occurred.replace(tzinfo=UTC)
+    return occurred.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _event_after(value: Any, cutoff: datetime) -> bool:

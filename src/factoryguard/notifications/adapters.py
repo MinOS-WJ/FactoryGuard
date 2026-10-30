@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from email.message import EmailMessage
+from pathlib import Path
 import json
 from math import isfinite
 import re
@@ -89,6 +90,7 @@ class EmailAdapter:
         message["X-FactoryGuard-Event-Id"] = event.id
         message["X-FactoryGuard-Dedup-Key"] = event.dedup_key
         message.set_content(_email_body(event))
+        _attach_event_media(message, event)
         client_factory = smtplib.SMTP_SSL if self.use_ssl else smtplib.SMTP
         try:
             with client_factory(self.host, self.port, timeout=self.timeout) as client:
@@ -146,6 +148,9 @@ class SmsHttpAdapter:
                 "level": event.level,
                 "stream_id": event.stream_id or event.channel_id,
                 "occurred_at": event.occurred_at.isoformat(),
+                "snapshot_uri": event.snapshot_uri,
+                "clip_uri": event.clip_uri,
+                "clip_status": event.clip_status,
             },
         }
         headers = {"Content-Type": "application/json"}
@@ -243,6 +248,29 @@ def _redact_error(exc: BaseException, password: str) -> str:
     return detail[:500] or exc.__class__.__name__
 
 
+_MAX_EMAIL_MEDIA_BYTES = 20 * 1024 * 1024
+
+
+def _attach_event_media(message: EmailMessage, event: Event) -> None:
+    for uri, maintype, subtype in (
+        (event.snapshot_uri, "image", "png"),
+        (event.clip_uri, "video", "mp4"),
+    ):
+        if not uri:
+            continue
+        path = Path(uri)
+        try:
+            if not path.is_file() or path.stat().st_size > _MAX_EMAIL_MEDIA_BYTES:
+                continue
+            message.add_attachment(
+                path.read_bytes(),
+                maintype=maintype,
+                subtype=subtype,
+                filename=path.name,
+            )
+        except OSError:
+            continue
+
 def _email_body(event: Event) -> str:
     stream_id = event.stream_id or event.channel_id
     entity = "/".join(value for value in (event.site_id, event.area_id, event.camera_id) if value) or "-"
@@ -255,6 +283,7 @@ def _email_body(event: Event) -> str:
         f"Rule: {event.rule_id}\n"
         f"Occurred at: {event.occurred_at.isoformat()}\n"
         f"Status: {event.status.value}\n"
+        f"Assignees: {', '.join(event.assignees) if event.assignees else '-'}\n"
         f"Dedup key: {event.dedup_key}\n"
         f"Snapshot: {event.snapshot_uri or '-'}\n"
         f"Clip: {event.clip_uri or '-'}\n"
@@ -266,7 +295,7 @@ def _event_message(event: Event) -> str:
     entity = "/".join(value for value in (event.site_id, event.area_id, event.camera_id) if value) or "-"
     return (
         f"FactoryGuard {event.level} event {event.id}; "
-        f"stream={stream_id}; entity={entity}; rule={event.rule_id}"
+        f"stream={stream_id}; entity={entity}; rule={event.rule_id}; assignees={",".join(event.assignees) if event.assignees else "-"}"
     )
 
 

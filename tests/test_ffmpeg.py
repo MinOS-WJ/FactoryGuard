@@ -1,9 +1,13 @@
+import io
+import threading
 from math import nan
 from pathlib import Path
 
+import numpy as np
+
 import pytest
 
-from factoryguard.media.ffmpeg import FFmpegInstallation, find_ffmpeg
+from factoryguard.media.ffmpeg import FFmpegInstallation, encode_raw_image, find_ffmpeg
 from factoryguard.media.rtsp import RTSPCapture
 
 
@@ -19,11 +23,14 @@ def test_rtsp_command_is_argument_safe():
     assert command[command.index("-i") + 1].startswith("rtsp://")
     assert "echo bad" in command[command.index("-i") + 1]
     assert "scale=640:360,fps=2" in command
+    assert command[command.index("-timeout") + 1] == "15000000"
 
 
 def test_rtsp_command_rejects_non_finite_fps():
     with pytest.raises(ValueError, match="fps"):
         FFmpegInstallation(Path("ffmpeg.exe")).command_for_rtsp("rtsp://localhost/live", fps=nan)
+    with pytest.raises(ValueError, match="read_timeout"):
+        FFmpegInstallation(Path("ffmpeg.exe")).command_for_rtsp("rtsp://localhost/live", read_timeout=0)
 
 
 def test_rawvideo_clip_command_uses_pipe_and_separate_output_argument(tmp_path):
@@ -35,6 +42,23 @@ def test_rawvideo_clip_command_uses_pipe_and_separate_output_argument(tmp_path):
     assert command[-1].endswith("event.mp4")
 
 
+def test_ffprobe_resolution_reads_source_dimensions(monkeypatch):
+    class Completed:
+        returncode = 0
+        stdout = b'{"streams":[{"width":1920,"height":1080}]}'
+        stderr = b""
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return Completed()
+
+    monkeypatch.setattr("factoryguard.media.ffmpeg.subprocess.run", fake_run)
+    installation = FFmpegInstallation(Path("ffmpeg.exe"), "test", Path("ffprobe.exe"))
+    assert installation.probe_resolution("rtsp://camera/live", timeout=4) == (1920, 1080)
+    assert calls[0][0][0] == "ffprobe.exe"
+
 def test_bundled_ffmpeg_is_discovered():
     installation = find_ffmpeg()
     assert installation is not None
@@ -45,17 +69,194 @@ def test_bundled_ffmpeg_is_discovered():
         assert bundled in installation.executable.parents
 
 
-def test_rtsp_capture_rejects_short_output(monkeypatch):
+def test_encode_raw_image_uses_png_pipe(monkeypatch, tmp_path):
+    calls = []
+
     class Completed:
         returncode = 0
-        stdout = b"short"
         stderr = b""
 
-    monkeypatch.setattr("factoryguard.media.rtsp.subprocess.run", lambda *args, **kwargs: Completed())
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        Path(command[-1]).write_bytes(b"png")
+        return Completed()
+
+    monkeypatch.setattr("factoryguard.media.ffmpeg.subprocess.run", fake_run)
+    image = np.zeros((2, 3, 3), dtype=np.uint8)
+    output = encode_raw_image(
+        FFmpegInstallation(Path("ffmpeg.exe")),
+        image,
+        tmp_path / "snapshot.png",
+    )
+    assert output.endswith("snapshot.png")
+    assert "-vcodec" in calls[0][0]
+    assert calls[0][0][calls[0][0].index("-vcodec") + 1] == "png"
+
+def test_rtsp_stream_keeps_one_process_and_reads_multiple_frames(monkeypatch):
+    frame_bytes = np.zeros((2, 2, 3), dtype=np.uint8).tobytes()
+    payload = frame_bytes * 2
+
+    class Process:
+        def __init__(self):
+            self.stdout = io.BytesIO(payload)
+            self.stderr = io.BytesIO()
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    process = Process()
+    calls = []
+
+    def fake_popen(command, **kwargs):
+        calls.append((command, kwargs))
+        return process
+
+    monkeypatch.setattr("factoryguard.media.rtsp.subprocess.Popen", fake_popen)
+    capture = RTSPCapture(FFmpegInstallation(Path("ffmpeg.exe")), "rtsp://localhost/live", width=2, height=2)
+    with capture.stream(timeout=3) as frames:
+        received = list(frames)
+    assert len(received) == 2
+    assert [frame.frame_no for frame in received] == [0, 1]
+    assert len(calls) == 1
+    assert "-frames:v" not in calls[0][0]
+
+def test_rtsp_stream_times_out_when_frame_read_stalls(monkeypatch):
+    released = threading.Event()
+
+    class BlockingStdout:
+        def read(self, _size):
+            released.wait(timeout=2.0)
+            return b""
+
+        def close(self):
+            released.set()
+
+    class Process:
+        def __init__(self):
+            self.stdout = BlockingStdout()
+            self.stderr = io.BytesIO()
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            released.set()
+
+        def kill(self):
+            self.returncode = -9
+            released.set()
+
+        def wait(self, timeout=None):
+            released.set()
+            return self.returncode
+
+    monkeypatch.setattr("factoryguard.media.rtsp.subprocess.Popen", lambda *args, **kwargs: Process())
+    capture = RTSPCapture(FFmpegInstallation(Path("ffmpeg.exe")), "rtsp://localhost/live", width=2, height=2)
+    with pytest.raises(RuntimeError, match="read timed out"):
+        with capture.stream(timeout=0.05) as frames:
+            next(frames)
+
+
+def test_rtsp_capture_error_redacts_credentials(monkeypatch):
+    class Process:
+        def __init__(self):
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"connect rtsp://admin:secret@camera/live failed")
+            self.returncode = 1
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    def fake_popen(*_args, **kwargs):
+        kwargs["stderr"].write(b"connect rtsp://admin:secret@camera/live failed")
+        return Process()
+
+    monkeypatch.setattr("factoryguard.media.rtsp.subprocess.Popen", fake_popen)
+    capture = RTSPCapture(FFmpegInstallation(Path("ffmpeg.exe")), "rtsp://admin:secret@camera/live", width=2, height=2)
+    with pytest.raises(RuntimeError) as exc:
+        list(capture.capture(1))
+    assert "secret" not in str(exc.value)
+    assert "***:***@camera/live" in str(exc.value)
+
+def test_rtsp_capture_uses_one_streaming_process(monkeypatch):
+    frame_bytes = np.zeros((2, 2, 3), dtype=np.uint8).tobytes()
+
+    class Process:
+        def __init__(self):
+            self.stdout = io.BytesIO(frame_bytes * 2)
+            self.stderr = io.BytesIO()
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    calls = []
+
+    def fake_popen(command, **kwargs):
+        calls.append((command, kwargs))
+        return Process()
+
+    monkeypatch.setattr("factoryguard.media.rtsp.subprocess.Popen", fake_popen)
+    capture = RTSPCapture(FFmpegInstallation(Path("ffmpeg.exe")), "rtsp://localhost/live", width=2, height=2)
+    frames = capture.capture(1)
+    assert next(frames).frame_no == 0
+    frames.close()
+    assert len(calls) == 1
+    assert "-frames:v" not in calls[0][0]
+
+def test_rtsp_capture_rejects_short_output(monkeypatch):
+    class Process:
+        def __init__(self):
+            self.stdout = io.BytesIO(b"short")
+            self.stderr = io.BytesIO()
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    monkeypatch.setattr("factoryguard.media.rtsp.subprocess.Popen", lambda *args, **kwargs: Process())
     capture = RTSPCapture(FFmpegInstallation(Path("ffmpeg.exe")), "rtsp://localhost/live", width=2, height=2)
     with pytest.raises(RuntimeError, match="returned 0 frames; expected 1"):
         list(capture.capture(1))
-
 
 def test_rtsp_capture_validates_constructor_and_timeout():
     with pytest.raises(ValueError, match="URL"):

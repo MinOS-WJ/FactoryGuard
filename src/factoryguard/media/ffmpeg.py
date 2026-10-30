@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -11,6 +12,10 @@ from typing import Iterable
 import numpy as np
 
 
+def _creation_flags() -> int:
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0
+
+
 @dataclass(frozen=True, slots=True)
 class FFmpegInstallation:
     """An FFmpeg toolchain discovered without invoking a shell."""
@@ -19,7 +24,7 @@ class FFmpegInstallation:
     version: str | None = None
     ffprobe: Path | None = None
 
-    def command_for_rtsp(
+    def command_for_stream(
         self,
         url: str,
         *,
@@ -27,6 +32,7 @@ class FFmpegInstallation:
         width: int | None = None,
         height: int | None = None,
         frames: int | None = None,
+        read_timeout: float = 15.0,
     ) -> list[str]:
         """Build an isolated RTSP-over-TCP raw-frame command.
 
@@ -34,30 +40,34 @@ class FFmpegInstallation:
         Keeping every argument separate prevents a camera URL or credential
         from becoming a command injection vector.
         """
-        if not url:
-            raise ValueError("RTSP URL is required")
+        if not url.lower().startswith(("rtsp://", "rtsps://", "rtp://")):
+            raise ValueError("stream URL must use rtsp://, rtsps:// or rtp://")
         if not isfinite(fps) or fps <= 0:
             raise ValueError("fps must be positive")
         if frames is not None and frames < 1:
             raise ValueError("frames must be positive when provided")
+        if not isfinite(read_timeout) or read_timeout <= 0:
+            raise ValueError("read_timeout must be positive")
         filters = [f"fps={fps:g}"]
         if width is not None or height is not None:
             if not width or not height or width <= 0 or height <= 0:
                 raise ValueError("width and height must both be positive")
             filters.insert(0, f"scale={width}:{height}")
-        command = [
-            str(self.executable),
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-rtsp_transport",
-            "tcp",
+        command = [str(self.executable), "-hide_banner", "-loglevel", "warning"]
+        if url.lower().startswith(("rtsp://", "rtsps://")):
+            command.extend([
+                "-rtsp_transport",
+                "tcp",
+                "-timeout",
+                str(max(1, round(read_timeout * 1_000_000))),
+            ])
+        command.extend([
             "-i",
             url,
             "-an",
             "-vf",
             ",".join(filters),
-        ]
+        ])
         if frames is not None:
             command.extend(["-frames:v", str(frames)])
         command.extend([
@@ -68,6 +78,70 @@ class FFmpegInstallation:
             "pipe:1",
         ])
         return command
+
+    def command_for_rtsp(
+        self,
+        url: str,
+        *,
+        fps: float = 2.0,
+        width: int | None = None,
+        height: int | None = None,
+        frames: int | None = None,
+        read_timeout: float = 15.0,
+    ) -> list[str]:
+        """Backward-compatible name for RTSP and RTP stream commands."""
+        return self.command_for_stream(
+            url,
+            fps=fps,
+            width=width,
+            height=height,
+            frames=frames,
+            read_timeout=read_timeout,
+        )
+
+    def probe_resolution(self, url: str, *, timeout: float = 10.0) -> tuple[int, int] | None:
+        """Return the source video resolution when FFprobe is available."""
+
+        if not self.ffprobe:
+            return None
+        if not url:
+            raise ValueError("RTSP URL is required")
+        if not isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive")
+        command = [
+            str(self.ffprobe),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
+            url,
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+                shell=False,
+                creationflags=_creation_flags(),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if completed.returncode != 0:
+            return None
+        try:
+            payload = json.loads(completed.stdout.decode("utf-8", errors="replace"))
+            stream = payload["streams"][0]
+            width = int(stream["width"])
+            height = int(stream["height"])
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return (width, height) if width > 0 and height > 0 else None
 
     def command_for_rawvideo(
         self,
@@ -160,6 +234,7 @@ def encode_raw_clip(
             timeout=timeout,
             check=False,
             shell=False,
+            creationflags=_creation_flags(),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"FFmpeg clip encoding timed out after {timeout:g}s") from exc
@@ -170,6 +245,65 @@ def encode_raw_clip(
         raise RuntimeError(f"FFmpeg clip encoding failed ({completed.returncode}): {detail}")
     return str(destination)
 
+
+def encode_raw_image(
+    installation: FFmpegInstallation,
+    image: np.ndarray,
+    output: str | os.PathLike[str],
+    *,
+    timeout: float = 10.0,
+) -> str:
+    """Encode one BGR frame as a local PNG without requiring Qt."""
+
+    if not isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be positive")
+    if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("image must be an HxWx3 BGR array")
+    height, width = image.shape[:2]
+    destination = Path(output).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(installation.executable),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s",
+        f"{width}x{height}",
+        "-i",
+        "pipe:0",
+        "-frames:v",
+        "1",
+        "-f",
+        "image2",
+        "-vcodec",
+        "png",
+        str(destination),
+    ]
+    payload = np.ascontiguousarray(image, dtype=np.uint8).tobytes()
+    try:
+        completed = subprocess.run(
+            command,
+            input=payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            shell=False,
+            creationflags=_creation_flags(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"FFmpeg image encoding timed out after {timeout:g}s") from exc
+    except OSError as exc:
+        raise RuntimeError(f"FFmpeg image encoding could not start: {exc}") from exc
+    if completed.returncode != 0 or not destination.is_file() or destination.stat().st_size == 0:
+        detail = completed.stderr.decode("utf-8", errors="replace")[-1000:]
+        raise RuntimeError(f"FFmpeg image encoding failed ({completed.returncode}): {detail}")
+    return str(destination)
 
 def find_ffmpeg(explicit: str | os.PathLike[str] | None = None) -> FFmpegInstallation | None:
     """Find the supplied bundle, an explicit path, or a PATH executable."""
@@ -222,6 +356,7 @@ def _version(executable: Path) -> str | None:
             timeout=5,
             check=False,
             shell=False,
+            creationflags=_creation_flags(),
         )
     except (OSError, subprocess.SubprocessError):
         return None

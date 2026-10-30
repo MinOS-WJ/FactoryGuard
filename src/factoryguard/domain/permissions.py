@@ -25,6 +25,7 @@ class Permission(StrEnum):
     MANAGE_ARMING = "manage_arming"
     REVIEW_EVENTS = "review_events"
     MANAGE_SYSTEM = "manage_system"
+    PUBLISH_RULES = "publish_rules"
 
 
 ROLE_LABELS: dict[UserRole, str] = {
@@ -42,6 +43,7 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
             Permission.MANAGE_TOPOLOGY,
             Permission.MANAGE_RULES,
             Permission.MANAGE_ARMING,
+            Permission.PUBLISH_RULES,
             Permission.REVIEW_EVENTS,
         }
     ),

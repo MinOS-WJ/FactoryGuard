@@ -3,11 +3,13 @@ from __future__ import annotations
 """Qt workers for continuous and one-shot notification delivery."""
 
 from collections.abc import Iterable
+from datetime import UTC, datetime
 import threading
 from math import isfinite
 
+from factoryguard.domain.models import Detection, Event, Frame, Rule, RuleType
 from factoryguard.notifications.adapters import EmailAdapter, NotificationAdapter, SmsHttpAdapter, WebhookAdapter
-from factoryguard.notifications.destinations import NotificationDestination
+from factoryguard.notifications.destinations import NotificationDestination, destination_channel_map
 from factoryguard.notifications.dispatcher import DispatchReport, OutboxDispatcher
 from factoryguard.storage.sqlite import SQLiteStore
 
@@ -16,6 +18,25 @@ from .qt import HAS_QT
 
 if HAS_QT:
     from .qt import QObject, Signal, Slot
+
+    class NotificationTestWorker(QObject):
+        """Send one synthetic connectivity event without blocking the GUI."""
+
+        result_ready = Signal(bool, str)
+        finished = Signal()
+
+        def __init__(self, adapter: NotificationAdapter) -> None:
+            super().__init__()
+            self.adapter = adapter
+
+        @Slot()
+        def run(self) -> None:
+            try:
+                ok, detail = self.adapter.send(_connectivity_event(), outbox={})
+            except Exception as exc:  # noqa: BLE001 - report adapter failures to the operator
+                ok, detail = False, str(exc)
+            self.result_ready.emit(ok, detail)
+            self.finished.emit()
 
     class NotificationWorker(QObject):
         """Run webhook delivery away from the Qt GUI thread."""
@@ -74,6 +95,9 @@ if HAS_QT:
             self.sms_template_id = sms_template_id
             self.sms_recipients = sms_recipients
             self.destinations = tuple(destinations)
+            self.destination_channels = destination_channel_map(
+                destination for destination in self.destinations if destination.enabled
+            )
             self.adapters = _delivery_adapters(
                 webhook_url=self.webhook_url,
                 webhook_secret=self.webhook_secret,
@@ -113,6 +137,11 @@ if HAS_QT:
                 self.status_changed.emit("starting", "通知调度器正在启动")
                 while not self._stop.is_set():
                     try:
+                        store.escalate_overdue_events(
+                        destination_channels=self.destination_channels,
+                            channels=tuple(self.adapters),
+                            now=datetime.now(UTC),
+                        )
                         report = dispatcher.dispatch_once(store, limit=self.batch_size)
                         self.report_ready.emit(report)
                         self.status_changed.emit("running", _report_detail(report))
@@ -187,6 +216,9 @@ if HAS_QT:
             self.sms_template_id = sms_template_id
             self.sms_recipients = sms_recipients
             self.destinations = tuple(destinations)
+            self.destination_channels = destination_channel_map(
+                destination for destination in self.destinations if destination.enabled
+            )
             self.adapters = _delivery_adapters(
                 webhook_url=self.webhook_url,
                 webhook_secret=self.webhook_secret,
@@ -218,6 +250,11 @@ if HAS_QT:
                 store = SQLiteStore(self.db)
                 dispatcher = OutboxDispatcher(adapters=self.adapters)
                 self.status_changed.emit("starting", "正在执行一次通知发送")
+                store.escalate_overdue_events(
+                    destination_channels=self.destination_channels,
+                    channels=tuple(self.adapters),
+                    now=datetime.now(UTC),
+                )
                 report = dispatcher.dispatch_once(store, limit=self.batch_size)
                 self.report_ready.emit(report)
                 self.status_changed.emit("running", _report_detail(report))
@@ -240,6 +277,18 @@ else:
         def __init__(self, **_: object) -> None:
             raise RuntimeError("PySide6 is required for the notification worker")
 
+
+def _connectivity_event() -> Event:
+    rule = Rule(
+        "notification-connectivity-test",
+        "connectivity-test",
+        "FactoryGuard connectivity test",
+        RuleType.POLYGON,
+        ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0)),
+    )
+    frame = Frame("connectivity-test", 1, datetime.now(UTC), 2, 2)
+    detection = Detection("test", 1.0, (0.0, 0.0, 1.0, 1.0), "connectivity-test")
+    return Event.create(rule=rule, frame=frame, detection=detection)
 
 def _report_detail(report: DispatchReport) -> str:
     if report.claimed == 0:
@@ -347,4 +396,4 @@ def _destination_adapter(destination: NotificationDestination) -> NotificationAd
     raise ValueError(f"unsupported notification destination: {destination.kind}")
 
 
-__all__ = ["NotificationDispatchOnceWorker", "NotificationWorker"]
+__all__ = ["NotificationDispatchOnceWorker", "NotificationTestWorker", "NotificationWorker"]

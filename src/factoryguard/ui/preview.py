@@ -12,7 +12,7 @@ from factoryguard.domain.models import Detection
 from .qt import HAS_QT
 
 if HAS_QT:
-    from .qt import QColor, QFont, QImage, QPainter, QPen, QRectF, Qt, QWidget
+    from .qt import QColor, QFont, QImage, QPainter, QPen, QRectF, QSizePolicy, Qt, QWidget
 
 
 def numpy_to_qimage(image: np.ndarray):
@@ -56,11 +56,15 @@ if HAS_QT:
             self._mode = "live"
             self._message = "等待视频流"
             self.setMinimumSize(420, 250)
+            self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
             self.setAttribute(Qt.WA_OpaquePaintEvent, True)
 
         @property
         def has_image(self) -> bool:
             return not self._image.isNull()
+
+        def current_image(self) -> QImage:
+            return self._image.copy() if not self._image.isNull() else QImage()
 
         def set_frame(self, image: np.ndarray, detections: tuple[Detection, ...] | list[Detection] = ()) -> None:
             self._image = numpy_to_qimage(image)

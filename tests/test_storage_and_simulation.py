@@ -1,4 +1,6 @@
 import json
+
+import pytest
 from datetime import UTC, datetime, timedelta
 
 from factoryguard.domain.models import Detection, Event, EventStatus, Frame, Rule, RuleType
@@ -212,6 +214,269 @@ def test_stream_arming_state_persists_and_is_audited(tmp_path):
     store.close()
 
 
+
+def test_rule_assignees_round_trip_and_event_target(tmp_path):
+    store = SQLiteStore(tmp_path / "assignees.db")
+    rule = Rule(
+        "assignee-rule",
+        stream_id="stream-1",
+        name="值班定向",
+        type=RuleType.POLYGON,
+        geometry=((0, 0), (100, 0), (100, 100), (0, 100)),
+        assignees=("张三", "李四"),
+    )
+    store.save_rule(rule)
+    loaded = store.load_rules(stream_id="stream-1")[0]
+    assert loaded.assignees == ("张三", "李四")
+    event = Event.create(
+        rule=loaded,
+        frame=Frame("stream-1", 1, datetime(2026, 1, 1, tzinfo=UTC), 100, 100),
+        detection=Detection("person", 0.9, (10, 10, 40, 80), "t1"),
+    )
+    assert event.assignees == ("张三", "李四")
+    assert event.target["assignees"] == ["张三", "李四"]
+    store.close()
+
+
+
+
+def test_builtin_rule_templates_are_importable(tmp_path):
+    from factoryguard.rule_templates import BUILTIN_RULE_TEMPLATES
+    store = SQLiteStore(tmp_path / "builtin-templates.db")
+    assert len(BUILTIN_RULE_TEMPLATES) >= 5
+    template = BUILTIN_RULE_TEMPLATES[2]
+    imported = store.import_rule_template(
+        template,
+        actor="operator",
+        stream_id="stream-1",
+    )
+    assert imported.condition == "line_count"
+    assert imported.publication_status == "draft"
+    store.close()
+
+def test_rule_template_export_and_import_are_portable(tmp_path):
+    store = SQLiteStore(tmp_path / "rule-templates.db")
+    source = Rule(
+        "template-source",
+        stream_id="stream-1",
+        site_id="site-1",
+        name="行业模板",
+        type=RuleType.POLYGON,
+        geometry=((0, 0), (100, 0), (100, 100), (0, 100)),
+        condition_nodes=(
+            {"id": "g1", "op": "not", "children": [
+                {"id": "occ", "condition": "occupancy", "count_threshold": 2},
+            ]},
+        ),
+    )
+    store.save_rule(source)
+    template = store.export_rule_template("template-source")
+    assert "stream_id" not in template["rule"]
+    imported = store.import_rule_template(
+        template,
+        actor="operator",
+        stream_id="stream-2",
+        new_id="imported-rule",
+    )
+    assert imported.id == "imported-rule"
+    assert imported.stream_id == "stream-2"
+    assert imported.publication_status == "draft"
+    assert imported.condition_nodes == source.condition_nodes
+    store.close()
+
+def test_condition_nodes_round_trip(tmp_path):
+    store = SQLiteStore(tmp_path / "condition-nodes.db")
+    rule = Rule(
+        "tree-rule",
+        stream_id="stream-1",
+        name="条件树",
+        type=RuleType.POLYGON,
+        geometry=((0, 0), (100, 0), (100, 100), (0, 100)),
+        condition_nodes=(
+            {"id": "g1", "op": "or", "children": [
+                {"id": "occ", "condition": "occupancy", "count_threshold": 2},
+                {"id": "intr", "condition": "intrusion", "confirm_frames": 1},
+            ]},
+        ),
+    )
+    store.save_rule(rule)
+    loaded = store.load_rules(stream_id="stream-1")[0]
+    assert loaded.condition_nodes == rule.condition_nodes
+    store.close()
+
+def test_line_count_rule_fields_round_trip(tmp_path):
+    store = SQLiteStore(tmp_path / "line-count-rules.db")
+    rule = Rule(
+        "line-count-rule",
+        stream_id="stream-1",
+        name="东门过线计数",
+        type=RuleType.LINE,
+        geometry=((0, 100), (500, 100)),
+        condition="line_count",
+        direction="down",
+        count_threshold=10,
+        window_seconds=300,
+        cooldown_seconds=60,
+        actions=("event", "notify", "audit", "http"),
+        http_action_url="https://actions.example.test/event",
+        http_action_timeout=7,
+    )
+    store.save_rule(rule)
+    loaded = store.load_rules(stream_id="stream-1")[0]
+    assert loaded.condition == "line_count"
+    assert loaded.direction == "down"
+    assert loaded.count_threshold == 10
+    assert loaded.window_seconds == 300
+    assert loaded.actions == ("event", "notify", "audit", "http")
+    assert loaded.http_action_url == "https://actions.example.test/event"
+    assert loaded.http_action_timeout == 7
+    store.close()
+
+
+def test_rule_versions_are_saved_and_restored_as_new_version(tmp_path):
+    store = SQLiteStore(tmp_path / "rule-versions.db")
+    version_one = Rule(
+        "versioned-rule",
+        stream_id="stream-1",
+        name="版本测试",
+        type=RuleType.LINE,
+        geometry=((0, 100), (500, 100)),
+        condition="line_cross",
+        version=1,
+    )
+    store.save_rule(version_one, note="initial")
+    version_two = Rule(
+        "versioned-rule",
+        stream_id="stream-1",
+        name="版本测试 v2",
+        type=RuleType.LINE,
+        geometry=((0, 120), (500, 120)),
+        condition="line_cross",
+        cooldown_seconds=10,
+        version=2,
+    )
+    store.save_rule(version_two, note="adjust line")
+    assert [row["version"] for row in store.list_rule_versions("versioned-rule")] == [2, 1]
+    restored = store.restore_rule_version("versioned-rule", 1, actor="operator")
+    assert restored.version == 3
+    assert restored.geometry == version_one.geometry
+    assert store.load_rules(stream_id="stream-1")[0].version == 3
+    store.close()
+
+
+def test_rule_dual_approval_requires_two_distinct_reviewers(tmp_path):
+    store = SQLiteStore(tmp_path / "dual-approval.db")
+    draft = Rule(
+        "review-rule",
+        stream_id="stream-1",
+        name="需要双人审核",
+        type=RuleType.POLYGON,
+        geometry=((0, 0), (100, 0), (100, 100), (0, 100)),
+        publication_status="draft",
+        version=1,
+    )
+    store.save_rule(draft)
+    pending = store.submit_rule_for_review("review-rule", actor="alice")
+    assert pending.publication_status == "pending_review"
+    assert pending.version == 2
+    assert store.load_rules(stream_id="stream-1", published_only=True) == []
+
+    first = store.approve_rule("review-rule", actor="alice")
+    assert first.publication_status == "pending_review"
+    assert store.rule_approval_actors("review-rule", first.version) == ("alice",)
+    store.approve_rule("review-rule", actor="alice")
+    assert store.rule_approval_actors("review-rule", first.version) == ("alice",)
+
+    published = store.approve_rule("review-rule", actor="bob")
+    assert published.publication_status == "published"
+    assert published.version == 3
+    assert [rule.id for rule in store.load_rules(stream_id="stream-1", published_only=True)] == ["review-rule"]
+    store.close()
+
+
+def test_rule_rejection_returns_to_draft_and_is_versioned(tmp_path):
+    store = SQLiteStore(tmp_path / "reject-review.db")
+    draft = Rule(
+        "reject-rule",
+        stream_id="stream-1",
+        name="驳回规则",
+        type=RuleType.LINE,
+        geometry=((0, 100), (500, 100)),
+        publication_status="draft",
+        version=1,
+    )
+    store.save_rule(draft)
+    pending = store.submit_rule_for_review("reject-rule", actor="alice")
+    rejected = store.reject_rule("reject-rule", actor="bob", note="参数不合理")
+    assert rejected.publication_status == "draft"
+    assert rejected.version == 3
+    reviews = store.list_rule_reviews("reject-rule")
+    assert reviews[-1]["decision"] == "reject"
+    store.close()
+
+def test_draft_rules_are_hidden_from_production_runtime(tmp_path):
+    store = SQLiteStore(tmp_path / "draft-rules.db")
+    draft = Rule(
+        "draft-rule",
+        stream_id="stream-1",
+        name="draft",
+        type=RuleType.POLYGON,
+        geometry=((0, 0), (100, 0), (100, 100), (0, 100)),
+        publication_status="draft",
+    )
+    published = Rule(
+        "published-rule",
+        stream_id="stream-1",
+        name="published",
+        type=RuleType.POLYGON,
+        geometry=((0, 0), (100, 0), (100, 100), (0, 100)),
+        publication_status="published",
+    )
+    store.save_rule(draft)
+    store.save_rule(published)
+    assert {rule.id for rule in store.load_rules(stream_id="stream-1")} == {"draft-rule", "published-rule"}
+    assert [rule.id for rule in store.load_rules(stream_id="stream-1", published_only=True)] == ["published-rule"]
+    store.close()
+
+
+def test_overdue_open_event_escalates_once_and_requeues_notifications(tmp_path):
+    store = SQLiteStore(tmp_path / "escalation.db")
+    rule = Rule(
+        "escalation-rule",
+        "CH01",
+        "escalate",
+        RuleType.POLYGON,
+        ((0, 0), (100, 0), (100, 100), (0, 100)),
+        confirm_frames=1,
+        ack_deadline_seconds=10,
+        escalation_level="critical",
+        actions=("event", "notify"),
+    )
+    store.save_rule(rule)
+    occurred = datetime(2026, 1, 1, tzinfo=UTC)
+    event = Event.create(
+        rule=rule,
+        frame=Frame("CH01", 1, occurred, 100, 100),
+        detection=Detection("person", 0.9, (10, 10, 30, 80), "track-1"),
+    )
+    assert store.create_event_with_outbox(event, channels=("webhook",))
+    assert store.escalate_overdue_events(
+        channels=("webhook",),
+        now=occurred + timedelta(seconds=20),
+    ) == 1
+    assert store.escalate_overdue_events(
+        channels=("webhook",),
+        now=occurred + timedelta(seconds=30),
+    ) == 0
+    row = store._connection_or_raise().execute(
+        "SELECT level, escalated_at FROM event WHERE id = ?", (event.id,)
+    ).fetchone()
+    assert row["level"] == "critical"
+    assert row["escalated_at"] is not None
+    assert store.outbox_counts()["pending"] == 2
+    store.close()
+
+
 def test_outbox_claim_lease_retry_and_sent_state():
     store = SQLiteStore()
     rule = Rule("r1", "CH01", "fence", RuleType.POLYGON, ((0, 0), (10, 0), (10, 10), (0, 10)))
@@ -272,4 +537,36 @@ def test_outbox_operations_console_lists_counts_and_requeues_failed_rows():
         "SELECT action, actor FROM audit_log WHERE resource = ? ORDER BY id DESC LIMIT 1", (outbox_id,)
     ).fetchone()
     assert tuple(audit) == ("notification.requeue", "operator")
+    store.close()
+
+
+def test_overdue_escalation_uses_rule_destination_ids(tmp_path):
+    store = SQLiteStore(tmp_path / "escalation-destination.db")
+    rule = Rule(
+        "escalation-destination-rule",
+        "CH01",
+        "escalate destination",
+        RuleType.POLYGON,
+        ((0, 0), (100, 0), (100, 100), (0, 100)),
+        confirm_frames=1,
+        ack_deadline_seconds=10,
+        escalation_level="high",
+        actions=("event", "notify"),
+        destination_ids=("gate-a",),
+    )
+    store.save_rule(rule)
+    occurred = datetime(2026, 1, 1, tzinfo=UTC)
+    event = Event.create(
+        rule=rule,
+        frame=Frame("CH01", 1, occurred, 100, 100),
+        detection=Detection("person", 0.9, (10, 10, 30, 80), "track-1"),
+    )
+    assert store.create_event_with_outbox(event, channels=("webhook",))
+    assert store.escalate_overdue_events(
+        channels=("webhook", "email"),
+        destination_channels={"gate-a": "webhook:gate-a", "gate-b": "webhook:gate-b"},
+        now=occurred + timedelta(seconds=20),
+    ) == 1
+    rows = store.list_pending_outbox()
+    assert {row["channel"] for row in rows} == {"webhook", "webhook:gate-a"}
     store.close()

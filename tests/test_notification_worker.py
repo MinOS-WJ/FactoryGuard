@@ -4,11 +4,17 @@ import pytest
 
 pytest.importorskip("PySide6")
 
+from factoryguard.inference.base import InferenceHealth
 from factoryguard.notifications.dispatcher import DispatchReport
 from factoryguard.notifications.destinations import NotificationDestination
 from factoryguard.storage.sqlite import SQLiteStore
 from factoryguard.ui import notification_worker
-from factoryguard.ui.notification_worker import NotificationDispatchOnceWorker, NotificationWorker
+from factoryguard.ui.model_worker import ModelHealthWorker
+from factoryguard.ui.notification_worker import (
+    NotificationDispatchOnceWorker,
+    NotificationTestWorker,
+    NotificationWorker,
+)
 
 
 def test_notification_worker_dispatches_until_requested_to_stop(monkeypatch, tmp_path):
@@ -43,6 +49,70 @@ def test_notification_worker_dispatches_until_requested_to_stop(monkeypatch, tmp
     assert statuses[0][0] == "starting"
     assert statuses[-1][0] == "stopped"
 
+
+def test_notification_test_worker_sends_synthetic_event():
+    captured = []
+
+    class _Adapter:
+        def send(self, event, *, outbox):
+            captured.append((event, dict(outbox)))
+            return True, "accepted"
+
+    results = []
+    finished = []
+    worker = NotificationTestWorker(_Adapter())
+    worker.result_ready.connect(lambda ok, detail: results.append((ok, detail)))
+    worker.finished.connect(lambda: finished.append(True))
+    worker.run()
+
+    assert results == [(True, "accepted")]
+    assert finished == [True]
+    assert captured[0][0].rule_id == "notification-connectivity-test"
+    assert captured[0][1] == {}
+
+def test_model_health_worker_reports_ready_model():
+    class _Engine:
+        def __init__(self, model_path, *, confidence, iou):
+            assert model_path == "models/test.onnx"
+            assert confidence == 0.42
+            assert iou == 0.33
+
+        def health_check(self):
+            return InferenceHealth("ready", "cpu", detail="CPUExecutionProvider")
+
+    import factoryguard.ui.model_worker as model_worker
+
+    original = model_worker.YoloOnnxEngine
+    model_worker.YoloOnnxEngine = _Engine
+    try:
+        results = []
+        worker = ModelHealthWorker("models/test.onnx", confidence=0.42, iou=0.33)
+        worker.result_ready.connect(lambda ok, detail: results.append((ok, detail)))
+        worker.run()
+    finally:
+        model_worker.YoloOnnxEngine = original
+
+    assert results == [(True, "ready · cpu · CPUExecutionProvider")]
+
+def test_model_health_worker_reports_loading_failure():
+    def _fail(_model_path, **_kwargs):
+        raise RuntimeError("model load failed")
+
+    import factoryguard.ui.model_worker as model_worker
+
+    original = model_worker.YoloOnnxEngine
+    model_worker.YoloOnnxEngine = _fail
+    try:
+        results = []
+        worker = ModelHealthWorker("missing.onnx")
+        worker.result_ready.connect(lambda ok, detail: results.append((ok, detail)))
+        worker.run()
+    finally:
+        model_worker.YoloOnnxEngine = original
+
+    assert len(results) == 1
+    assert results[0][0] is False
+    assert "model load failed" in results[0][1]
 
 def test_notification_worker_rejects_invalid_delivery_configuration(tmp_path):
     database = tmp_path / "notifications.db"

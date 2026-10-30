@@ -6,7 +6,9 @@ import json
 from typing import Any
 
 from factoryguard.domain.permissions import ROLE_LABELS, UserRole, role_from_value
-from factoryguard.inference.remote import CentralInferenceClient
+from factoryguard.inference.profiles import ModelBinding, ModelProfile, new_model_binding_id, new_model_profile_id
+from factoryguard.storage.sqlite import SQLiteStore
+from factoryguard.inference.yolo_onnx import YoloOnnxEngine
 from factoryguard.notifications.adapters import (
     EmailAdapter,
     SmsHttpAdapter,
@@ -27,11 +29,13 @@ if HAS_QT:
         QDoubleSpinBox,
         QFormLayout,
         QGroupBox,
+        QHeaderView,
         QHBoxLayout,
         QLabel,
         QLineEdit,
         QPushButton,
         QSpinBox,
+        QSplitter,
         QTableWidget,
         QTableWidgetItem,
         QVBoxLayout,
@@ -202,7 +206,7 @@ if HAS_QT:
                 destination.provider = str(self.webhook_provider_combo.currentData() or "custom")
                 destination.enabled = self.webhook_enabled_check.isChecked()
                 destination.settings["url"] = self.webhook_url_edit.text().strip()
-                destination.secrets["secret"] = self.webhook_secret_edit.text()
+                destination.secrets["secret"] = self._webhook_secret_value()
             elif kind == "email":
                 destination.name = self.email_name_edit.text().strip() or destination.name
                 destination.provider = str(self.email_provider_combo.currentData() or "custom")
@@ -217,7 +221,7 @@ if HAS_QT:
                         "security": str(self.email_security_combo.currentData() or "starttls"),
                     }
                 )
-                destination.secrets["password"] = self.email_password_edit.text()
+                destination.secrets["password"] = self._email_password_value()
             else:
                 destination.name = self.sms_name_edit.text().strip() or destination.name
                 destination.provider = str(self.sms_provider_combo.currentData() or "custom_http")
@@ -230,7 +234,7 @@ if HAS_QT:
                         "recipients": list(self._sms_recipients_from_form()),
                     }
                 )
-                destination.secrets["token"] = self.sms_token_edit.text()
+                destination.secrets["token"] = self._sms_token_value()
 
         def _sync_all_destination_editors(self) -> None:
             self._sync_destination_editor("webhook")
@@ -411,61 +415,418 @@ if HAS_QT:
             layout.addStretch(1)
             return page
 
+        def _build_model_settings_page(self) -> QWidget:
+            page, layout = self._settings_page(
+                "模型接入",
+                "集中管理本机 ONNX 模型，绑定当前监控配置并做健康检查。",
+            )
+            instances = QGroupBox("模型实例")
+            instances_layout = QVBoxLayout(instances)
+            self.model_profile_table = QTableWidget(0, 6)
+            self.model_profile_table.setHorizontalHeaderLabels(
+                ["名称", "任务", "后端", "模型地址", "版本", "状态"]
+            )
+            self.model_profile_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            self.model_profile_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self.model_profile_table.setSelectionMode(QAbstractItemView.SingleSelection)
+            self.model_profile_table.setAlternatingRowColors(True)
+            self.model_profile_table.horizontalHeader().setStretchLastSection(True)
+            self.model_profile_table.itemSelectionChanged.connect(self._select_model_profile_from_table)
+            instances_layout.addWidget(self.model_profile_table)
+            actions = QHBoxLayout()
+            add_model = QPushButton("新增模型")
+            duplicate_model = QPushButton("复制模型")
+            delete_model = QPushButton("删除模型")
+            add_model.clicked.connect(self._add_model_profile)
+            duplicate_model.clicked.connect(self._duplicate_model_profile)
+            delete_model.clicked.connect(self._delete_model_profile)
+            actions.addWidget(add_model)
+            actions.addWidget(duplicate_model)
+            actions.addWidget(delete_model)
+            actions.addStretch(1)
+            instances_layout.addLayout(actions)
+            layout.addWidget(instances)
+
+            editor = QGroupBox("模型配置")
+            editor_layout = QFormLayout(editor)
+            self.model_name_edit = QLineEdit()
+            self.model_name_edit.setPlaceholderText("例如：YOLO11n 人员检测")
+            self.model_task_combo = QComboBox()
+            self.model_task_combo.addItem("目标检测", "detection")
+            self.model_task_combo.addItem("图像分类", "classification")
+            self.model_task_combo.addItem("姿态估计", "pose")
+            self.model_task_combo.addItem("异常检测", "anomaly")
+            self.model_backend_combo = QComboBox()
+            self.model_backend_combo.addItem("本地 ONNX Runtime", "onnx_cpu")
+            self.model_backend_combo.setEnabled(False)
+            self.model_uri_edit = QLineEdit()
+            self.model_uri_edit.setPlaceholderText("models/yolo11n.onnx")
+            self.model_input_width_spin = QSpinBox()
+            self.model_input_width_spin.setRange(64, 4096)
+            self.model_input_width_spin.setValue(640)
+            self.model_input_height_spin = QSpinBox()
+            self.model_input_height_spin.setRange(64, 4096)
+            self.model_input_height_spin.setValue(640)
+            self.model_labels_edit = QLineEdit("person")
+            self.model_labels_edit.setPlaceholderText("person, forklift, vehicle")
+            self.model_confidence_spin = QDoubleSpinBox()
+            self.model_confidence_spin.setRange(0.01, 1.0)
+            self.model_confidence_spin.setSingleStep(0.05)
+            self.model_confidence_spin.setValue(0.25)
+            self.model_iou_spin = QDoubleSpinBox()
+            self.model_iou_spin.setRange(0.01, 1.0)
+            self.model_iou_spin.setSingleStep(0.05)
+            self.model_iou_spin.setValue(0.45)
+            self.model_version_edit = QLineEdit("1.0")
+            self.model_enabled_check = QCheckBox("模型启用")
+            self.model_enabled_check.setChecked(True)
+            self.model_status_label = QLabel("等待测试")
+            self.model_status_label.setWordWrap(True)
+            self.model_status_label.setObjectName("muted")
+            editor_layout.addRow("模型名称", self.model_name_edit)
+            editor_layout.addRow("任务类型", self.model_task_combo)
+            editor_layout.addRow("运行后端", self.model_backend_combo)
+            editor_layout.addRow("模型地址", self.model_uri_edit)
+            size_row = QHBoxLayout()
+            size_row.addWidget(QLabel("宽"))
+            size_row.addWidget(self.model_input_width_spin)
+            size_row.addWidget(QLabel("高"))
+            size_row.addWidget(self.model_input_height_spin)
+            editor_layout.addRow("输入尺寸", size_row)
+            editor_layout.addRow("标签集合", self.model_labels_edit)
+            editor_layout.addRow("默认置信度", self.model_confidence_spin)
+            editor_layout.addRow("默认 IoU", self.model_iou_spin)
+            editor_layout.addRow("模型版本", self.model_version_edit)
+            editor_layout.addRow("状态", self.model_enabled_check)
+            editor_layout.addRow("检查结果", self.model_status_label)
+            button_row = QHBoxLayout()
+            test_model = QPushButton("健康检查")
+            apply_model = QPushButton("应用到监控配置")
+            save_models = QPushButton("保存模型接入")
+            save_models.setObjectName("primary")
+            self.model_profile_test_button = test_model
+            test_model.clicked.connect(self._test_model_profile)
+            apply_model.clicked.connect(self._apply_model_profile)
+            save_models.clicked.connect(self._save_model_profiles)
+            button_row.addWidget(test_model)
+            button_row.addWidget(apply_model)
+            button_row.addWidget(save_models)
+            button_row.addStretch(1)
+            editor_layout.addRow("", button_row)
+            layout.addWidget(editor)
+
+            binding_group = QGroupBox("模型绑定")
+            binding_layout = QVBoxLayout(binding_group)
+            self.model_binding_table = QTableWidget(0, 5)
+            self.model_binding_table.setHorizontalHeaderLabels(["模型", "范围", "范围 ID", "优先级", "状态"])
+            self.model_binding_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            self.model_binding_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self.model_binding_table.setAlternatingRowColors(True)
+            self.model_binding_table.horizontalHeader().setStretchLastSection(True)
+            binding_layout.addWidget(self.model_binding_table)
+            binding_form = QHBoxLayout()
+            self.binding_model_combo = QComboBox()
+            self.binding_scope_combo = QComboBox()
+            self.binding_scope_combo.addItem("厂区", "site")
+            self.binding_scope_combo.addItem("区域", "area")
+            self.binding_scope_combo.addItem("摄像头", "camera")
+            self.binding_scope_combo.addItem("推流", "stream")
+            self.binding_scope_id_edit = QLineEdit()
+            self.binding_scope_id_edit.setPlaceholderText("选择或输入实体 ID")
+            self.binding_priority_spin = QSpinBox()
+            self.binding_priority_spin.setRange(-100, 100)
+            self.binding_enabled_check = QCheckBox("启用")
+            self.binding_enabled_check.setChecked(True)
+            add_binding = QPushButton("新增绑定")
+            delete_binding = QPushButton("删除绑定")
+            add_binding.clicked.connect(self._add_model_binding)
+            delete_binding.clicked.connect(self._delete_model_binding)
+            binding_form.addWidget(self.binding_model_combo, 2)
+            binding_form.addWidget(self.binding_scope_combo)
+            binding_form.addWidget(self.binding_scope_id_edit, 2)
+            binding_form.addWidget(QLabel("优先级"))
+            binding_form.addWidget(self.binding_priority_spin)
+            binding_form.addWidget(self.binding_enabled_check)
+            binding_form.addWidget(add_binding)
+            binding_form.addWidget(delete_binding)
+            binding_layout.addLayout(binding_form)
+            layout.addWidget(binding_group)
+            layout.addStretch(1)
+            self._refresh_model_profile_table()
+            self._refresh_model_binding_table()
+            selected = self._model_profile_by_id(self._selected_model_profile_id)
+            if selected is not None:
+                self._load_model_profile_editor(selected)
+            return page
+
+        def _refresh_model_binding_model_combo(self) -> None:
+            if not hasattr(self, "binding_model_combo"):
+                return
+            current = self.binding_model_combo.currentData()
+            self.binding_model_combo.clear()
+            for profile in self._model_profiles:
+                self.binding_model_combo.addItem(profile.name, profile.id)
+            index = self.binding_model_combo.findData(current)
+            self.binding_model_combo.setCurrentIndex(max(0, index))
+
+        def _refresh_model_binding_table(self) -> None:
+            if not hasattr(self, "model_binding_table"):
+                return
+            model_names = {profile.id: profile.name for profile in self._model_profiles}
+            scope_labels = {"site": "厂区", "area": "区域", "camera": "摄像头", "stream": "推流"}
+            self.model_binding_table.setRowCount(0)
+            for binding in self._model_bindings:
+                row = self.model_binding_table.rowCount()
+                self.model_binding_table.insertRow(row)
+                values = (
+                    model_names.get(binding.model_profile_id, binding.model_profile_id),
+                    scope_labels.get(binding.scope_type, binding.scope_type),
+                    binding.scope_id,
+                    str(binding.priority),
+                    "启用" if binding.enabled else "停用",
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value))
+                    item.setData(Qt.UserRole, binding.id)
+                    self.model_binding_table.setItem(row, column, item)
+            self._refresh_model_binding_model_combo()
+
+        def _add_model_binding(self) -> None:
+            profile_id = str(self.binding_model_combo.currentData() or "")
+            scope_id = self.binding_scope_id_edit.text().strip()
+            if not profile_id or not scope_id:
+                self.statusBar().showMessage("请选择模型并填写绑定范围 ID", 5000)
+                return
+            try:
+                binding = ModelBinding(
+                    id=new_model_binding_id(),
+                    model_profile_id=profile_id,
+                    scope_type=str(self.binding_scope_combo.currentData() or "stream"),
+                    scope_id=scope_id,
+                    priority=self.binding_priority_spin.value(),
+                    enabled=self.binding_enabled_check.isChecked(),
+                )
+            except (TypeError, ValueError) as exc:
+                self.statusBar().showMessage(f"模型绑定无效：{exc}", 6000)
+                return
+            self._model_bindings.append(binding)
+            self.binding_scope_id_edit.clear()
+            self._refresh_model_binding_table()
+
+        def _delete_model_binding(self) -> None:
+            selected = self.model_binding_table.selectedItems()
+            if not selected:
+                return
+            binding_id = str(selected[0].data(Qt.UserRole) or "")
+            self._model_bindings = [binding for binding in self._model_bindings if binding.id != binding_id]
+            self._refresh_model_binding_table()
+
+        def _refresh_model_profile_table(self) -> None:
+            self._model_table_refreshing = True
+            self.model_profile_table.setRowCount(0)
+            selected_id = self._selected_model_profile_id
+            task_labels = {"detection": "目标检测", "classification": "分类", "pose": "姿态", "anomaly": "异常"}
+            backend_labels = {"onnx_cpu": "本地 ONNX"}
+            for profile in self._model_profiles:
+                row = self.model_profile_table.rowCount()
+                self.model_profile_table.insertRow(row)
+                values = (
+                    profile.name,
+                    task_labels.get(profile.task_type, profile.task_type),
+                    backend_labels.get(profile.backend, profile.backend),
+                    profile.model_uri,
+                    profile.version,
+                    "启用" if profile.enabled else "停用",
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value))
+                    item.setData(Qt.UserRole, profile.id)
+                    self.model_profile_table.setItem(row, column, item)
+                if profile.id == selected_id:
+                    self.model_profile_table.selectRow(row)
+            self._model_table_refreshing = False
+            self._refresh_model_binding_model_combo()
+
+        def _select_model_profile_from_table(self) -> None:
+            if getattr(self, "_model_table_refreshing", False):
+                return
+            selected = self.model_profile_table.selectedItems()
+            if not selected:
+                return
+            profile_id = str(selected[0].data(Qt.UserRole) or "")
+            if not profile_id or profile_id == self._selected_model_profile_id:
+                return
+            self._sync_model_editor_to_profile()
+            self._selected_model_profile_id = profile_id
+            profile = self._model_profile_by_id(profile_id)
+            if profile is not None:
+                self._load_model_profile_editor(profile)
+
+        def _sync_model_editor_to_profile(self) -> None:
+            profile = self._model_profile_by_id(self._selected_model_profile_id)
+            if profile is None:
+                return
+            profile.name = self.model_name_edit.text().strip() or profile.name
+            profile.task_type = str(self.model_task_combo.currentData() or "detection")
+            profile.backend = str(self.model_backend_combo.currentData() or "onnx_cpu")
+            profile.model_uri = self.model_uri_edit.text().strip()
+            profile.input_width = self.model_input_width_spin.value()
+            profile.input_height = self.model_input_height_spin.value()
+            profile.labels = tuple(
+                item.strip() for item in self.model_labels_edit.text().split(",") if item.strip()
+            )
+            profile.confidence = self.model_confidence_spin.value()
+            profile.iou = self.model_iou_spin.value()
+            profile.version = self.model_version_edit.text().strip() or profile.version
+            profile.enabled = self.model_enabled_check.isChecked()
+
+        def _load_model_profile_editor(self, profile: ModelProfile) -> None:
+            self.model_name_edit.setText(profile.name)
+            self.model_task_combo.setCurrentIndex(max(0, self.model_task_combo.findData(profile.task_type)))
+            self.model_backend_combo.setCurrentIndex(max(0, self.model_backend_combo.findData(profile.backend)))
+            self.model_uri_edit.setText(profile.model_uri)
+            self.model_input_width_spin.setValue(profile.input_width)
+            self.model_input_height_spin.setValue(profile.input_height)
+            self.model_labels_edit.setText(", ".join(profile.labels))
+            self.model_confidence_spin.setValue(profile.confidence)
+            self.model_iou_spin.setValue(profile.iou)
+            self.model_version_edit.setText(profile.version)
+            self.model_enabled_check.setChecked(profile.enabled)
+            self.model_status_label.setText("等待测试")
+
+        def _add_model_profile(self) -> None:
+            self._sync_model_editor_to_profile()
+            profile = ModelProfile(
+                id=new_model_profile_id(),
+                name="新模型",
+                task_type="detection",
+                backend="onnx_cpu",
+                model_uri="",
+                labels=("person",),
+            )
+            self._model_profiles.append(profile)
+            self._selected_model_profile_id = profile.id
+            self._refresh_model_profile_table()
+            self._load_model_profile_editor(profile)
+
+        def _duplicate_model_profile(self) -> None:
+            self._sync_model_editor_to_profile()
+            source = self._model_profile_by_id(self._selected_model_profile_id)
+            if source is None:
+                return
+            profile = ModelProfile.from_public_dict({**source.to_public_dict(), "id": new_model_profile_id(), "name": f"{source.name} 副本"})
+            self._model_profiles.append(profile)
+            self._selected_model_profile_id = profile.id
+            self._refresh_model_profile_table()
+            self._load_model_profile_editor(profile)
+
+        def _delete_model_profile(self) -> None:
+            profile = self._model_profile_by_id(self._selected_model_profile_id)
+            if profile is None:
+                return
+            if len(self._model_profiles) <= 1:
+                self.statusBar().showMessage("至少保留一个模型配置", 5000)
+                return
+            self._model_profiles.remove(profile)
+            self._model_bindings = [
+                binding for binding in self._model_bindings if binding.model_profile_id != profile.id
+            ]
+            self._selected_model_profile_id = self._model_profiles[0].id
+            self._refresh_model_profile_table()
+            self._load_model_profile_editor(self._model_profiles[0])
+
+        def _save_model_profiles(self) -> None:
+            self._sync_model_editor_to_profile()
+            try:
+                self._model_profiles = [
+                    ModelProfile.from_public_dict(profile.to_public_dict())
+                    for profile in self._model_profiles
+                ]
+            except (TypeError, ValueError) as exc:
+                self.statusBar().showMessage(f"模型配置无效：{exc}", 6000)
+                return
+            self._local_settings["models"] = {
+                "profiles": [profile.to_public_dict() for profile in self._model_profiles],
+                "bindings": [binding.to_public_dict() for binding in self._model_bindings],
+            }
+            try:
+                db_path = self.db_edit.text().strip() or self._base_config.db
+                if db_path != ":memory:":
+                    store = SQLiteStore(db_path)
+                    try:
+                        store.save_model_configuration(self._model_profiles, self._model_bindings, actor=self._current_actor())
+                    finally:
+                        store.close()
+            except (OSError, ValueError, RuntimeError) as exc:
+                self.statusBar().showMessage(f"模型配置数据库保存失败：{exc}", 6000)
+            try:
+                self._local_settings_path.parent.mkdir(parents=True, exist_ok=True)
+                self._local_settings_path.write_text(
+                    json.dumps(self._local_settings, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                self.statusBar().showMessage(f"模型配置保存失败：{exc}", 6000)
+                return
+            self._refresh_model_profile_table()
+            self._refresh_model_binding_table()
+            self.statusBar().showMessage("模型接入配置已保存", 5000)
+
+        def _test_model_profile(self) -> None:
+            self._sync_model_editor_to_profile()
+            profile = self._model_profile_by_id(self._selected_model_profile_id)
+            if profile is None:
+                return
+            self._start_model_health_check(
+                model_path=profile.model_uri,
+                status_label=self.model_status_label,
+                button=self.model_profile_test_button,
+                confidence=profile.confidence,
+                iou=profile.iou,
+            )
+
+        def _apply_model_profile(self) -> None:
+            self._sync_model_editor_to_profile()
+            profile = self._model_profile_by_id(self._selected_model_profile_id)
+            if profile is None:
+                return
+            self.model_edit.setText(profile.model_uri)
+            self.confidence_spin.setValue(profile.confidence)
+            self.statusBar().showMessage(f"已将模型“{profile.name}”应用到本机监控配置", 5000)
         def _build_inference_settings_page(self) -> QWidget:
             page, layout = self._settings_page(
-                "集中推理",
-                "一台中心主机统一运行模型，多个值守终端只取流、显示结果和处置事件，降低终端硬件与运维成本。",
+                "本机推理设置",
+                "当前产品只使用本机 ONNX Runtime，不需要独立推理服务或中心服务器。",
             )
-            saved = self._local_settings.get("inference", {})
-            if not isinstance(saved, dict):
-                saved = {}
-
-            service = QGroupBox("推理服务")
+            service = QGroupBox("本机推理")
             service_layout = QFormLayout(service)
-            self.inference_mode_combo = QComboBox()
-            self.inference_mode_combo.addItem("集中推理服务（推荐）", "central")
-            self.inference_mode_combo.addItem("本地 CPU 推理（兼容模式）", "local")
-            saved_mode = str(saved.get("mode", self._base_config.inference_mode) or "central")
-            self.inference_mode_combo.setCurrentIndex(
-                max(0, self.inference_mode_combo.findData(saved_mode))
-            )
-            self.inference_url_edit = QLineEdit(
-                str(saved.get("url", self._base_config.central_inference_url) or "")
-            )
-            self.inference_url_edit.setPlaceholderText("http://192.168.1.10:8765")
-            self.inference_api_key_edit = QLineEdit(self._base_config.central_inference_api_key)
-            self.inference_api_key_edit.setEchoMode(QLineEdit.Password)
-            self.inference_api_key_edit.setPlaceholderText("仅保留在当前进程")
-            self.inference_timeout_spin = QDoubleSpinBox()
-            self.inference_timeout_spin.setRange(0.5, 120.0)
-            self.inference_timeout_spin.setSingleStep(0.5)
-            self.inference_timeout_spin.setValue(float(saved.get("timeout", self._base_config.central_inference_timeout)))
-            self.inference_status_label = QLabel("等待测试中心推理连接")
+            self.inference_mode_label = QLabel("本机 ONNX Runtime · CPUExecutionProvider")
+            self.inference_mode_label.setWordWrap(True)
+            model_label = QLabel(self.model_edit.text().strip() or self._base_config.model)
+            model_label.setWordWrap(True)
+            device_label = QLabel("仅使用 CPUExecutionProvider，不加载 GPU 或远程推理后端")
+            device_label.setWordWrap(True)
+            self.inference_status_label = QLabel("模型将在启动监控时加载到本机 ONNX Runtime")
             self.inference_status_label.setWordWrap(True)
             self.inference_status_label.setObjectName("muted")
-            service_layout.addRow("运行模式", self.inference_mode_combo)
-            service_layout.addRow("中心服务地址", self.inference_url_edit)
-            service_layout.addRow("访问令牌", self.inference_api_key_edit)
-            service_layout.addRow("请求超时（秒）", self.inference_timeout_spin)
+            service_layout.addRow("推理方式", self.inference_mode_label)
+            service_layout.addRow("模型文件", model_label)
+            service_layout.addRow("执行方式", device_label)
             service_layout.addRow("当前状态", self.inference_status_label)
             action_row = QHBoxLayout()
-            test_connection = QPushButton("测试连接")
-            save_service = QPushButton("保存推理设置")
-            save_service.setObjectName("primary")
-            test_connection.clicked.connect(self._test_central_inference_connection)
-            save_service.clicked.connect(self._save_inference_settings)
-            action_row.addWidget(test_connection)
-            action_row.addWidget(save_service)
+            test_model = QPushButton("检查本机模型")
+            self.model_test_button = test_model
+            test_model.clicked.connect(self._test_local_inference_environment)
+            action_row.addWidget(test_model)
             action_row.addStretch(1)
             service_layout.addRow("", action_row)
             layout.addWidget(service)
 
-            guidance = QGroupBox("小微企业部署建议")
+            guidance = QGroupBox("部署说明")
             guidance_layout = QVBoxLayout(guidance)
             costs = QLabel(
-                "推荐一台中心电脑运行推理服务、事件库和通知调度；摄像机继续由 NVR 录像。"
-                "终端只安装控制台，不再为每台电脑配置独立模型和 GPU。"
-                "4-8 路低帧率子码流可先使用 CPU；路数增加时再升级单张消费级 GPU。"
+                "模型、视频帧、事件和通知都在这台部署电脑上处理。"
+                "普通电脑可先使用 CPU；路数或帧率增加时，再为同一台电脑配置可用的 GPU 加速。"
             )
             costs.setWordWrap(True)
             costs.setObjectName("muted")
@@ -474,44 +835,11 @@ if HAS_QT:
             layout.addStretch(1)
             return page
 
-        def _save_inference_settings(self) -> None:
-            mode = str(self.inference_mode_combo.currentData() or "central")
-            url = self.inference_url_edit.text().strip()
-            if not url.lower().startswith(("http://", "https://")):
-                self.statusBar().showMessage("中心推理地址必须使用 HTTP 或 HTTPS", 6000)
-                return
-            self._local_settings["inference"] = {
-                "mode": mode,
-                "url": url,
-                "timeout": self.inference_timeout_spin.value(),
-            }
-            try:
-                self._local_settings_path.parent.mkdir(parents=True, exist_ok=True)
-                self._local_settings_path.write_text(
-                    json.dumps(self._local_settings, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-            except OSError as exc:
-                self.statusBar().showMessage(f"推理设置保存失败：{exc}", 6000)
-                return
-            self.statusBar().showMessage("推理设置已保存（访问令牌仅保留在当前进程）", 5000)
-
-        def _test_central_inference_connection(self) -> None:
-            if str(self.inference_mode_combo.currentData() or "central") == "local":
-                self.inference_status_label.setText("当前为本地 CPU 兼容模式，不需要中心服务")
-                return
-            try:
-                client = CentralInferenceClient(
-                    self.inference_url_edit.text(),
-                    api_key=self.inference_api_key_edit.text(),
-                    timeout=self.inference_timeout_spin.value(),
-                )
-                health = client.health_check()
-            except ValueError as exc:
-                self.inference_status_label.setText(f"配置无效：{exc}")
-                return
-            self.inference_status_label.setText(
-                f"{health.state} · {health.provider} · {health.detail or '中心推理服务已响应'}"
+        def _test_local_inference_environment(self) -> None:
+            self._start_model_health_check(
+                model_path=self.model_edit.text().strip() or self._base_config.model,
+                status_label=self.inference_status_label,
+                button=self.model_test_button,
             )
 
         def _build_webhook_settings_page(self) -> QWidget:
@@ -579,10 +907,16 @@ if HAS_QT:
             self.webhook_secret_edit.setPlaceholderText("留空则使用启动参数或环境变量")
             connection_layout.addRow("回调地址", self.webhook_url_edit)
             connection_layout.addRow("签名密钥", self.webhook_secret_edit)
+            self.webhook_test_button = QPushButton("发送测试 Webhook")
             save_webhook = QPushButton("保存 Webhook 配置")
             save_webhook.setObjectName("primary")
+            self.webhook_test_button.clicked.connect(lambda: self._send_notification_test("webhook"))
             save_webhook.clicked.connect(self._save_notification_settings)
-            connection_layout.addRow("", save_webhook)
+            webhook_actions = QHBoxLayout()
+            webhook_actions.addWidget(self.webhook_test_button)
+            webhook_actions.addWidget(save_webhook)
+            webhook_actions.addStretch(1)
+            connection_layout.addRow("", webhook_actions)
             hint = QLabel(
                 "仅接受 HTTPS；请求会携带 X-FactoryGuard-Event-Id 和 "
                 "X-FactoryGuard-Dedup-Key 以便接收端幂等处理。"
@@ -696,15 +1030,18 @@ if HAS_QT:
             connection_layout.addRow("邮件加密", self.email_security_combo)
             action_row = QHBoxLayout()
             validate_email = QPushButton("校验配置")
+            self.email_test_button = QPushButton("发送测试邮件")
             save_email = QPushButton("保存邮件配置")
             save_email.setObjectName("primary")
             validate_email.clicked.connect(self._validate_email_configuration)
+            self.email_test_button.clicked.connect(lambda: self._send_notification_test("email"))
             save_email.clicked.connect(self._save_notification_settings)
             action_row.addWidget(validate_email)
+            action_row.addWidget(self.email_test_button)
             action_row.addWidget(save_email)
             action_row.addStretch(1)
             connection_layout.addRow("", action_row)
-            hint = QLabel("校验只检查地址和参数格式，不会连接 SMTP 服务器或发送测试邮件。")
+            hint = QLabel("校验只检查地址和参数格式；“发送测试邮件”会连接 SMTP 并发送一条合成测试消息。")
             hint.setWordWrap(True)
             hint.setObjectName("muted")
             connection_layout.addRow("", hint)
@@ -734,7 +1071,7 @@ if HAS_QT:
                     host=self.email_host_edit.text(),
                     port=self.email_port_spin.value(),
                     username=self.email_username_edit.text(),
-                    password=self.email_password_edit.text(),
+                    password=self._email_password_value(),
                     sender=self.email_sender_edit.text(),
                     recipients=recipients,
                     use_ssl=use_ssl,
@@ -824,17 +1161,20 @@ if HAS_QT:
             connection_layout.addRow("接收号码", self.sms_recipients_edit)
             action_row = QHBoxLayout()
             validate_sms = QPushButton("校验配置")
+            self.sms_test_button = QPushButton("发送测试短信")
             save_sms = QPushButton("保存短信配置")
             save_sms.setObjectName("primary")
             validate_sms.clicked.connect(self._validate_sms_configuration)
+            self.sms_test_button.clicked.connect(lambda: self._send_notification_test("sms"))
             save_sms.clicked.connect(self._save_notification_settings)
             action_row.addWidget(validate_sms)
+            action_row.addWidget(self.sms_test_button)
             action_row.addWidget(save_sms)
             action_row.addStretch(1)
             connection_layout.addRow("", action_row)
             hint = QLabel(
                 "通用网关请求体包含 provider、to、sender、template_id、message 和 event；"
-                "校验不会实际发送短信。"
+                "“发送测试短信”会调用网关并发送一条合成测试消息。"
             )
             hint.setWordWrap(True)
             hint.setObjectName("muted")
@@ -866,7 +1206,7 @@ if HAS_QT:
                     endpoint=self.sms_endpoint_edit.text(),
                     recipients=recipients,
                     provider=str(self.sms_provider_combo.currentData() or "custom_http"),
-                    token=self.sms_token_edit.text(),
+                    token=self._sms_token_value(),
                     sender=self.sms_sender_edit.text(),
                     template_id=self.sms_template_edit.text(),
                 )
@@ -945,38 +1285,60 @@ if HAS_QT:
 
         def _build_health_settings_page(self) -> QWidget:
             page, layout = self._settings_page(
-                "健康诊断",
-                "执行部署预检，查看数据库、磁盘、模型、媒体目录和通知配置状态。",
+                "资源监控",
+                "查看本机 CPU、内存、磁盘和 FactoryGuard 进程资源占用，并保留关键组件检查。",
             )
-            health = QGroupBox("运行健康")
-            health_layout = QVBoxLayout(health)
-            self.health_label = QLabel("等待健康检查")
+            resource = QGroupBox("\u8ba1\u7b97\u673a\u4e0e FactoryGuard")
+            resource_layout = QVBoxLayout(resource)
+            self.health_label = QLabel("\u7b49\u5f85\u8d44\u6e90\u5237\u65b0")
             self.health_label.setWordWrap(True)
             self.health_label.setObjectName("muted")
-            health_layout.addWidget(self.health_label)
+            resource_layout.addWidget(self.health_label)
+            self.resource_table = QTableWidget(0, 2)
+            self.resource_table.setHorizontalHeaderLabels(["\u8d44\u6e90\u6307\u6807", "\u5f53\u524d\u503c"])
+            self.resource_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            self.resource_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self.resource_table.setAlternatingRowColors(True)
+            self.resource_table.verticalHeader().setVisible(False)
+            self.resource_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            self.resource_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+            resource_layout.addWidget(self.resource_table, 1)
+
+            checks = QGroupBox("\u5173\u952e\u7ec4\u4ef6")
+            checks_layout = QVBoxLayout(checks)
             self.preflight_table = QTableWidget(0, 3)
-            self.preflight_table.setHorizontalHeaderLabels(["检查项", "状态", "详情"])
+            self.preflight_table.setHorizontalHeaderLabels(["\u68c0\u67e5\u9879", "\u72b6\u6001", "\u8be6\u60c5"])
             self.preflight_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
             self.preflight_table.setSelectionBehavior(QAbstractItemView.SelectRows)
             self.preflight_table.setAlternatingRowColors(True)
-            self.preflight_table.horizontalHeader().setStretchLastSection(True)
-            health_layout.addWidget(self.preflight_table, 1)
+            self.preflight_table.verticalHeader().setVisible(False)
+            self.preflight_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            self.preflight_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            self.preflight_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+            checks_layout.addWidget(self.preflight_table, 1)
             health_actions = QHBoxLayout()
-            self.refresh_health_button = QPushButton("刷新健康状态")
-            self.export_diagnostics_button = QPushButton("导出诊断 JSON")
+            self.refresh_health_button = QPushButton("\u5237\u65b0\u8d44\u6e90")
+            self.export_diagnostics_button = QPushButton("\u5bfc\u51fa\u8bca\u65ad JSON")
             health_actions.addWidget(self.refresh_health_button)
             health_actions.addWidget(self.export_diagnostics_button)
             health_actions.addStretch(1)
-            health_layout.addLayout(health_actions)
-            self.refresh_health_button.clicked.connect(self._refresh_health)
-            self.export_diagnostics_button.clicked.connect(self._export_diagnostics)
-            diagnostics_hint = QLabel("诊断文件会自动脱敏 RTSP 凭据、Webhook 密钥和 SMTP 密码。")
+            checks_layout.addLayout(health_actions)
+            diagnostics_hint = QLabel("\u8bca\u65ad\u6587\u4ef6\u4f1a\u81ea\u52a8\u8131\u654f RTSP \u51ed\u636e\u3001Webhook \u5bc6\u94a5\u548c SMTP \u5bc6\u7801\u3002")
             diagnostics_hint.setWordWrap(True)
             diagnostics_hint.setObjectName("muted")
-            health_layout.addWidget(diagnostics_hint)
-            layout.addWidget(health, 1)
-            return page
+            checks_layout.addWidget(diagnostics_hint)
 
+            columns = QSplitter(Qt.Horizontal)
+            columns.setChildrenCollapsible(False)
+            columns.addWidget(resource)
+            columns.addWidget(checks)
+            columns.setStretchFactor(0, 3)
+            columns.setStretchFactor(1, 2)
+            columns.setSizes([720, 480])
+            layout.addWidget(columns, 1)
+            self.refresh_health_button.clicked.connect(self._refresh_health)
+            self.export_diagnostics_button.clicked.connect(self._export_diagnostics)
+            return page
 
 else:
 

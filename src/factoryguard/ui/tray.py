@@ -43,6 +43,9 @@ if HAS_QT:
             quit_action.triggered.connect(on_quit)
             self.icon.activated.connect(self._activated)
 
+        def set_icon(self, icon: object) -> None:
+            if icon is not None and not icon.isNull():
+                self.icon.setIcon(icon)
         def show(self) -> None:
             self.icon.show()
 

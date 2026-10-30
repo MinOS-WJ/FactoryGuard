@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 import json
 import smtplib
@@ -9,6 +10,7 @@ import pytest
 from factoryguard.notifications.adapters import parse_recipients
 from factoryguard.domain.models import Detection, Event, Frame, Rule, RuleType
 from factoryguard.notifications.adapters import EmailAdapter, SmsHttpAdapter, parse_phone_recipients
+from factoryguard.notifications.actions import execute_http_action
 
 
 def _event() -> Event:
@@ -58,7 +60,8 @@ def test_email_adapter_sends_using_smtp_and_does_not_expose_password(monkeypatch
         recipients=("operator@example.test",),
     )
 
-    success, detail = adapter.send(_event(), outbox={})
+    event = replace(_event(), snapshot_uri="snapshot.png", clip_uri="clip.mp4", clip_status="ready")
+    success, detail = adapter.send(event, outbox={})
 
     assert (success, detail) == (True, "SMTP accepted for 1 recipient(s)")
     smtp = _FakeSMTP.instances[-1]
@@ -68,6 +71,29 @@ def test_email_adapter_sends_using_smtp_and_does_not_expose_password(monkeypatch
     assert "secret" not in smtp.message.as_string()
     assert "FactoryGuard event" in str(smtp.message["Subject"])
 
+
+def test_email_adapter_attaches_existing_media(tmp_path, monkeypatch):
+    monkeypatch.setattr("factoryguard.notifications.adapters.smtplib.SMTP", _FakeSMTP)
+    snapshot = tmp_path / "snapshot.png"
+    clip = tmp_path / "clip.mp4"
+    snapshot.write_bytes(b"png-data")
+    clip.write_bytes(b"mp4-data")
+    event = replace(
+        _event(),
+        snapshot_uri=str(snapshot),
+        clip_uri=str(clip),
+        clip_status="ready",
+    )
+    adapter = EmailAdapter(
+        host="smtp.example.test",
+        sender="factoryguard@example.test",
+        recipients=("operator@example.test",),
+    )
+
+    success, _detail = adapter.send(event, outbox={})
+    assert success is True
+    attachments = list(_FakeSMTP.instances[-1].message.iter_attachments())
+    assert {item.get_filename() for item in attachments} == {"snapshot.png", "clip.mp4"}
 
 def test_email_adapter_rejects_conflicting_tls_modes():
     try:
@@ -163,7 +189,8 @@ def test_email_adapter_redacts_password_from_delivery_error(monkeypatch):
         recipients=("operator@example.test",),
     )
 
-    success, detail = adapter.send(_event(), outbox={})
+    event = replace(_event(), snapshot_uri="snapshot.png", clip_uri="clip.mp4", clip_status="ready")
+    success, detail = adapter.send(event, outbox={})
 
     assert success is False
     assert "super-secret" not in detail
@@ -207,7 +234,8 @@ def test_sms_http_adapter_posts_generic_gateway_payload(monkeypatch):
         template_id="event-alert",
     )
 
-    success, detail = adapter.send(_event(), outbox={})
+    event = replace(_event(), snapshot_uri="snapshot.png", clip_uri="clip.mp4", clip_status="ready")
+    success, detail = adapter.send(event, outbox={})
 
     assert success is True
     assert detail == "SMS gateway accepted for 2 recipient(s)"
@@ -218,6 +246,9 @@ def test_sms_http_adapter_posts_generic_gateway_payload(monkeypatch):
     assert payload["sender"] == "FactoryGuard"
     assert payload["template_id"] == "event-alert"
     assert payload["event"]["id"]
+    assert payload["event"]["snapshot_uri"] == "snapshot.png"
+    assert payload["event"]["clip_uri"] == "clip.mp4"
+    assert payload["event"]["clip_status"] == "ready"
     assert request.get_header("Authorization") == "Bearer sms-token"
     assert captured["timeout"] == 10.0
 
@@ -229,3 +260,37 @@ def test_sms_http_adapter_rejects_reserved_cloud_provider():
             recipients=("13800138000",),
             provider="aliyun",
         )
+
+
+def test_external_http_action_posts_event_payload(monkeypatch):
+    captured = {}
+
+    class _Response:
+        status = 204
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def _urlopen(request, *, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setattr("factoryguard.notifications.actions.urlopen", _urlopen)
+    ok, detail = execute_http_action(
+        replace(_event(), snapshot_uri="snapshot.png", clip_uri="clip.mp4", clip_status="ready"),
+        url="https://actions.example.test/event",
+        timeout=3.0,
+    )
+    assert ok is True
+    assert detail == "HTTP 204"
+    payload = json.loads(captured["request"].data.decode("utf-8"))
+    assert payload["event_id"]
+    assert payload["target"]["label"] == "person"
+    assert payload["snapshot_uri"] == "snapshot.png"
+    assert payload["clip_uri"] == "clip.mp4"
+    assert captured["request"].get_header("Idempotency-key")
+    assert captured["timeout"] == 3.0
