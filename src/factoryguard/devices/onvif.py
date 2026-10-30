@@ -286,6 +286,7 @@ class OnvifAdapter(DeviceAdapter):
         self._capabilities = DeviceCapabilities()
         self._services: dict[str, str] = {}
         self._profiles: tuple[DeviceChannel, ...] = ()
+        self._media_is_media2 = False
 
     def probe(self, *, timeout: float = 5.0) -> ProbeResult:
         require_open(self)
@@ -345,6 +346,22 @@ class OnvifAdapter(DeviceAdapter):
                 if xaddr:
                     self._services[name.lower()] = xaddr
         services = self._services
+        event_types: tuple[str, ...] = ()
+        events_service = self._service_for("events")
+        if events_service:
+            try:
+                event_root = self.soap.call(
+                    events_service,
+                    "GetEventProperties",
+                    '<GetEventProperties xmlns="http://www.onvif.org/ver10/events/wsdl"/>',
+                )
+                topic_set = _find_child(event_root, "TopicSet")
+                if topic_set is not None:
+                    event_types = tuple(
+                        sorted({_local(child.tag).lower() for child in list(topic_set)})
+                    )
+            except RuntimeError:
+                event_types = ()
         profiles: list[str] = []
         for namespace in services:
             lower = namespace.lower()
@@ -358,14 +375,18 @@ class OnvifAdapter(DeviceAdapter):
                 profiles.append("Profile M")
         if not profiles and services:
             profiles.append("ONVIF Core")
+        if event_types:
+            profiles.append("Profile M")
+        self._media_is_media2 = any("/ver20/media" in key.lower() for key in services)
         self._capabilities = DeviceCapabilities(
             live_video=any("media" in key.lower() for key in services),
-            native_events=any("event" in key.lower() for key in services),
+            native_events=bool(event_types) or any("event" in key.lower() for key in services),
             recording_search=any("recording" in key.lower() or "replay" in key.lower() for key in services),
             ptz=any("ptz" in key.lower() for key in services),
             digital_io=any("deviceio" in key.lower() for key in services),
-            metadata=any("analytics" in key.lower() or "metadata" in key.lower() for key in services),
+            metadata=bool(event_types) or any("analytics" in key.lower() or "metadata" in key.lower() for key in services),
             profiles=tuple(dict.fromkeys(profiles)),
+            event_types=event_types,
         )
         return self._capabilities
 
@@ -374,7 +395,8 @@ class OnvifAdapter(DeviceAdapter):
         service = self._service_for("media")
         if not service:
             raise RuntimeError("设备未提供 ONVIF Media 服务")
-        body = '<GetProfiles xmlns="http://www.onvif.org/ver10/media/wsdl"/>'
+        namespace = "http://www.onvif.org/ver20/media/wsdl" if self._media_is_media2 else "http://www.onvif.org/ver10/media/wsdl"
+        body = f'<GetProfiles xmlns="{namespace}"/>'
         root = self.soap.call(service, "GetProfiles", body)
         channels: list[DeviceChannel] = []
         for index, profile in enumerate(_items(root, "Profiles"), start=1):
@@ -389,7 +411,7 @@ class OnvifAdapter(DeviceAdapter):
                     id=token,
                     name=name,
                     profile_token=token,
-                    source_token=_child_text(_find_child(profile, "SourceToken"), "ReferenceToken"),
+                    source_token=_child_text(profile, "SourceToken"),
                     encoding=_child_text(configuration, "Encoding"),
                     width=width,
                     height=height,
@@ -409,7 +431,8 @@ class OnvifAdapter(DeviceAdapter):
         service = self._service_for("media")
         stream = "RTP-Unicast"
         protocol = "RTSP"
-        body = f"""<GetStreamUri xmlns="http://www.onvif.org/ver10/media/wsdl">
+        namespace = "http://www.onvif.org/ver20/media/wsdl" if self._media_is_media2 else "http://www.onvif.org/ver10/media/wsdl"
+        body = f"""<GetStreamUri xmlns="{namespace}">
  <StreamSetup><Stream>{stream}</Stream><Transport><Protocol>{protocol}</Protocol></Transport></StreamSetup>
  <ProfileToken>{_xml_escape(profile.profile_token)}</ProfileToken>
 </GetStreamUri>"""

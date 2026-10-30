@@ -202,6 +202,7 @@ if HAS_QT:
             self._stream_states: dict[str, tuple[str, str]] = {}
             self._stream_health_history: dict[str, dict[str, Any]] = {}
             self._stream_metrics: dict[str, dict[str, Any]] = {}
+            self._stream_analysis_labels: dict[str, str] = {}
             self._arming_states: dict[str, bool] = {}
             self._preview_grid_widgets: dict[str, PreviewWidget] = {}
             self._preview_grid_cells: dict[str, QWidget] = {}
@@ -3704,7 +3705,9 @@ if HAS_QT:
                 return
             values = tuple(detections) if detections is not None else ()
             self.preview.set_frame(image, values)
-            self.preview_info.setText(f"实时 · 本机分析目标 {len(values)} 个")
+            policy = self._stream_analysis_labels.get(self._preview_stream_id or "", "设备事件优先")
+            target_text = f" · 本机分析目标 {len(values)} 个" if values else ""
+            self.preview_info.setText(f"实时 · {policy}{target_text}")
 
         def _rule_reference_image(self, stream_id: str) -> QImage | None:
             if self._replay_locked or self._preview_stream_id != stream_id or not self.preview.has_image:
@@ -3722,10 +3725,14 @@ if HAS_QT:
                 return
             self._preview_stream_id = stream_id
             self._on_preview(image, detections)
-            self.preview_info.setText(f"{stream_id} · 实时 · 本机分析目标 {len(values)} 个")
+            policy = self._stream_analysis_labels.get(stream_id, "设备事件优先")
+            target_text = f" · 本机分析目标 {len(values)} 个" if values else ""
+            self.preview_info.setText(f"{stream_id} · 实时 · {policy}{target_text}")
 
         def _on_stream_status(self, stream_id: str, status: str, detail: str) -> None:
             self._stream_states[stream_id] = (status, detail)
+            if any(label in detail for label in ("设备原生事件", "本机备用分析", "设备事件 +", "分析已停用")):
+                self._stream_analysis_labels[stream_id] = detail.split(" · ", 1)[0]
             history = self._stream_health_history.setdefault(stream_id, {})
             history.update({"status": status, "detail": detail, "updated_at": datetime.now(UTC).isoformat()})
             self._refresh_stream_table()
@@ -3776,7 +3783,7 @@ if HAS_QT:
             )
             self._refresh_overview()
             if self._tray is not None:
-                self._tray.notify("FactoryGuard 事件", "检测到目标进入规则区域")
+                self._tray.notify("FactoryGuard 事件", f"收到{payload.get('source', '安全')}事件")
 
         def _on_worker_error(self, detail: str) -> None:
             self.statusBar().showMessage(detail, 8000)

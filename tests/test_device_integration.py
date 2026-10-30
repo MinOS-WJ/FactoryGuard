@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
@@ -197,6 +198,41 @@ def test_native_event_is_merged_with_recent_local_fallback_event():
         store.close()
 
 
+
+def test_native_event_rule_executes_http_action(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "factoryguard.app.native_events.execute_http_action",
+        lambda event, *, url, timeout: calls.append((event.id, url, timeout)) or (True, "ok"),
+    )
+    store = SQLiteStore(":memory:")
+    try:
+        rule = Rule(
+            "rule-http",
+            stream_id="stream-1",
+            trigger_mode=RuleMode.NATIVE_EVENT,
+            native_event_codes=("alarm",),
+            actions=("event", "http"),
+            http_action_url="https://example.invalid/hook",
+            http_action_timeout=2.0,
+        )
+        ingestor = NativeEventIngestor(store, (rule,), channels=())
+        event = NativeEvent(
+            device_id="device-1",
+            channel_id="ch1",
+            event_code="alarm",
+            occurred_at=datetime.now(UTC),
+            source=EventSource.GB28181,
+            source_event_id="gb-alarm-1",
+            stream_id="stream-1",
+        )
+        stored = ingestor.ingest(event)
+        assert len(stored) == 1
+        assert calls and calls[0][1] == "https://example.invalid/hook"
+    finally:
+        store.close()
+
+
 def test_analysis_policy_prefers_native_events_and_falls_back_when_unhealthy():
     capabilities = DeviceCapabilities(native_events=True, event_types=("motiondetect",))
     native_rule = Rule(
@@ -272,6 +308,86 @@ def test_sqlite_migrates_legacy_camera_and_persists_model_configuration(tmp_path
         assert bindings[0].scope_id == "stream-old"
     finally:
         migrated.close()
+
+
+
+def test_configuration_export_redacts_device_and_stream_credentials():
+    source = SQLiteStore(":memory:")
+    try:
+        topology = _topology()
+        device = VideoDevice(
+            id="device-onvif",
+            site_id="site-1",
+            area_id="area-1",
+            name="ONVIF Camera",
+            protocol=DeviceProtocol.ONVIF,
+            endpoint="http://admin:pw-device-123@10.0.0.8/onvif/device_service",
+            capabilities=DeviceCapabilities(live_video=True, native_events=True),
+        )
+        camera = CameraDevice(
+            "camera-secret",
+            "area-1",
+            "ONVIF Camera",
+            device_id=device.id,
+            channel_id="ch1",
+        )
+        stream = VideoStream(
+            "stream-secret",
+            camera.id,
+            "Main",
+            "rtsp://admin:pw-stream-123@10.0.0.8/live",
+            device_id=device.id,
+        )
+        source.save_topology(
+            EntityRegistry(
+                sites=topology.sites,
+                areas=topology.areas,
+                devices=(device,),
+                cameras=(camera,),
+                streams=(stream,),
+            )
+        )
+        exported = source.export_configuration()
+        serialized = json.dumps(exported, ensure_ascii=False)
+        assert exported["schema_version"] == 2
+        assert exported["credentials_redacted"] is True
+        assert "pw-device-123" not in serialized
+        assert "pw-stream-123" not in serialized
+        restored = SQLiteStore(":memory:")
+        try:
+            restored.import_configuration(exported, replace=True)
+            restored_device = restored.load_topology().get_device(device.id)
+            restored_stream = restored.load_topology().get_stream(stream.id)
+            assert "***:***@" in restored_device.endpoint
+            assert "***:***@" in restored_stream.url
+        finally:
+            restored.close()
+    finally:
+        source.close()
+
+
+
+def test_configuration_import_accepts_legacy_schema_one():
+    store = SQLiteStore(":memory:")
+    try:
+        store.import_configuration(
+            {
+                "schema_version": 1,
+                "topology": {
+                    "sites": [{"id": "site-old", "name": "旧厂区", "description": "", "enabled": True}],
+                    "areas": [],
+                    "cameras": [],
+                    "streams": [],
+                },
+                "rules": [],
+                "stream_arming": {},
+                "arming_schedules": [],
+            },
+            replace=True,
+        )
+        assert store.load_topology().sites[0].id == "site-old"
+    finally:
+        store.close()
 
 
 def test_credential_vault_round_trip_and_config_export_has_no_secret():
@@ -381,6 +497,11 @@ def test_onvif_adapter_probes_media_streams_and_pullpoint_events():
                     "<Service><Namespace>http://www.onvif.org/ver10/events/wsdl</Namespace><XAddr>http://cam/events</XAddr></Service>"
                     "</Response>"
                 )
+            if action == "GetEventProperties":
+                return __import__("xml.etree.ElementTree", fromlist=["ElementTree"]).fromstring(
+                    "<Response><TopicSet><MotionAlarm><Rule>true</Rule></MotionAlarm>"
+                    "<TamperAlarm><Rule>true</Rule></TamperAlarm></TopicSet></Response>"
+                )
             if action == "GetProfiles":
                 return __import__("xml.etree.ElementTree", fromlist=["ElementTree"]).fromstring(
                     '<Response><Profiles token="p1"><Name>Main</Name>'
@@ -410,6 +531,7 @@ def test_onvif_adapter_probes_media_streams_and_pullpoint_events():
     assert result.info.manufacturer == "Acme"
     assert result.capabilities.live_video is True
     assert result.capabilities.native_events is True
+    assert "motionalarm" in result.capabilities.event_types
     channel = adapter.list_channels()[0]
     assert channel.id == "p1"
     stream = adapter.get_live_stream(channel.id)

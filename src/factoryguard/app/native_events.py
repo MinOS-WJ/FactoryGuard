@@ -15,6 +15,7 @@ from factoryguard.domain.models import (
     Rule,
     RuleMode,
 )
+from factoryguard.notifications.actions import execute_http_action
 from factoryguard.storage.sqlite import SQLiteStore
 
 
@@ -93,6 +94,7 @@ class NativeEventIngestor:
         self.store = store
         self.rules = tuple(rule for rule in rules if rule.trigger_mode is RuleMode.NATIVE_EVENT and rule.enabled)
         self.channels = tuple(dict.fromkeys(str(value) for value in channels if str(value)))
+        self.last_action_errors: list[str] = []
 
     def matching_rules(self, event: NativeEvent) -> tuple[Rule, ...]:
         return tuple(
@@ -123,6 +125,14 @@ class NativeEventIngestor:
                 enqueue=bool(self.channels),
             )
             if created:
+                if "http" in rule.actions:
+                    ok, detail = execute_http_action(
+                        mapped,
+                        url=rule.http_action_url,
+                        timeout=rule.http_action_timeout,
+                    )
+                    if not ok:
+                        self.last_action_errors.append(f"{rule.id}: {detail}")
                 stored.append(mapped)
         return tuple(stored)
 

@@ -108,6 +108,23 @@ class DeviceManager:
         adapter = self.adapter_for(device)
         try:
             result = adapter.probe(timeout=timeout)
+            channels = ()
+            if result.ok and result.capabilities.live_video:
+                try:
+                    channels = adapter.list_channels()
+                except (KeyError, RuntimeError, ValueError):
+                    channels = ()
+            if channels:
+                result = replace(
+                    result,
+                    capabilities=replace(
+                        result.capabilities,
+                        media_profiles=tuple(
+                            f"{channel.id}:{channel.name}:{channel.encoding}:{channel.width}x{channel.height}"
+                            for channel in channels
+                        ),
+                    ),
+                )
         finally:
             adapter.close()
         now = datetime.now(UTC).isoformat()

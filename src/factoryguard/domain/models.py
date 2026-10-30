@@ -639,6 +639,7 @@ class NativeEvent:
                 "rule_name": rule.name,
                 "assignees": list(rule.assignees),
             },
+            clip_status="native_reference",
             assignees=tuple(rule.assignees),
             source=self.source,
             source_event_id=source_event_id,
