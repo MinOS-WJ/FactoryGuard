@@ -3,9 +3,9 @@ from __future__ import annotations
 """Local GB/T 28181 platform-side SIP endpoint.
 
 FactoryGuard receives registrations from compatible cameras, encoders and
-NVRs. The implementation intentionally uses asyncio UDP only; no PJSIP or
-native service is required. Media still flows over the negotiated RTP port and
-is handed to the existing FFmpeg pipeline by a live session descriptor.
+NVRs. The implementation uses asyncio UDP and TCP SIP transports without
+PJSIP or another native service. Media still flows over the negotiated RTP
+port and is handed to the FFmpeg pipeline by a live session descriptor.
 """
 
 import asyncio
@@ -39,7 +39,7 @@ from ..base import (
     Recording,
     require_open,
 )
-from .sip import DigestChallenge, SipMessage, verify_digest
+from .sip import DigestChallenge, SipMessage, SipParseError, verify_digest
 
 
 @dataclass(slots=True)
@@ -63,6 +63,8 @@ class Gb28181Registration:
     expires_at: datetime
     user_agent: str = ""
     channels: dict[str, Gb28181Channel] = field(default_factory=dict)
+    transport_kind: str = "udp"
+    transport: Any = None
 
 
 @dataclass(slots=True)
@@ -84,6 +86,48 @@ class Gb28181LiveSession:
                 self.rtp_socket.close()
             except OSError:
                 pass
+
+
+class Gb28181TcpProtocol(asyncio.Protocol):
+    """Framed SIP-over-TCP receiver for persistent device connections."""
+
+    def __init__(self, platform: "Gb28181Platform") -> None:
+        self.platform = platform
+        self.transport: asyncio.Transport | None = None
+        self.buffer = bytearray()
+        self.address: tuple[str, int] = ("", 0)
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+        peer = transport.get_extra_info("peername")
+        if peer and len(peer) >= 2:
+            self.address = (str(peer[0]), int(peer[1]))
+        self.platform._tcp_protocols.add(self)
+
+    def data_received(self, data: bytes) -> None:
+        self.buffer.extend(data)
+        while True:
+            message, remaining = _take_sip_message(bytes(self.buffer))
+            if message is None:
+                break
+            self.buffer = bytearray(remaining)
+            try:
+                self.platform.handle_message(
+                    message,
+                    self.address,
+                    transport=self.transport,
+                    transport_kind="tcp",
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate one bad SIP message
+                self.platform._record_error(f"{self.address[0]}: {exc}")
+
+    def error_received(self, exc: Exception) -> None:
+        self.platform._record_error(f"{self.address[0]}: {exc}")
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self.platform._tcp_protocols.discard(self)
+        if exc is not None:
+            self.platform._record_error(f"{self.address[0]}: {exc}")
 
 
 class Gb28181Platform(asyncio.DatagramProtocol):
@@ -110,6 +154,8 @@ class Gb28181Platform(asyncio.DatagramProtocol):
         self.registrations: dict[str, Gb28181Registration] = {}
         self.last_errors: list[str] = []
         self._transport: asyncio.DatagramTransport | None = None
+        self._tcp_server: asyncio.Server | None = None
+        self._tcp_protocols: set[Gb28181TcpProtocol] = set()
         self._pending: dict[tuple[str, str], asyncio.Future[SipMessage]] = {}
         self._dialogs: dict[str, Gb28181LiveSession] = {}
         self._requests_sent = 0
@@ -121,7 +167,7 @@ class Gb28181Platform(asyncio.DatagramProtocol):
 
     @property
     def started(self) -> bool:
-        return self._transport is not None
+        return self._transport is not None or self._tcp_server is not None
 
     @property
     def diagnostics(self) -> dict[str, Any]:
@@ -129,6 +175,7 @@ class Gb28181Platform(asyncio.DatagramProtocol):
             "platform_id": self.platform_id,
             "domain": self.domain,
             "started": self.started,
+            "transports": (("udp" if self._transport else ""), ("tcp" if self._tcp_server else "")),
             "registrations": len(self.registrations),
             "channels": sum(len(item.channels) for item in self.registrations.values()),
             "active_streams": len(self._dialogs),
@@ -139,14 +186,22 @@ class Gb28181Platform(asyncio.DatagramProtocol):
 
     async def start(self, *, host: str | None = None, port: int | None = None) -> tuple[str, int]:
         loop = asyncio.get_running_loop()
+        bind_host = host or self.host
+        bind_port = self.port if port is None else port
         transport, _protocol = await loop.create_datagram_endpoint(
             lambda: self,
-            local_addr=(host or self.host, self.port if port is None else port),
+            local_addr=(bind_host, bind_port),
         )
         self._transport = transport
         self.loop = loop
         sockname = transport.get_extra_info("sockname")
-        return str(sockname[0]), int(sockname[1])
+        actual_port = int(sockname[1])
+        self._tcp_server = await loop.create_server(
+            lambda: Gb28181TcpProtocol(self),
+            host=bind_host,
+            port=actual_port,
+        )
+        return str(sockname[0]), actual_port
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self._transport = transport  # type: ignore[assignment]
@@ -161,27 +216,69 @@ class Gb28181Platform(asyncio.DatagramProtocol):
     def error_received(self, exc: Exception) -> None:
         self._record_error(str(exc))
 
-    def handle_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
-        message = SipMessage.parse(data)
+    def handle_datagram(
+        self,
+        data: bytes,
+        addr: tuple[str, int],
+        *,
+        transport: Any | None = None,
+        transport_kind: str = "udp",
+    ) -> None:
+        try:
+            message = SipMessage.parse(data)
+        except SipParseError as exc:
+            self._record_error(f"{addr[0]}: {exc}")
+            return
+        self.handle_message(
+            message,
+            addr,
+            transport=transport or self._transport,
+            transport_kind=transport_kind,
+        )
+
+    def handle_message(
+        self,
+        message: SipMessage,
+        addr: tuple[str, int],
+        *,
+        transport: Any | None = None,
+        transport_kind: str = "udp",
+    ) -> None:
         if not message.is_request:
             self._complete_response(message)
             return
         method = message.method
         if method == "REGISTER":
-            self._handle_register(message, addr)
+            self._handle_register(message, addr, transport=transport, transport_kind=transport_kind)
         elif method == "MESSAGE":
-            self._handle_message(message, addr)
+            self._handle_message(message, addr, transport=transport, transport_kind=transport_kind)
         elif method == "BYE":
-            self._handle_bye(message, addr)
+            self._handle_bye(message, addr, transport=transport, transport_kind=transport_kind)
         elif method == "ACK":
             return
         else:
-            self._send(message.response(405, "Method Not Allowed", extra_headers=(("Allow", "REGISTER, MESSAGE, INVITE, ACK, BYE"),)), addr)
+            self._send(
+                message.response(
+                    405,
+                    "Method Not Allowed",
+                    extra_headers=(("Allow", "REGISTER, MESSAGE, INVITE, ACK, BYE"),),
+                ),
+                addr,
+                transport=transport,
+                transport_kind=transport_kind,
+            )
 
-    def _handle_register(self, message: SipMessage, addr: tuple[str, int]) -> None:
+    def _handle_register(
+        self,
+        message: SipMessage,
+        addr: tuple[str, int],
+        *,
+        transport: Any | None = None,
+        transport_kind: str = "udp",
+    ) -> None:
         device_id = _sip_user(message.to_header) or _sip_user(message.from_header)
         if not device_id:
-            self._send(message.response(400, "Bad Request"), addr)
+            self._send(message.response(400, "Bad Request"), addr, transport=transport, transport_kind=transport_kind)
             return
         authorization = message.get("authorization")
         if self.password and not verify_digest(authorization, password=self.password, method="REGISTER", uri=message.request_uri):
@@ -193,6 +290,8 @@ class Gb28181Platform(asyncio.DatagramProtocol):
                     extra_headers=(("WWW-Authenticate", challenge.header()),),
                 ),
                 addr,
+                transport=transport,
+                transport_kind=transport_kind,
             )
             return
         expires = _expires(message.get("expires", "3600"))
@@ -206,6 +305,8 @@ class Gb28181Platform(asyncio.DatagramProtocol):
                 expires_at=_future(expires),
                 user_agent=message.get("user-agent"),
                 channels=existing.channels if existing else {},
+                transport_kind=transport_kind,
+                transport=transport,
             )
         self._send(
             message.response(
@@ -217,10 +318,24 @@ class Gb28181Platform(asyncio.DatagramProtocol):
                 ),
             ),
             addr,
+            transport=transport,
+            transport_kind=transport_kind,
         )
 
-    def _handle_message(self, message: SipMessage, addr: tuple[str, int]) -> None:
-        self._send(message.response(200, "OK"), addr)
+    def _handle_message(
+        self,
+        message: SipMessage,
+        addr: tuple[str, int],
+        *,
+        transport: Any | None = None,
+        transport_kind: str = "udp",
+    ) -> None:
+        self._send(
+            message.response(200, "OK"),
+            addr,
+            transport=transport,
+            transport_kind=transport_kind,
+        )
         if not message.body:
             return
         try:
@@ -289,8 +404,20 @@ class Gb28181Platform(asyncio.DatagramProtocol):
         if command == "recordinfo":
             self._handle_record_info(root)
 
-    def _handle_bye(self, message: SipMessage, addr: tuple[str, int]) -> None:
-        self._send(message.response(200, "OK"), addr)
+    def _handle_bye(
+        self,
+        message: SipMessage,
+        addr: tuple[str, int],
+        *,
+        transport: Any | None = None,
+        transport_kind: str = "udp",
+    ) -> None:
+        self._send(
+            message.response(200, "OK"),
+            addr,
+            transport=transport,
+            transport_kind=transport_kind,
+        )
         session = self._dialogs.pop(message.call_id, None)
         if session is not None:
             session.close()
@@ -338,7 +465,7 @@ class Gb28181Platform(asyncio.DatagramProtocol):
         if registration is None:
             raise RuntimeError("GB/T 28181 设备未注册")
         loop = asyncio.get_running_loop()
-        sn = str(loop.time_ns() % 1_000_000_000)
+        sn = secrets.token_hex(8)
         future: asyncio.Future[tuple[Recording, ...]] = loop.create_future()
         self._recording_futures[sn] = future
         body = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -355,11 +482,16 @@ class Gb28181Platform(asyncio.DatagramProtocol):
             to_header=f"<sip:{device_id}@{self.domain}>",
             call_id=f"record-{sn}@{self.domain}",
             cseq=1,
-            via=f"SIP/2.0/UDP {_local_signaling_host(registration.address)}:{self.port};branch=z9hG4bK{secrets.token_hex(10)};rport",
+            via=f"SIP/2.0/{_via_transport(registration.transport_kind)} {_local_signaling_host(registration.address)}:{self.port};branch=z9hG4bK{secrets.token_hex(10)};rport",
             content_type="Application/MANSCDP+xml",
             body=body,
         )
-        self._send(request, registration.address)
+        self._send(
+            request,
+            registration.address,
+            transport=registration.transport,
+            transport_kind=registration.transport_kind,
+        )
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
@@ -397,7 +529,7 @@ class Gb28181Platform(asyncio.DatagramProtocol):
         media_sock = None
         call_id = f"{secrets.token_hex(12)}@{self.domain}"
         branch = "z9hG4bK" + secrets.token_hex(10)
-        via = f"SIP/2.0/UDP {_local_signaling_host(registration.address)}:{self.port};branch={branch};rport"
+        via = f"SIP/2.0/{_via_transport(registration.transport_kind)} {_local_signaling_host(registration.address)}:{self.port};branch={branch};rport"
         from_header = f"<sip:{self.platform_id}@{self.domain}>;tag={secrets.token_hex(6)}"
         to_header = f"<sip:{channel_id}@{self.domain}>"
         sdp = (
@@ -424,7 +556,13 @@ class Gb28181Platform(asyncio.DatagramProtocol):
             body=sdp,
             extra_headers=(("Contact", f"<sip:{self.platform_id}@{_local_signaling_host(registration.address)}:{self.port}>"), ("Subject", f"{channel_id}:{0},{self.platform_id}:{0}")),
         )
-        response = await self._request(request, registration.address, timeout=timeout)
+        response = await self._request(
+            request,
+            registration.address,
+            timeout=timeout,
+            transport=registration.transport,
+            transport_kind=registration.transport_kind,
+        )
         if response.status_code != 200:
             raise RuntimeError(f"GB/T 28181 INVITE failed: {response.status_code} {response.reason}")
         remote_host, remote_port = _sdp_media(response.text)
@@ -450,6 +588,8 @@ class Gb28181Platform(asyncio.DatagramProtocol):
                 via=via,
             ),
             registration.address,
+            transport=registration.transport,
+            transport_kind=registration.transport_kind,
         )
         return session
 
@@ -465,18 +605,33 @@ class Gb28181Platform(asyncio.DatagramProtocol):
                     to_header=f"<sip:{session.channel_id}@{self.domain}>",
                     call_id=session.call_id,
                     cseq=2,
-                    via=f"SIP/2.0/UDP {_local_signaling_host(registration.address)}:{self.port};branch=z9hG4bK{secrets.token_hex(10)};rport",
+                    via=f"SIP/2.0/{_via_transport(registration.transport_kind)} {_local_signaling_host(registration.address)}:{self.port};branch=z9hG4bK{secrets.token_hex(10)};rport",
                 ),
                 registration.address,
+                transport=registration.transport,
+                transport_kind=registration.transport_kind,
             )
         session.close()
 
-    async def _request(self, request: SipMessage, address: tuple[str, int], *, timeout: float) -> SipMessage:
+    async def _request(
+        self,
+        request: SipMessage,
+        address: tuple[str, int],
+        *,
+        timeout: float,
+        transport: Any | None = None,
+        transport_kind: str = "udp",
+    ) -> SipMessage:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[SipMessage] = loop.create_future()
         key = (request.call_id, request.branch)
         self._pending[key] = future
-        self._send(request, address)
+        self._send(
+            request,
+            address,
+            transport=transport,
+            transport_kind=transport_kind,
+        )
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
@@ -488,10 +643,21 @@ class Gb28181Platform(asyncio.DatagramProtocol):
         if future is not None and not future.done():
             future.set_result(message)
 
-    def _send(self, message: SipMessage, address: tuple[str, int]) -> None:
-        if self._transport is None:
+    def _send(
+        self,
+        message: SipMessage,
+        address: tuple[str, int],
+        *,
+        transport: Any | None = None,
+        transport_kind: str = "udp",
+    ) -> None:
+        payload = message.encode()
+        if transport_kind == "tcp" and transport is not None:
+            transport.write(payload)
+        elif self._transport is not None:
+            self._transport.sendto(payload, address)
+        else:
             raise RuntimeError("GB/T 28181 SIP endpoint is not started")
-        self._transport.sendto(message.encode(), address)
         if message.is_request:
             self._requests_sent += 1
 
@@ -503,6 +669,14 @@ class Gb28181Platform(asyncio.DatagramProtocol):
         for session in tuple(self._dialogs.values()):
             session.close()
         self._dialogs.clear()
+        for protocol in tuple(self._tcp_protocols):
+            if protocol.transport is not None:
+                protocol.transport.close()
+        self._tcp_protocols.clear()
+        if self._tcp_server is not None:
+            self._tcp_server.close()
+            await self._tcp_server.wait_closed()
+            self._tcp_server = None
         if self._transport is not None:
             self._transport.close()
             self._transport = None
@@ -637,6 +811,28 @@ class Gb28181Adapter(DeviceAdapter):
         self.closed = True
 
 
+def _take_sip_message(data: bytes) -> tuple[bytes | None, bytes]:
+    """Return one complete SIP message and the unconsumed TCP bytes."""
+    for separator in (b"\r\n\r\n", b"\n\n"):
+        index = data.find(separator)
+        if index >= 0:
+            header_end = index + len(separator)
+            break
+    else:
+        return None, data
+    header = data[:header_end]
+    match = re.search(rb"(?im)^Content-Length\s*:\s*(\d+)\s*$", header)
+    content_length = int(match.group(1)) if match else 0
+    total = header_end + content_length
+    if len(data) < total:
+        return None, data
+    return data[:total], data[total:]
+
+
+def _via_transport(kind: str) -> str:
+    return "TCP" if str(kind).lower() == "tcp" else "UDP"
+
+
 def _sip_user(value: str) -> str:
     match = re.search(r"sip:([^@;>\s]+)", value, re.IGNORECASE)
     return match.group(1) if match else ""
@@ -672,6 +868,10 @@ def _call_id_from_cseq_or_headers(message: SipMessage) -> str:
 
 def _with_to_tag(value: str, tag: str) -> str:
     return value if "tag=" in value.lower() else f"{value};tag={tag}"
+
+
+def _xml_escape(value: str) -> str:
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
 def _xml_text(node: ET.Element, name: str, default: str = "") -> str:

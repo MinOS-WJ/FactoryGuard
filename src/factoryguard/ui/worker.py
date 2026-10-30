@@ -421,13 +421,14 @@ if HAS_QT:
                 engine = None
                 pipeline = None
                 rules_by_id: dict[str, Rule] = {}
+                auto_default_rule = False
 
                 def enable_local_analysis() -> None:
-                    nonlocal engine, pipeline, rules_by_id, analysis_rules
+                    nonlocal engine, pipeline, rules_by_id, analysis_rules, auto_default_rule
                     local_engine, health = self._shared_engine(runtime)
                     if health.state != "ready":
                         raise RuntimeError(health.detail or f"本机备用分析不可用: {runtime.stream_id}")
-                    if not persisted_rules:
+                    if not analysis_rules:
                         default_rule = Rule(
                             id=f"qt-full-frame-{runtime.stream_id}",
                             stream_id=runtime.stream_id,
@@ -439,7 +440,7 @@ if HAS_QT:
                             area_id=runtime.area_id,
                             camera_id=runtime.camera_id,
                         )
-                        store.save_rule(default_rule)
+                        auto_default_rule = True
                         analysis_rules = [default_rule]
                     engine = local_engine
                     pipeline = DetectionPipeline(
@@ -499,7 +500,7 @@ if HAS_QT:
                                             and subscription_state != "degraded"
                                         ),
                                         native_rules=native_rules,
-                                        analysis_rules=analysis_rules,
+                                        analysis_rules=() if auto_default_rule else analysis_rules,
                                     )
                                     if updated_decision.use_local != decision.use_local:
                                         if updated_decision.use_local:

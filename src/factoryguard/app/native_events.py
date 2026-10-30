@@ -64,14 +64,14 @@ def decide_analysis(
         return AnalysisDecision(
             resolved,
             native_available,
-            has_analysis_work or (not native_available and not has_native_work),
+            has_analysis_work or not native_available,
             "本机分析为主，设备事件作为补充",
         )
     if native_available and has_native_work and not has_analysis_work:
         return AnalysisDecision(resolved, True, False, "设备已提供所需事件，本机分析待命")
     if native_available and has_native_work and has_analysis_work:
         return AnalysisDecision(resolved, True, True, "部分规则需要本机分析")
-    use_local = has_analysis_work or (not native_available and not has_native_work)
+    use_local = has_analysis_work or not native_available
     return AnalysisDecision(
         resolved,
         native_available,

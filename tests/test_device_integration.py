@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import re
+import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -8,7 +12,7 @@ import pytest
 from factoryguard.app.native_events import NativeEventIngestor, decide_analysis
 from factoryguard.devices.base import DeviceCredentials
 from factoryguard.devices.gb28181.server import Gb28181Platform
-from factoryguard.devices.gb28181.sip import SipMessage, digest_response, verify_digest
+from factoryguard.devices.gb28181.sip import DigestChallenge, SipMessage, digest_response, verify_digest
 from factoryguard.devices.onvif import OnvifAdapter, OnvifDiscovery
 from factoryguard.domain.models import (
     AnalysisPolicy,
@@ -16,6 +20,7 @@ from factoryguard.domain.models import (
     CameraDevice,
     DeviceCapabilities,
     DeviceProtocol,
+    Event,
     EventSource,
     NativeEvent,
     Rule,
@@ -26,6 +31,9 @@ from factoryguard.domain.models import (
     VideoStream,
 )
 from factoryguard.domain.topology import EntityRegistry
+from factoryguard.inference.base import InferenceHealth
+from factoryguard.media.rtsp import RawFrame
+from factoryguard.ui.worker import MonitorConfig, MonitorWorker, StreamRuntimeConfig
 from factoryguard.inference.profiles import ModelBinding, ModelProfile
 from factoryguard.security.credentials import CredentialVault, XorTestProtector, default_vault
 from factoryguard.storage.sqlite import SQLiteStore
@@ -106,6 +114,51 @@ def test_native_event_maps_to_existing_event_workflow_and_deduplicates_sources()
         store.close()
 
 
+
+def test_native_event_is_merged_with_recent_local_fallback_event():
+    from dataclasses import replace as dataclass_replace
+
+    store = SQLiteStore(":memory:")
+    try:
+        native_rule = Rule(
+            "rule-native",
+            stream_id="stream-1",
+            trigger_mode=RuleMode.NATIVE_EVENT,
+            native_event_codes=("motiondetect",),
+            dedup_window_seconds=30,
+        )
+        store.save_rule(native_rule)
+        now = datetime.now(UTC)
+        native = NativeEvent(
+            device_id="device-1",
+            channel_id="ch1",
+            event_code="motiondetect",
+            occurred_at=now,
+            source=EventSource.ONVIF,
+            source_event_id="native-1",
+            stream_id="stream-1",
+            payload={"semantic": "motion"},
+        )
+        local_event = Event(
+            id="evt-local",
+            dedup_key="local-1",
+            rule_id="rule-analysis",
+            channel_id="stream-1",
+            level="high",
+            occurred_at=now,
+            target={"condition": "motion"},
+            source=EventSource.LOCAL_INFERENCE,
+            correlation_key=native.correlation_key,
+            dedup_window_seconds=30,
+        )
+        assert store.create_event_with_outbox(local_event, enqueue=False)
+        ingestor = NativeEventIngestor(store, (native_rule,), channels=("webhook",))
+        assert ingestor.ingest(native) == ()
+        assert len(store.search_events(stream_id="stream-1")) == 1
+    finally:
+        store.close()
+
+
 def test_analysis_policy_prefers_native_events_and_falls_back_when_unhealthy():
     capabilities = DeviceCapabilities(native_events=True, event_types=("motiondetect",))
     native_rule = Rule(
@@ -134,9 +187,16 @@ def test_analysis_policy_prefers_native_events_and_falls_back_when_unhealthy():
         native_rules=(native_rule,),
         analysis_rules=(analysis_rule,),
     )
+    native_subscription_fallback = decide_analysis(
+        policy=AnalysisPolicy.LOCAL_FALLBACK,
+        capabilities=capabilities,
+        native_subscription_healthy=False,
+        native_rules=(native_rule,),
+    )
     assert healthy.use_native is True
     assert healthy.use_local is False
     assert fallback.use_local is True
+    assert native_subscription_fallback.use_local is True
     assert fallback.policy is AnalysisPolicy.LOCAL_FALLBACK
 
 
@@ -321,6 +381,320 @@ def test_onvif_adapter_probes_media_streams_and_pullpoint_events():
     subscription.close()
     assert event.event_code == "propertyoperation"
     assert event.channel_id == "ch1"
+
+
+
+def _gb_register(auth: str = "") -> bytes:
+    headers = [
+        "REGISTER sip:3402000000@3402000000 SIP/2.0",
+        "Via: SIP/2.0/TCP 10.0.0.8:5060;branch=z9hG4bKtcp",
+        "From: <sip:340200000000000001@3402000000>;tag=cam",
+        "To: <sip:340200000000000001@3402000000>",
+        "Call-ID: tcp-reg",
+        "CSeq: 1 REGISTER",
+        "Expires: 3600",
+        "Content-Length: 0",
+    ]
+    if auth:
+        headers.insert(5, f"Authorization: {auth}")
+    return ("\r\n".join(headers) + "\r\n\r\n").encode()
+
+
+def test_gb28181_tcp_registration_uses_digest_and_routes_response_over_tcp():
+    platform = Gb28181Platform(
+        platform_id="340200000000000000",
+        domain="3402000000",
+        password="secret",
+    )
+    transport = SimpleNamespace(write=lambda payload: transport.writes.append(payload), writes=[])
+    platform.handle_message(
+        SipMessage.parse(_gb_register()),
+        ("10.0.0.8", 5060),
+        transport=transport,
+        transport_kind="tcp",
+    )
+    challenge = SipMessage.parse(transport.writes[0])
+    assert challenge.status_code == 401
+    parsed = DigestChallenge.parse(challenge.get("www-authenticate"))
+    auth = digest_response(
+        username="340200000000000001",
+        password="secret",
+        realm=parsed.realm,
+        nonce=parsed.nonce,
+        method="REGISTER",
+        uri="sip:3402000000@3402000000",
+    )
+    platform.handle_message(
+        SipMessage.parse(_gb_register(auth)),
+        ("10.0.0.8", 5060),
+        transport=transport,
+        transport_kind="tcp",
+    )
+    response = SipMessage.parse(transport.writes[1])
+    assert response.status_code == 200
+    registration = platform.registrations["340200000000000001"]
+    assert registration.transport_kind == "tcp"
+    assert registration.transport is transport
+
+
+def test_gb28181_tcp_invite_ack_bye_and_recording_query():
+    async def run() -> None:
+        platform = Gb28181Platform(
+            platform_id="340200000000000000",
+            domain="3402000000",
+        )
+        transport = SimpleNamespace(write=lambda payload: transport.writes.append(payload), writes=[])
+        platform.registrations["device-1"] = __import__(
+            "factoryguard.devices.gb28181.server", fromlist=["Gb28181Registration"]
+        ).Gb28181Registration(
+            device_id="device-1",
+            address=("10.0.0.8", 5060),
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            channels={
+                "ch1": __import__(
+                    "factoryguard.devices.gb28181.server", fromlist=["Gb28181Channel"]
+                ).Gb28181Channel(id="ch1", name="Camera"),
+            },
+            transport_kind="tcp",
+            transport=transport,
+        )
+        invite_task = asyncio.create_task(platform.invite("device-1", "ch1", timeout=1))
+        await asyncio.sleep(0)
+        invite = SipMessage.parse(transport.writes[0])
+        assert invite.method == "INVITE"
+        assert "SIP/2.0/TCP" in invite.via
+        response = invite.response(
+            200,
+            "OK",
+            extra_headers=(("Content-Type", "application/sdp"),),
+            body=b"v=0\r\n",
+        )
+        platform._complete_response(response)
+        session = await invite_task
+        ack = SipMessage.parse(transport.writes[1])
+        assert ack.method == "ACK"
+        await platform.bye(session)
+        bye = SipMessage.parse(transport.writes[2])
+        assert bye.method == "BYE"
+
+        record_task = asyncio.create_task(
+            platform.query_recordings(
+                "device-1",
+                "ch1",
+                start_at=datetime.now(UTC) - timedelta(hours=1),
+                end_at=datetime.now(UTC),
+                timeout=1,
+            )
+        )
+        await asyncio.sleep(0)
+        query = SipMessage.parse(transport.writes[3])
+        assert query.method == "MESSAGE"
+        assert b"RecordInfo" in query.body
+        query_root = ET.fromstring(query.body)
+        sn = query_root.findtext("SN")
+        platform._handle_record_info(
+            ET.fromstring(
+                f"<Response><CmdType>RecordInfo</CmdType><SN>{sn}</SN><DeviceID>ch1</DeviceID>"
+                "<SumNum>1</SumNum><DeviceList><Item><DeviceID>ch1</DeviceID>"
+                "<Name>录像</Name><StartTime>2026-01-01T00:00:00Z</StartTime>"
+                "<EndTime>2026-01-01T01:00:00Z</EndTime></Item></DeviceList></Response>"
+            )
+        )
+        recordings = await record_task
+        assert recordings[0].channel_id == "ch1"
+
+    asyncio.run(run())
+
+
+
+def test_gb28181_platform_starts_udp_and_tcp_listeners_and_closes():
+    async def run():
+        platform = Gb28181Platform(
+            platform_id="340200000000000000",
+            domain="3402000000",
+        )
+        host, port = await platform.start(host="127.0.0.1", port=0)
+        assert host == "127.0.0.1"
+        assert port > 0
+        assert platform.started
+        assert platform.diagnostics["transports"] == ("udp", "tcp")
+        await platform.close()
+        assert not platform.started
+
+    asyncio.run(run())
+
+
+def test_gb28181_malformed_transport_does_not_stop_registration():
+    platform = Gb28181Platform(
+        platform_id="340200000000000000",
+        domain="3402000000",
+    )
+    transport = SimpleNamespace(sendto=lambda *_args: None)
+    platform._transport = transport
+    platform.handle_datagram(b"not sip", ("10.0.0.8", 5060))
+    platform.handle_datagram(_gb_register(), ("10.0.0.8", 5060))
+    assert "340200000000000001" in platform.registrations
+
+
+
+def test_ws_discovery_probe_receives_local_device_match(monkeypatch):
+    import socket as socket_module
+
+    payload = (
+        b"<Envelope><Body><ProbeMatches><ProbeMatch>"
+        b"<XAddrs>http://10.0.0.8/onvif/device_service</XAddrs>"
+        b"<Scopes>onvif://www.onvif.org/type/video_encoder</Scopes>"
+        b"<Types>dn:NetworkVideoTransmitter</Types><MetadataVersion>1</MetadataVersion>"
+        b"</ProbeMatch></ProbeMatches></Body></Envelope>"
+    )
+
+    class FakeSocket:
+        def __init__(self, *_args, **_kwargs):
+            self.sent = []
+            self.received = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def setsockopt(self, *_args):
+            return None
+
+        def settimeout(self, _timeout):
+            return None
+
+        def sendto(self, data, address):
+            self.sent.append((data, address))
+
+        def recvfrom(self, _size):
+            if self.received:
+                raise socket_module.timeout()
+            self.received = True
+            return payload, ("10.0.0.8", 3702)
+
+    fake = FakeSocket()
+    monkeypatch.setattr("factoryguard.devices.onvif.socket.socket", lambda *_args, **_kwargs: fake)
+    found = OnvifDiscovery().discover(timeout=0.1, probes=1)
+    assert found[0].endpoint == "http://10.0.0.8/onvif/device_service"
+    assert fake.sent[0][1] == ("239.255.255.250", 3702)
+
+
+def test_onvif_soap_client_posts_authenticated_xml(monkeypatch):
+    from factoryguard.devices.onvif import OnvifSoapClient
+
+    response_xml = (
+        b"<Envelope><Body><GetDeviceInformationResponse>"
+        b"<Manufacturer>Acme</Manufacturer><Model>Cam</Model>"
+        b"</GetDeviceInformationResponse></Body></Envelope>"
+    )
+
+    class FakeResponse:
+        status = 200
+
+        def read(self):
+            return response_xml
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["data"] = request.data
+        captured["headers"] = request.headers
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("factoryguard.devices.onvif.urllib.request.urlopen", fake_urlopen)
+    client = OnvifSoapClient(
+        "http://10.0.0.8/onvif/device_service",
+        DeviceCredentials(username="admin", password="secret"),
+        timeout=3,
+    )
+    root = client.call("http://10.0.0.8/onvif/device_service", "GetDeviceInformation", "<GetDeviceInformation/>")
+    assert root.find(".//Manufacturer").text == "Acme"
+    assert b"UsernameToken" in captured["data"]
+    assert captured["timeout"] == 3
+
+
+
+def test_monitor_worker_stops_local_analysis_when_native_subscription_recovers(monkeypatch):
+    states = ["healthy", "healthy", "degraded", "degraded", "healthy"]
+    calls = []
+
+    class FakeStore:
+        def load_rules(self, **_kwargs):
+            return []
+
+        def save_rule(self, _rule):
+            return None
+
+        def get_stream_armed(self, _stream_id, default=True):
+            return default
+
+        def get_arming_schedule(self, _stream_id):
+            return None
+
+        def list_device_subscriptions(self):
+            return {"device-1": {"state": states.pop(0) if states else "healthy"}}
+
+        def set_stream_health(self, *_args, **_kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeEngine:
+        def infer_image(self, _image):
+            calls.append(frame_index[0])
+            return ()
+
+    class FakeCapture:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @contextmanager
+        def stream(self, *, timeout):
+            def frames():
+                for frame_index[0] in range(20):
+                    yield RawFrame(__import__("numpy").zeros((2, 2, 3), dtype="uint8"), frame_index[0])
+                worker._stop.set()
+
+            yield frames()
+
+    frame_index = [0]
+    worker = MonitorWorker(
+        MonitorConfig(
+            db=":memory:",
+            notification_channels=(),
+            streams=(
+                StreamRuntimeConfig(
+                    stream_id="stream-1",
+                    url="rtsp://camera/live",
+                    device_id="device-1",
+                    capabilities=DeviceCapabilities(native_events=True),
+                    native_subscription_healthy=True,
+                    analysis_policy=AnalysisPolicy.LOCAL_FALLBACK,
+                ),
+            ),
+        )
+    )
+    monkeypatch.setattr("factoryguard.ui.worker.SQLiteStore", lambda *_args, **_kwargs: FakeStore())
+    monkeypatch.setattr("factoryguard.ui.worker.RTSPCapture", FakeCapture)
+    monkeypatch.setattr(
+        "factoryguard.ui.worker.require_ffmpeg",
+        lambda: SimpleNamespace(version="fake"),
+    )
+    worker._shared_engine = lambda _runtime: (FakeEngine(), InferenceHealth("ready", "fake"))
+    worker._run_stream_once(SimpleNamespace(), worker.config.streams[0])
+    assert calls
+    assert min(calls) >= 5
+    assert max(calls) <= 15
 
 
 def test_ws_discovery_parses_probe_match_without_network(monkeypatch):
