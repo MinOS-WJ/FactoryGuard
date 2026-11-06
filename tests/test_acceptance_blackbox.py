@@ -1,4 +1,4 @@
-﻿"""Black-box acceptance checks for the real ``src/main.py`` entry point.
+"""Black-box acceptance checks for the real src/main.py entry point.
 
 These tests deliberately avoid importing FactoryGuard internals. They start
 the same script an operator starts and assert only process results and
@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINT = ROOT / "src" / "main.py"
@@ -21,7 +20,6 @@ ENTRYPOINT = ROOT / "src" / "main.py"
 def _run_cli(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess[str]:
     """Run the checkout entry point without relying on package installation."""
     environment = os.environ.copy()
-    # Removing an inherited PYTHONPATH makes this a real entry-point check.
     environment.pop("PYTHONPATH", None)
     environment["PYTHONIOENCODING"] = "utf-8"
     environment.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -46,21 +44,26 @@ def _json_output(result: subprocess.CompletedProcess[str]) -> dict[str, object]:
     return value
 
 
-def test_real_entrypoint_help_lists_operational_commands() -> None:
+def test_real_entrypoint_help_lists_only_current_commands() -> None:
     result = _run_cli("--help")
 
     assert result.returncode == 0, result.stderr
-    assert "simulate" in result.stdout
-    assert "health" in result.stdout
-    assert "channels" in result.stdout
-    assert "dispatch-outbox" in result.stdout
-    assert "cleanup-media" in result.stdout
+    for command in (
+        "gui",
+        "tray",
+        "probe-rtsp",
+        "health",
+        "channels",
+        "dispatch-outbox",
+        "cleanup-media",
+    ):
+        assert command in result.stdout
+    for removed in ("simulate", "detect-rtsp", "monitor-rtsp"):
+        assert removed not in result.stdout
 
 
 def test_real_entrypoint_health_returns_machine_readable_report(tmp_path: Path) -> None:
     database = tmp_path / "health.db"
-    model = tmp_path / "model.onnx"
-    model.write_bytes(b"acceptance-fixture")
     media = tmp_path / "media"
 
     report = _json_output(
@@ -68,8 +71,6 @@ def test_real_entrypoint_health_returns_machine_readable_report(tmp_path: Path) 
             "health",
             "--db",
             str(database),
-            "--model",
-            str(model),
             "--media-dir",
             str(media),
         )
@@ -79,27 +80,13 @@ def test_real_entrypoint_health_returns_machine_readable_report(tmp_path: Path) 
     assert isinstance(report["checks"], list)
     check_names = {str(item["name"]) for item in report["checks"]}
     assert {
-        "SQLite \u6570\u636e\u5e93",
+        "SQLite 数据库",
         "FFmpeg",
-        "ONNX \u6a21\u578b",
-        "\u5a92\u4f53\u76ee\u5f55",
-        "\u78c1\u76d8\u7a7a\u95f4",
+        "媒体目录",
+        "磁盘空间",
     } <= check_names
+    assert all("ONNX" not in name for name in check_names)
     assert media.is_dir()
-
-
-def test_real_entrypoint_simulation_persists_event_and_outbox(tmp_path: Path) -> None:
-    database = tmp_path / "simulation.db"
-
-    report = _json_output(_run_cli("simulate", "--db", str(database), "--frames", "3"))
-
-    assert report == {
-        "frames": 3,
-        "events": 1,
-        "pending_notifications": 1,
-        "integrity": "ok",
-    }
-    assert database.is_file()
 
 
 def test_real_entrypoint_channels_reports_adapter_and_authorization_state() -> None:
@@ -115,13 +102,11 @@ def test_real_entrypoint_channels_reports_adapter_and_authorization_state() -> N
     )
     assert channels["email"]["implemented"] is True
     assert channels["sms"]["implemented"] is True
-    assert all(channels[key]["implemented"] is False for key in ("wecom", "wechat", "dingtalk", "feishu"))
 
 
 def test_real_entrypoint_cleanup_media_is_observable_and_safe(tmp_path: Path) -> None:
     database = tmp_path / "cleanup.db"
     media = tmp_path / "events-media"
-    _json_output(_run_cli("simulate", "--db", str(database), "--frames", "3"))
 
     report = _json_output(
         _run_cli(
@@ -146,9 +131,8 @@ def test_real_entrypoint_cleanup_media_is_observable_and_safe(tmp_path: Path) ->
     }
 
 
-def test_real_entrypoint_dispatch_outbox_reports_retry_without_losing_event(tmp_path: Path) -> None:
+def test_real_entrypoint_dispatch_outbox_handles_empty_queue(tmp_path: Path) -> None:
     database = tmp_path / "dispatch.db"
-    _json_output(_run_cli("simulate", "--db", str(database), "--frames", "3"))
 
     report = _json_output(
         _run_cli(
@@ -165,7 +149,7 @@ def test_real_entrypoint_dispatch_outbox_reports_retry_without_losing_event(tmp_
         )
     )
 
-    assert report["claimed"] == 1
+    assert report["claimed"] == 0
     assert report["sent"] == 0
-    assert report["retried"] == 1
+    assert report["retried"] == 0
     assert report["failed"] == 0

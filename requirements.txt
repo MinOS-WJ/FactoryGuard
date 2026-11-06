@@ -1,12 +1,9 @@
-# Runtime (CPU-only; do not replace with onnxruntime-gpu on this host)
+# Runtime
 numpy>=1.26,<3
-onnxruntime>=1.18,<2
 
 # Development and verification
 pytest>=8,<10
+ruff>=0.9,<1
 
-# Optional desktop control panel and system tray (keep all Qt bindings on one release)
+# Desktop merchant console (keep all Qt bindings on one release)
 PySide6==6.12.0
-
-# ONVIF SOAP transport and schema support
-zeep>=4.2,<5

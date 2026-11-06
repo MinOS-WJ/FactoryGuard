@@ -22,6 +22,11 @@ def test_resource_sampler_returns_local_system_metrics(tmp_path):
     assert first.process_cpu_percent >= 0.0
 
 
+def test_resource_sampler_accepts_not_yet_created_paths(tmp_path):
+    snapshot = ResourceSampler().sample(tmp_path / "missing" / "nested")
+    assert snapshot.disk_total_bytes >= snapshot.disk_free_bytes >= 0
+
+
 def test_resource_state_uses_shared_cpu_memory_and_disk_thresholds(tmp_path):
     snapshot = replace(
         ResourceSampler().sample(tmp_path),
@@ -33,10 +38,10 @@ def test_resource_state_uses_shared_cpu_memory_and_disk_thresholds(tmp_path):
 
     assert classify_resource_state(snapshot) == "ok"
     assert classify_resource_state(replace(snapshot, cpu_percent=75)) == "warn"
-    assert classify_resource_state(replace(snapshot, cpu_percent=90)) == "error"
+    # Whole-machine load is outside the operator control and never an error.
+    assert classify_resource_state(replace(snapshot, cpu_percent=100)) == "warn"
     assert classify_resource_state(replace(snapshot, memory_used_percent=85)) == "warn"
     assert classify_resource_state(replace(snapshot, memory_used_percent=95)) == "error"
-
     disk_warn = replace(
         snapshot,
         cpu_percent=0,

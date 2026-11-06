@@ -17,8 +17,17 @@ models/cache/
 # Locally downloaded reference PDFs; paper/README.md keeps the source links
 paper/*.pdf
 
-# Runtime databases, logs and generated media
+# Delivery evidence (screenshots and recordings) is a deliverable and is kept
+# in the repository on purpose.  Only the bulky customer footage is excluded.
 data/
+
+# PyInstaller output (rebuild with FactoryGuard.spec)
+build/
+dist/
+build-sim/
+test-package/
+real-computer-test-package/
+FactoryGuard-TestPackage-*.zip
 events-media/
 exports/
 diagnostics/
@@ -34,6 +43,17 @@ logs/
 *.log
 *.mp4
 *.mov
+
+# Customer surveillance footage supplied for on-site verification.  The files
+# stay on the delivery machine and never enter the repository.
+监控录像*/
+
+# The delivery recordings are part of the handover package.
+!docs/testing/evidence/*.mp4
+
+# Customer surveillance footage must never enter the repository
+docs/testing/evidence/live-view-real-footage.mp4
+docs/testing/evidence/footage-recording.json
 *.avi
 *.mkv
 *.wav
@@ -42,6 +62,9 @@ logs/
 .env
 .env.*
 !.env.example
+config/factoryguard.json
+config/branding/
+config/*.local.json
 config/local/
 secrets/
 *.secret

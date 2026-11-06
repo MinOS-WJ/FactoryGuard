@@ -7,6 +7,7 @@ import os
 import shutil
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -67,6 +68,13 @@ class ResourceSnapshot:
     captured_at: float
 
 
+def _existing_disk_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return path if path.exists() else Path.cwd()
+
+
 class ResourceSampler:
     """Sample host and current-process resources using lightweight Windows APIs."""
 
@@ -74,6 +82,7 @@ class ResourceSampler:
         self._system_cpu: tuple[int, int, int] | None = None
         self._process_cpu: tuple[int, int, float] | None = None
         self._sample_count = 0
+        self._cpu_window: deque[float] | None = None
         # Prime counters so the first UI/CLI sample reports a real interval.
         self._cpu_percent()
         self._process_cpu_percent(time.perf_counter())
@@ -84,15 +93,14 @@ class ResourceSampler:
         self._sample_count += 1
         now = time.perf_counter()
         total_memory, available_memory = self._memory()
-        disk = shutil.disk_usage(Path(disk_root))
+        disk = shutil.disk_usage(_existing_disk_path(disk_root))
+        cpu_percent = self._smoothed_cpu_percent()
         return ResourceSnapshot(
-            cpu_percent=self._cpu_percent(),
+            cpu_percent=cpu_percent,
             memory_total_bytes=total_memory,
             memory_available_bytes=available_memory,
             memory_used_percent=(
-                (total_memory - available_memory) / total_memory * 100.0
-                if total_memory
-                else 0.0
+                (total_memory - available_memory) / total_memory * 100.0 if total_memory else 0.0
             ),
             process_memory_bytes=self._process_memory_bytes(),
             process_cpu_percent=self._process_cpu_percent(now),
@@ -103,9 +111,24 @@ class ResourceSampler:
             captured_at=now,
         )
 
+    def _smoothed_cpu_percent(self) -> float:
+        """Measure CPU across a short window so a burst is not a fault."""
+        current = self._cpu_percent()
+        if self._cpu_window is None:
+            self._cpu_window = deque(maxlen=4)
+        self._cpu_window.append(current)
+        if len(self._cpu_window) < 2:
+            return current
+        return sum(self._cpu_window) / len(self._cpu_window)
+
     def _cpu_percent(self) -> float:
         if os.name != "nt":
             return 0.0
+        if self._system_cpu is None:
+            # Prime the counters and measure over a short window so a burst of
+            # work is not reported as a sustained fault.
+            time.sleep(0.05)
+            self._system_cpu = None
         try:
             idle = _FileTime()
             kernel = _FileTime()
@@ -201,8 +224,16 @@ class ResourceSampler:
 
 
 def classify_resource_state(snapshot: ResourceSnapshot) -> ResourceState:
+    """Grade the machine state without blaming the operator for outside load.
+
+    Disk space and memory exhaustion are problems the operator can fix, so
+    they may raise an error.  Whole-machine CPU load is often caused by
+    other programs, therefore it only ever produces a warning.  A busy
+    machine must not make the health check fail and send the merchant
+    looking for a fault that does not exist.
+    """
     free_ratio = snapshot.disk_free_bytes / max(snapshot.disk_total_bytes, 1)
-    if snapshot.cpu_percent >= 90 or snapshot.memory_used_percent >= 95 or free_ratio < 0.05:
+    if snapshot.memory_used_percent >= 95 or free_ratio < 0.05:
         return "error"
     if snapshot.cpu_percent >= 75 or snapshot.memory_used_percent >= 85 or free_ratio < 0.15:
         return "warn"

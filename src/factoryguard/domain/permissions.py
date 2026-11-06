@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Local desktop roles and capability checks.
 
 The desktop console is intentionally local-first, so this module models the
@@ -7,6 +5,8 @@ operator's current role without pretending to be a remote identity provider.
 It gives the UI one consistent policy boundary and keeps audit actor values
 separate from authorization decisions.
 """
+
+from __future__ import annotations
 
 from enum import StrEnum
 
@@ -62,10 +62,12 @@ def role_from_value(value: object) -> UserRole:
 def can(role: UserRole | str, permission: Permission | str) -> bool:
     resolved_role = role_from_value(role)
     try:
-        resolved_permission = permission if isinstance(permission, Permission) else Permission(str(permission))
+        resolved_permission = (
+            permission if isinstance(permission, Permission) else Permission(str(permission))
+        )
     except ValueError:
         return False
     return resolved_permission in ROLE_PERMISSIONS[resolved_role]
 
 
-__all__ = ["Permission", "ROLE_LABELS", "ROLE_PERMISSIONS", "UserRole", "can", "role_from_value"]
+__all__ = ["ROLE_LABELS", "ROLE_PERMISSIONS", "Permission", "UserRole", "can", "role_from_value"]

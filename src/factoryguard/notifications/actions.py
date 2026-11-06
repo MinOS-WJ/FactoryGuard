@@ -7,6 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from factoryguard.domain.models import Event
+from factoryguard.net import close_http_error
 
 
 def execute_http_action(event: Event, *, url: str, timeout: float = 5.0) -> tuple[bool, str]:
@@ -38,6 +39,7 @@ def execute_http_action(event: Event, *, url: str, timeout: float = 5.0) -> tupl
             return True, f"HTTP {status}"
         return False, f"HTTP action returned {status}"
     except (OSError, URLError, HTTPError) as exc:
+        close_http_error(exc)
         return False, str(exc)[:500]
 
 

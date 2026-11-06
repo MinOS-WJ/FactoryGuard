@@ -3,34 +3,50 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from math import isfinite
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 from uuid import uuid4
 
+from factoryguard.devices.base import Recording
+from factoryguard.domain.incidents import (
+    STATUS_LABELS,
+    Incident,
+    IncidentSeverity,
+    IncidentSource,
+    IncidentStatus,
+)
 from factoryguard.domain.models import (
-    AnalysisPolicy,
     Area,
     CameraDevice,
     DeviceCapabilities,
-    DeviceProtocol,
     Event,
-    EventSource,
     EventStatus,
     Rule,
-    RuleMode,
-    RuleType,
     Site,
     VideoDevice,
     VideoStream,
 )
-from factoryguard.devices.base import Recording
-from factoryguard.inference.profiles import ModelBinding, ModelProfile
 from factoryguard.domain.schedules import ArmingSchedule, TimeWindow
 from factoryguard.domain.topology import EntityRegistry
+
+ALLOWED_INCIDENT_STATUS_TRANSITIONS = {
+    IncidentStatus.OPEN: {
+        IncidentStatus.ACKNOWLEDGED,
+        IncidentStatus.RESOLVED,
+        IncidentStatus.FALSE_ALARM,
+    },
+    IncidentStatus.ACKNOWLEDGED: {
+        IncidentStatus.OPEN,
+        IncidentStatus.RESOLVED,
+        IncidentStatus.FALSE_ALARM,
+    },
+    IncidentStatus.RESOLVED: {IncidentStatus.OPEN},
+    IncidentStatus.FALSE_ALARM: {IncidentStatus.OPEN},
+}
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -64,7 +80,7 @@ CREATE TABLE IF NOT EXISTS video_device (
   device_id TEXT NOT NULL DEFAULT '',
   credential_ref TEXT,
   capabilities TEXT NOT NULL DEFAULT '{}',
-  analysis_policy TEXT NOT NULL DEFAULT 'local_fallback',
+  analysis_policy TEXT NOT NULL DEFAULT 'native_only',
   enabled INTEGER NOT NULL DEFAULT 1,
   last_probe_at TEXT,
   last_ok_at TEXT,
@@ -107,6 +123,7 @@ CREATE TABLE IF NOT EXISTS video_stream (
   native_event_codes TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS ix_stream_camera ON video_stream(camera_id);
+-- Legacy-compatible storage for native event routing rules.
 CREATE TABLE IF NOT EXISTS detection_rule (
   id TEXT PRIMARY KEY,
   stream_id TEXT NOT NULL,
@@ -199,33 +216,11 @@ CREATE TABLE IF NOT EXISTS event (
   escalated_at TEXT,
   payload TEXT NOT NULL,
   device_id TEXT,
-  source TEXT NOT NULL DEFAULT 'local_inference',
+  source TEXT NOT NULL DEFAULT 'system',
   source_event_id TEXT,
   native INTEGER NOT NULL DEFAULT 0,
-  analysis_policy TEXT NOT NULL DEFAULT 'local_fallback',
+  analysis_policy TEXT NOT NULL DEFAULT 'native_only',
   correlation_key TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS model_profile (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  task_type TEXT NOT NULL,
-  backend TEXT NOT NULL,
-  model_uri TEXT NOT NULL,
-  input_width INTEGER NOT NULL,
-  input_height INTEGER NOT NULL,
-  labels TEXT NOT NULL,
-  confidence REAL NOT NULL,
-  iou REAL NOT NULL,
-  version TEXT NOT NULL,
-  enabled INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS model_binding (
-  id TEXT PRIMARY KEY,
-  model_profile_id TEXT NOT NULL REFERENCES model_profile(id),
-  scope_type TEXT NOT NULL,
-  scope_id TEXT NOT NULL,
-  priority INTEGER NOT NULL DEFAULT 0,
-  enabled INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS device_subscription (
   device_id TEXT PRIMARY KEY REFERENCES video_device(id),
@@ -276,6 +271,57 @@ CREATE TABLE IF NOT EXISTS stream_health (
   reconnect_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_stream_health_status ON stream_health(status, updated_at);
+CREATE TABLE IF NOT EXISTS incident (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  severity TEXT NOT NULL DEFAULT 'medium',
+  status TEXT NOT NULL DEFAULT 'open',
+  site_id TEXT,
+  area_id TEXT,
+  camera_id TEXT,
+  site_name_snapshot TEXT NOT NULL DEFAULT '',
+  area_name_snapshot TEXT NOT NULL DEFAULT '',
+  camera_name_snapshot TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'user',
+  reporter TEXT NOT NULL DEFAULT '',
+  occurred_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  ai_summary TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS ix_incident_status_time ON incident(status, occurred_at);
+CREATE INDEX IF NOT EXISTS ix_incident_area_time ON incident(area_id, occurred_at);
+CREATE TABLE IF NOT EXISTS incident_notification_delivery (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id TEXT NOT NULL REFERENCES incident(id) ON DELETE CASCADE,
+  channel TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 1,
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(incident_id, channel)
+);
+CREATE INDEX IF NOT EXISTS ix_incident_notification_status
+  ON incident_notification_delivery(status, updated_at);
+CREATE TABLE IF NOT EXISTS assistant_conversation (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL DEFAULT '现场助手',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS assistant_message (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES assistant_conversation(id) ON DELETE CASCADE,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT 'offline',
+  citations TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_assistant_message_conversation ON assistant_message(conversation_id, created_at);
 """
 
 
@@ -314,6 +360,14 @@ class SQLiteStore:
 
         with connection:
             add_columns(
+                "incident",
+                {
+                    "site_name_snapshot": "TEXT NOT NULL DEFAULT ''",
+                    "area_name_snapshot": "TEXT NOT NULL DEFAULT ''",
+                    "camera_name_snapshot": "TEXT NOT NULL DEFAULT ''",
+                },
+            )
+            add_columns(
                 "event",
                 {
                     "stream_id": "TEXT",
@@ -321,10 +375,10 @@ class SQLiteStore:
                     "area_id": "TEXT",
                     "camera_id": "TEXT",
                     "device_id": "TEXT",
-                    "source": "TEXT NOT NULL DEFAULT 'local_inference'",
+                    "source": "TEXT NOT NULL DEFAULT 'system'",
                     "source_event_id": "TEXT",
                     "native": "INTEGER NOT NULL DEFAULT 0",
-                    "analysis_policy": "TEXT NOT NULL DEFAULT 'local_fallback'",
+                    "analysis_policy": "TEXT NOT NULL DEFAULT 'native_only'",
                     "correlation_key": "TEXT NOT NULL DEFAULT ''",
                 },
             )
@@ -383,14 +437,16 @@ class SQLiteStore:
             ).fetchall()
             for row in legacy_rows:
                 device_id = f"device-{row['id']}"
-                raw_endpoint = _endpoint_without_credentials(str(row["url"] or row["address"] or ""))
+                raw_endpoint = _endpoint_without_credentials(
+                    str(row["url"] or row["address"] or "")
+                )
                 protocol = "rtsp" if raw_endpoint else "manual"
                 endpoint = raw_endpoint or f"manual://{row['id']}"
                 connection.execute(
                     """INSERT OR IGNORE INTO video_device
                        (id, site_id, area_id, name, protocol, endpoint, vendor, model, firmware,
                         serial_number, device_id, credential_ref, capabilities, analysis_policy, enabled)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, NULL, ?, 'local_fallback', 1)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, NULL, ?, 'native_only', 1)""",
                     (
                         device_id,
                         row["site_id"],
@@ -401,7 +457,9 @@ class SQLiteStore:
                         row["vendor"] or "",
                         "",
                         row["id"],
-                        json.dumps(DeviceCapabilities(live_video=True, profiles=("RTSP/RTP",)).as_dict()),
+                        json.dumps(
+                            DeviceCapabilities(live_video=True, profiles=("RTSP/RTP",)).as_dict()
+                        ),
                     ),
                 )
                 connection.execute(
@@ -415,14 +473,92 @@ class SQLiteStore:
             connection.execute(
                 "CREATE VIEW camera AS SELECT id, area_id, name, vendor, address, enabled, device_id, channel_id FROM camera_device"
             )
-            connection.execute("CREATE INDEX IF NOT EXISTS ix_camera_device ON camera_device(device_id)")
-            connection.execute("CREATE INDEX IF NOT EXISTS ix_stream_device ON video_stream(device_id)")
-            connection.execute("CREATE INDEX IF NOT EXISTS ix_event_stream_time ON event(stream_id, occurred_at)")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_camera_device ON camera_device(device_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_stream_device ON video_stream(device_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_event_stream_time ON event(stream_id, occurred_at)"
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS ix_event_entity_time ON event(site_id, area_id, camera_id, occurred_at)"
             )
-            connection.execute("CREATE INDEX IF NOT EXISTS ix_event_correlation ON event(correlation_key, occurred_at)")
-            connection.execute("CREATE INDEX IF NOT EXISTS ix_event_source_event ON event(source, source_event_id)")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_event_correlation ON event(correlation_key, occurred_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_event_source_event ON event(source, source_event_id)"
+            )
+
+    def referenced_credential_refs(self) -> tuple[str, ...]:
+        """Return credential references still used by a physical device."""
+        connection = self._connection_or_raise()
+        rows = connection.execute(
+            "SELECT DISTINCT credential_ref FROM video_device"
+            " WHERE credential_ref IS NOT NULL AND credential_ref != ''"
+        )
+        return tuple(sorted({str(row[0]) for row in rows if row[0]}))
+
+    def prune_history(
+        self,
+        *,
+        retention_days: float,
+        now: datetime | None = None,
+        actor: str = "retention",
+    ) -> dict[str, int]:
+        """Remove expired device events, audit rows and delivered outbox entries.
+
+        Incidents and their notification history are kept because operators
+        rely on them for reporting.  Only the raw device event stream and the
+        audit trail are trimmed so a long-running installation does not grow
+        without bound.
+        """
+        if not isfinite(retention_days) or retention_days < 0:
+            raise ValueError("retention_days must be finite and non-negative")
+        if not actor.strip():
+            raise ValueError("retention actor is required")
+        reference = now or datetime.now(UTC)
+        if reference.tzinfo is None:
+            raise ValueError("retention reference time must be timezone-aware")
+        cutoff = (reference - timedelta(days=retention_days)).isoformat()
+        connection = self._connection_or_raise()
+        with connection:
+            outbox = connection.execute(
+                "DELETE FROM notification_outbox WHERE status = 'sent' AND sent_at IS NOT NULL"
+                " AND sent_at < ?",
+                (cutoff,),
+            ).rowcount
+            events = connection.execute(
+                "DELETE FROM event WHERE occurred_at < ?"
+                " AND id NOT IN (SELECT event_id FROM notification_outbox)",
+                (cutoff,),
+            ).rowcount
+            audit = connection.execute(
+                "DELETE FROM audit_log WHERE ts < ?",
+                (cutoff,),
+            ).rowcount
+            # Chat history is a working buffer, not a business record, so it
+            # follows the same retention window as the audit trail.
+            assistant = connection.execute(
+                "DELETE FROM assistant_message WHERE created_at < ?",
+                (cutoff,),
+            ).rowcount
+        return {
+            "outbox": max(int(outbox), 0),
+            "events": max(int(events), 0),
+            "audit": max(int(audit), 0),
+            "assistant": max(int(assistant), 0),
+        }
+
+    def checkpoint_wal(self) -> None:
+        """Fold the write-ahead log back into the database file."""
+        connection = self._connection_or_raise()
+        try:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
 
     def close(self) -> None:
         if self._connection is not None:
@@ -449,6 +585,262 @@ class SQLiteStore:
             for stream in topology.streams:
                 self._upsert_stream(connection, stream)
 
+    def save_camera_bundle(
+        self,
+        device: VideoDevice,
+        camera: CameraDevice,
+        stream: VideoStream | None = None,
+        *,
+        actor: str = "system",
+    ) -> None:
+        """Persist a camera bundle atomically while retaining topology audit."""
+        if not actor.strip():
+            raise ValueError("camera bundle actor is required")
+        if camera.device_id != device.id:
+            raise ValueError("camera bundle device_id must match the physical device")
+        if camera.area_id != device.area_id:
+            raise ValueError("camera bundle area_id must match the physical device")
+        if stream is not None:
+            if stream.camera_id != camera.id:
+                raise ValueError("camera bundle stream camera_id must match the camera")
+            if stream.device_id not in (None, device.id):
+                raise ValueError("camera bundle stream device_id must match the physical device")
+        now = datetime.now(UTC).isoformat()
+        connection = self._connection_or_raise()
+        entries = [
+            (
+                "topology.device.updated",
+                device.id,
+                {
+                    "site_id": device.site_id,
+                    "area_id": device.area_id,
+                    "protocol": str(device.protocol),
+                    "endpoint": _redact_url(device.endpoint),
+                    "capabilities": device.capabilities.as_dict(),
+                    "analysis_policy": str(device.analysis_policy),
+                    "enabled": device.enabled,
+                    "health_status": device.health_status,
+                    "last_probe_at": device.last_probe_at,
+                    "last_ok_at": device.last_ok_at,
+                },
+            ),
+            (
+                "topology.camera.updated",
+                camera.id,
+                {
+                    "area_id": camera.area_id,
+                    "name": camera.name,
+                    "vendor": camera.vendor,
+                    "address": _redact_url(camera.address),
+                    "enabled": camera.enabled,
+                },
+            ),
+        ]
+        if stream is not None:
+            entries.append(
+                (
+                    "topology.stream.updated",
+                    stream.id,
+                    {
+                        "camera_id": stream.camera_id,
+                        "name": stream.name,
+                        "url": _redact_url(stream.url),
+                        "role": str(stream.role),
+                        "width": stream.width,
+                        "height": stream.height,
+                        "fps": stream.fps,
+                        "enabled": bool(stream.enabled),
+                    },
+                )
+            )
+        with connection:
+            self._upsert_device(connection, device)
+            self._upsert_camera(connection, camera)
+            if stream is not None:
+                self._upsert_stream(connection, stream)
+            for action, resource, detail in entries:
+                connection.execute(
+                    """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
+                       VALUES (?, ?, ?, 'success', ?, ?)""",
+                    (
+                        actor,
+                        action,
+                        resource,
+                        now,
+                        json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+
+    def save_device_camera_batch(
+        self,
+        devices: Sequence[VideoDevice],
+        cameras: Sequence[CameraDevice],
+        *,
+        actor: str = "system",
+    ) -> None:
+        """Persist shared-device camera imports as one all-or-nothing batch."""
+        if not actor.strip():
+            raise ValueError("camera import actor is required")
+        device_list = tuple(devices)
+        camera_list = tuple(cameras)
+        if not device_list and not camera_list:
+            return
+        device_by_id = {device.id: device for device in device_list}
+        if len(device_by_id) != len(device_list):
+            raise ValueError("camera import device ids must be unique")
+        camera_by_id = {camera.id: camera for camera in camera_list}
+        if len(camera_by_id) != len(camera_list):
+            raise ValueError("camera import camera ids must be unique")
+        connection = self._connection_or_raise()
+        device_refs: dict[str, tuple[str, str]] = {
+            device.id: (device.site_id, device.area_id) for device in device_list
+        }
+        for camera in camera_list:
+            refs = device_refs.get(camera.device_id)
+            if refs is None:
+                row = connection.execute(
+                    "SELECT site_id, area_id FROM video_device WHERE id = ?",
+                    (camera.device_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("camera import references an unknown physical device")
+                refs = (str(row["site_id"]), str(row["area_id"]))
+                device_refs[camera.device_id] = refs
+            site_id, area_id = refs
+            area = connection.execute(
+                "SELECT site_id FROM area WHERE id = ?",
+                (camera.area_id,),
+            ).fetchone()
+            if area is None:
+                raise ValueError("camera import references an unknown area")
+            if str(area["site_id"]) != site_id:
+                raise ValueError("camera import device and area must belong to the same site")
+            if camera.area_id != area_id:
+                raise ValueError("camera import area_id must match the physical device")
+        now = datetime.now(UTC).isoformat()
+        with connection:
+            for device in device_list:
+                self._upsert_device(connection, device)
+            for camera in camera_list:
+                self._upsert_camera(connection, camera)
+            for device in device_list:
+                self._insert_topology_audit(
+                    connection,
+                    actor=actor,
+                    action="topology.device.updated",
+                    resource=device.id,
+                    now=now,
+                    detail={
+                        "site_id": device.site_id,
+                        "area_id": device.area_id,
+                        "protocol": str(device.protocol),
+                        "endpoint": _redact_url(device.endpoint),
+                        "capabilities": device.capabilities.as_dict(),
+                        "analysis_policy": str(device.analysis_policy),
+                        "enabled": device.enabled,
+                        "health_status": device.health_status,
+                        "last_probe_at": device.last_probe_at,
+                        "last_ok_at": device.last_ok_at,
+                    },
+                )
+            for camera in camera_list:
+                self._insert_topology_audit(
+                    connection,
+                    actor=actor,
+                    action="topology.camera.updated",
+                    resource=camera.id,
+                    now=now,
+                    detail={
+                        "area_id": camera.area_id,
+                        "name": camera.name,
+                        "vendor": camera.vendor,
+                        "address": _redact_url(camera.address),
+                        "enabled": camera.enabled,
+                        "device_id": camera.device_id,
+                        "channel_id": camera.channel_id,
+                    },
+                )
+
+    @staticmethod
+    def _insert_topology_audit(
+        connection: sqlite3.Connection,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        now: str,
+        detail: Mapping[str, object],
+    ) -> None:
+        connection.execute(
+            """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
+               VALUES (?, ?, ?, 'success', ?, ?)""",
+            (
+                actor,
+                action,
+                resource,
+                now,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+
+    def save_area_bundle(self, site: Site, area: Area, *, actor: str = "system") -> None:
+        """Persist a site and area atomically with topology audit."""
+        if not actor.strip():
+            raise ValueError("area bundle actor is required")
+        if area.site_id != site.id:
+            raise ValueError("area bundle site_id must match the site")
+        if area.parent_id == area.id:
+            raise ValueError("area cannot be its own parent")
+        connection = self._connection_or_raise()
+        duplicate = connection.execute(
+            "SELECT id FROM area WHERE site_id = ? AND lower(name) = lower(?) AND id != ?",
+            (area.site_id, area.name, area.id),
+        ).fetchone()
+        if duplicate is not None:
+            raise ValueError("area name must be unique within the same site")
+        if area.parent_id:
+            parent = connection.execute(
+                "SELECT site_id FROM area WHERE id = ?", (area.parent_id,)
+            ).fetchone()
+            if parent is None:
+                raise ValueError("area bundle references an unknown parent area")
+            if str(parent["site_id"]) != site.id:
+                raise ValueError("area bundle parent must belong to the same site")
+        now = datetime.now(UTC).isoformat()
+        entries = [
+            (
+                "topology.site.updated",
+                site.id,
+                {"name": site.name, "description": site.description, "enabled": site.enabled},
+            ),
+            (
+                "topology.area.updated",
+                area.id,
+                {
+                    "site_id": area.site_id,
+                    "parent_id": area.parent_id,
+                    "name": area.name,
+                    "geometry_points": len(area.geometry),
+                    "enabled": area.enabled,
+                },
+            ),
+        ]
+        with connection:
+            self._upsert_site(connection, site)
+            self._upsert_area(connection, area)
+            for action, resource, detail in entries:
+                connection.execute(
+                    """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
+                       VALUES (?, ?, ?, 'success', ?, ?)""",
+                    (
+                        actor,
+                        action,
+                        resource,
+                        now,
+                        json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+
     def save_site(self, site: Site, *, actor: str = "system") -> None:
         self._save_topology_entity(
             kind="site",
@@ -457,6 +849,40 @@ class SQLiteStore:
             detail={"name": site.name, "description": site.description, "enabled": site.enabled},
             upsert=lambda connection: self._upsert_site(connection, site),
         )
+
+    def delete_site(self, site_id: str, *, actor: str = "system") -> bool:
+        """Delete an empty site; sites that still hold areas are rejected."""
+        if not actor.strip():
+            raise ValueError("site actor is required")
+        if not site_id:
+            raise ValueError("site id is required")
+        connection = self._connection_or_raise()
+        now = datetime.now(UTC).isoformat()
+        with connection:
+            site = connection.execute(
+                "SELECT id, name FROM site WHERE id = ?",
+                (site_id,),
+            ).fetchone()
+            if site is None:
+                return False
+            blocked = connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM area WHERE site_id = ?)",
+                (site_id,),
+            ).fetchone()[0]
+            if blocked:
+                raise ValueError("该场所下仍有区域，请先移除区域后再删除")
+            connection.execute("DELETE FROM site WHERE id = ?", (site_id,))
+            connection.execute(
+                """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
+                   VALUES (?, 'topology.site.deleted', ?, 'success', ?, ?)""",
+                (
+                    actor,
+                    site_id,
+                    now,
+                    json.dumps({"name": str(site["name"])}, ensure_ascii=False),
+                ),
+            )
+        return True
 
     def save_area(self, area: Area, *, actor: str = "system") -> None:
         self._save_topology_entity(
@@ -519,7 +945,7 @@ class SQLiteStore:
             raise ValueError("stream actor is required")
         connection = self._connection_or_raise()
         previous = connection.execute(
-            "SELECT camera_id, name, url, role, width, height, fps, model, confidence, enabled "
+            "SELECT camera_id, name, url, role, width, height, fps, enabled "
             "FROM video_stream WHERE id = ?",
             (stream.id,),
         ).fetchone()
@@ -531,8 +957,6 @@ class SQLiteStore:
             "width": stream.width,
             "height": stream.height,
             "fps": stream.fps,
-            "model": stream.model,
-            "confidence": stream.confidence,
             "enabled": bool(stream.enabled),
         }
         if previous is None:
@@ -559,11 +983,14 @@ class SQLiteStore:
                 (actor, stream.id, now, detail),
             )
 
-    def set_entity_enabled(self, kind: str, entity_id: str, enabled: bool, *, actor: str = "system") -> bool:
+    def set_entity_enabled(
+        self, kind: str, entity_id: str, enabled: bool, *, actor: str = "system"
+    ) -> bool:
         """Enable or disable one topology entity without deleting it."""
         tables = {
             "site": "site",
             "area": "area",
+            "device": "video_device",
             "camera": "camera_device",
             "stream": "video_stream",
         }
@@ -584,7 +1011,202 @@ class SQLiteStore:
             connection.execute(
                 """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
                    VALUES (?, 'topology.enabled.changed', ?, 'success', ?, ?)""",
-                (actor, entity_id, datetime.now(UTC).isoformat(), f"kind={kind}; enabled={int(enabled)}"),
+                (
+                    actor,
+                    entity_id,
+                    datetime.now(UTC).isoformat(),
+                    f"kind={kind}; enabled={int(enabled)}",
+                ),
+            )
+        return True
+
+    def set_camera_enabled(self, camera_id: str, enabled: bool, *, actor: str = "system") -> bool:
+        """Pause or resume one camera/channel without deleting its history.
+
+        A physical device is disabled only when none of its channels remain
+        enabled, so other channels on a shared NVR/camera keep subscribing.
+        """
+        if not camera_id.strip():
+            raise ValueError("camera id is required")
+        if not actor.strip():
+            raise ValueError("camera actor is required")
+        connection = self._connection_or_raise()
+        now = datetime.now(UTC).isoformat()
+        with connection:
+            camera = connection.execute(
+                "SELECT id, device_id FROM camera_device WHERE id = ?",
+                (camera_id,),
+            ).fetchone()
+            if camera is None:
+                raise KeyError(f"camera not found: {camera_id}")
+            device_id = str(camera["device_id"]) if camera["device_id"] else ""
+            connection.execute(
+                "UPDATE camera_device SET enabled = ? WHERE id = ?",
+                (int(enabled), camera_id),
+            )
+            device_enabled: bool | None = None
+            if device_id:
+                if enabled:
+                    connection.execute(
+                        "UPDATE video_device SET enabled = 1 WHERE id = ?", (device_id,)
+                    )
+                    device_enabled = True
+                else:
+                    other_enabled = connection.execute(
+                        """SELECT 1 FROM camera_device
+                           WHERE device_id = ? AND id != ? AND enabled = 1 LIMIT 1""",
+                        (device_id, camera_id),
+                    ).fetchone()
+                    if other_enabled is None:
+                        connection.execute(
+                            "UPDATE video_device SET enabled = 0 WHERE id = ?", (device_id,)
+                        )
+                        device_enabled = False
+                    else:
+                        device_enabled = True
+            connection.execute(
+                """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
+                   VALUES (?, 'topology.camera.enabled', ?, 'success', ?, ?)""",
+                (
+                    actor,
+                    camera_id,
+                    now,
+                    json.dumps(
+                        {
+                            "enabled": bool(enabled),
+                            "device_id": device_id or None,
+                            "device_enabled": device_enabled,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        return True
+
+    def delete_camera(self, camera_id: str, *, actor: str = "system") -> str | None:
+        """Delete one camera/channel and its streams while preserving event history.
+
+        The physical device is removed only when no other channel references it.
+        The returned credential reference, if any, can then be removed from the
+        external configuration store by the UI or caller.
+        """
+        if not actor.strip():
+            raise ValueError("camera actor is required")
+        if not camera_id:
+            raise ValueError("camera id is required")
+        connection = self._connection_or_raise()
+        now = datetime.now(UTC).isoformat()
+        with connection:
+            camera = connection.execute(
+                "SELECT id, name, device_id FROM camera_device WHERE id = ?",
+                (camera_id,),
+            ).fetchone()
+            if camera is None:
+                raise KeyError(f"camera not found: {camera_id}")
+            device_id = str(camera["device_id"]) if camera["device_id"] else ""
+            credential_ref: str | None = None
+            if device_id:
+                device = connection.execute(
+                    "SELECT credential_ref FROM video_device WHERE id = ?",
+                    (device_id,),
+                ).fetchone()
+                if device is not None and device["credential_ref"]:
+                    credential_ref = str(device["credential_ref"])
+            stream_ids = [
+                str(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM video_stream WHERE camera_id = ?",
+                    (camera_id,),
+                )
+            ]
+            if stream_ids:
+                placeholders = ",".join("?" for _ in stream_ids)
+                connection.execute(
+                    f"DELETE FROM stream_health WHERE stream_id IN ({placeholders})",
+                    stream_ids,
+                )
+                connection.execute(
+                    f"DELETE FROM stream_arming WHERE stream_id IN ({placeholders})",
+                    stream_ids,
+                )
+                connection.execute(
+                    f"DELETE FROM arming_schedule WHERE stream_id IN ({placeholders})",
+                    stream_ids,
+                )
+                connection.execute(
+                    f"DELETE FROM detection_rule WHERE stream_id IN ({placeholders})",
+                    stream_ids,
+                )
+            connection.execute("DELETE FROM video_stream WHERE camera_id = ?", (camera_id,))
+            connection.execute("DELETE FROM camera_device WHERE id = ?", (camera_id,))
+            removed_device = False
+            if device_id:
+                remaining = connection.execute(
+                    "SELECT 1 FROM camera_device WHERE device_id = ? LIMIT 1",
+                    (device_id,),
+                ).fetchone()
+                if remaining is None:
+                    connection.execute(
+                        "DELETE FROM device_subscription WHERE device_id = ?",
+                        (device_id,),
+                    )
+                    connection.execute(
+                        "DELETE FROM recording_index WHERE device_id = ?",
+                        (device_id,),
+                    )
+                    connection.execute("DELETE FROM video_device WHERE id = ?", (device_id,))
+                    removed_device = True
+            connection.execute(
+                """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
+                   VALUES (?, 'topology.camera.deleted', ?, 'success', ?, ?)""",
+                (
+                    actor,
+                    camera_id,
+                    now,
+                    json.dumps(
+                        {
+                            "name": str(camera["name"]),
+                            "device_id": device_id,
+                            "device_removed": removed_device,
+                            "streams_removed": len(stream_ids),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        return credential_ref if removed_device else None
+
+    def delete_area(self, area_id: str, *, actor: str = "system") -> bool:
+        """Delete an empty area; populated or nested areas are rejected."""
+        if not actor.strip():
+            raise ValueError("area actor is required")
+        if not area_id:
+            raise ValueError("area id is required")
+        connection = self._connection_or_raise()
+        now = datetime.now(UTC).isoformat()
+        with connection:
+            area = connection.execute(
+                "SELECT id, name FROM area WHERE id = ?",
+                (area_id,),
+            ).fetchone()
+            if area is None:
+                return False
+            blocked = connection.execute(
+                """SELECT
+                     EXISTS(SELECT 1 FROM camera_device WHERE area_id = ?)
+                     OR EXISTS(SELECT 1 FROM video_device WHERE area_id = ?)
+                     OR EXISTS(SELECT 1 FROM area WHERE parent_id = ?)""",
+                (area_id, area_id, area_id),
+            ).fetchone()[0]
+            if blocked:
+                raise ValueError("区域仍包含摄像头、设备或子区域，请先移除关联内容")
+            connection.execute("DELETE FROM area WHERE id = ?", (area_id,))
+            connection.execute(
+                """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
+                   VALUES (?, 'topology.area.deleted', ?, 'success', ?, ?)""",
+                (actor, area_id, now, json.dumps({"name": str(area["name"])}, ensure_ascii=False)),
             )
         return True
 
@@ -622,7 +1244,12 @@ class SQLiteStore:
         """Load and validate the site -> area -> device -> channel -> stream tree."""
         connection = self._connection_or_raise()
         sites = [
-            Site(str(row["id"]), str(row["name"]), str(row["description"] or ""), bool(row["enabled"]))
+            Site(
+                str(row["id"]),
+                str(row["name"]),
+                str(row["description"] or ""),
+                bool(row["enabled"]),
+            )
             for row in connection.execute("SELECT * FROM site ORDER BY rowid")
         ]
         areas = [
@@ -683,17 +1310,16 @@ class SQLiteStore:
                 width=int(row["width"]),
                 height=int(row["height"]),
                 fps=float(row["fps"]),
-                model=str(row["model"]) if row["model"] is not None else None,
-                confidence=float(row["confidence"]),
                 enabled=bool(row["enabled"]),
-                input_size=int(row["input_size"] if "input_size" in row.keys() else 640),
                 device_id=str(row["device_id"]) if row["device_id"] else None,
                 analysis_policy=str(row["analysis_policy"]) if row["analysis_policy"] else None,
                 native_event_codes=tuple(json.loads(row["native_event_codes"] or "[]")),
             )
             for row in connection.execute("SELECT * FROM video_stream ORDER BY rowid")
         ]
-        return EntityRegistry(sites=sites, areas=areas, devices=devices, cameras=cameras, streams=streams)
+        return EntityRegistry(
+            sites=sites, areas=areas, devices=devices, cameras=cameras, streams=streams
+        )
 
     def list_stream_paths(self) -> list[dict[str, object]]:
         """Return resolved entity paths for stream selectors and dashboards."""
@@ -712,7 +1338,8 @@ class SQLiteStore:
         """Persist one stream health transition and its recovery counters."""
         if not stream_id:
             raise ValueError("stream_id is required")
-        if not status.strip():
+        normalized_status = status.strip().lower()
+        if not normalized_status:
             raise ValueError("stream health status is required")
         if not actor.strip():
             raise ValueError("stream health actor is required")
@@ -723,10 +1350,12 @@ class SQLiteStore:
             (stream_id,),
         ).fetchone()
         reconnect_count = int(previous["reconnect_count"]) if previous is not None else 0
-        if status in {"degraded", "offline"} and (previous is None or str(previous["status"]) != status):
+        if normalized_status in {"degraded", "offline"} and (
+            previous is None or str(previous["status"]) != normalized_status
+        ):
             reconnect_count += 1
         last_ok_at = previous["last_ok_at"] if previous is not None else None
-        if status in {"ready", "running"}:
+        if normalized_status in {"ready", "running", "online", "healthy", "ok", "connected"}:
             last_ok_at = now
         safe_detail = _redact_url(str(detail))[-2000:]
         with connection:
@@ -737,13 +1366,13 @@ class SQLiteStore:
                    ON CONFLICT(stream_id) DO UPDATE SET status=excluded.status,
                      detail=excluded.detail, updated_at=excluded.updated_at,
                      last_ok_at=excluded.last_ok_at, reconnect_count=excluded.reconnect_count""",
-                (stream_id, status, safe_detail, now, last_ok_at, reconnect_count),
+                (stream_id, normalized_status, safe_detail, now, last_ok_at, reconnect_count),
             )
-            if previous is None or str(previous["status"]) != status:
+            if previous is None or str(previous["status"]) != normalized_status:
                 connection.execute(
                     """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
                        VALUES (?, 'stream.health.changed', ?, 'success', ?, ?)""",
-                    (actor, stream_id, now, f"status={status}; detail={safe_detail}"),
+                    (actor, stream_id, now, f"status={normalized_status}; detail={safe_detail}"),
                 )
 
     def list_stream_health(self) -> dict[str, dict[str, object]]:
@@ -756,7 +1385,9 @@ class SQLiteStore:
                 "last_ok_at": str(row["last_ok_at"]) if row["last_ok_at"] else None,
                 "reconnect_count": int(row["reconnect_count"]),
             }
-            for row in self._connection_or_raise().execute("SELECT * FROM stream_health ORDER BY stream_id")
+            for row in self._connection_or_raise().execute(
+                "SELECT * FROM stream_health ORDER BY stream_id"
+            )
         }
 
     def save_rule(self, rule: Rule, *, actor: str = "system", note: str = "") -> None:
@@ -805,46 +1436,30 @@ class SQLiteStore:
         if published_only:
             clauses.append("publication_status = 'published'")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = connection.execute(f"SELECT * FROM detection_rule {where} ORDER BY rowid", values).fetchall()
+        rows = connection.execute(
+            f"SELECT * FROM detection_rule {where} ORDER BY rowid", values
+        ).fetchall()
         rules: list[Rule] = []
         for row in rows:
             rules.append(
                 Rule(
                     id=str(row["id"]),
+                    channel_id=str(row["stream_id"]),
                     stream_id=str(row["stream_id"]),
                     site_id=str(row["site_id"]) if row["site_id"] is not None else None,
                     area_id=str(row["area_id"]) if row["area_id"] is not None else None,
                     camera_id=str(row["camera_id"]) if row["camera_id"] is not None else None,
                     name=str(row["name"]),
-                    type=RuleType(str(row["type"])) if str(row["type"]) else None,
-                    geometry=tuple(tuple(point) for point in json.loads(row["geometry"])),
-                    target_labels=frozenset(json.loads(row["target_labels"])),
-                    min_confidence=float(row["min_confidence"]),
-                    min_box_height=float(row["min_box_height"]),
-                    confirm_frames=int(row["confirm_frames"]),
-                    cooldown_seconds=float(row["cooldown_seconds"]),
-                    direction=str(row["direction"]),
-                    condition=str(row["condition"] or ""),
-                    count_threshold=int(row["count_threshold"] or 0),
-                    window_seconds=float(row["window_seconds"] or 0.0),
-                    dwell_seconds=float(row["dwell_seconds"] or 0.0),
-                    actions=tuple(json.loads(row["actions"] or "[]")) or (
-                        "event",
-                        "snapshot",
-                        "clip",
-                        "notify",
-                    ),
+                    actions=tuple(json.loads(row["actions"] or "[]")) or ("event", "notify"),
                     http_action_url=str(row["http_action_url"] or ""),
                     http_action_timeout=float(row["http_action_timeout"] or 5.0),
                     ack_deadline_seconds=float(row["ack_deadline_seconds"] or 0.0),
                     escalation_level=str(row["escalation_level"] or ""),
-                    enabled=bool(row["enabled"]),
                     destination_ids=tuple(json.loads(row["destination_ids"] or "[]")),
                     assignees=tuple(json.loads(row["assignees"] or "[]")),
-                    condition_nodes=tuple(json.loads(row["condition_nodes"] or "[]")),
-                    trigger_mode=str(row["trigger_mode"] or "analysis"),
                     native_event_codes=tuple(json.loads(row["native_event_codes"] or "[]")),
                     dedup_window_seconds=float(row["dedup_window_seconds"] or 5.0),
+                    enabled=bool(row["enabled"]),
                     publication_status=str(row["publication_status"] or "published"),
                     version=int(row["version"]),
                 )
@@ -884,12 +1499,15 @@ class SQLiteStore:
         restored = replace(restored, version=next_version)
         self.save_rule(restored, actor=actor, note=f"restored from v{version}")
         return restored
+
     def _rule_by_id(self, rule_id: str) -> Rule | None:
         if not rule_id.strip():
             return None
         return next((rule for rule in self.load_rules() if rule.id == rule_id), None)
 
-    def submit_rule_for_review(self, rule_id: str, *, actor: str = "system", note: str = "") -> Rule:
+    def submit_rule_for_review(
+        self, rule_id: str, *, actor: str = "system", note: str = ""
+    ) -> Rule:
         if not rule_id.strip() or not actor.strip():
             raise ValueError("rule_id and actor are required")
         rule = self._rule_by_id(rule_id)
@@ -915,7 +1533,14 @@ class SQLiteStore:
                 """INSERT OR IGNORE INTO rule_review
                 (rule_id, version, actor, decision, note, ts)
                 VALUES (?, ?, ?, ?, ?, ?)""",
-                (rule.id, rule.version, actor, "approve", note.strip(), datetime.now(UTC).isoformat()),
+                (
+                    rule.id,
+                    rule.version,
+                    actor,
+                    "approve",
+                    note.strip(),
+                    datetime.now(UTC).isoformat(),
+                ),
             )
         approvers = self.rule_approval_actors(rule.id, rule.version)
         if len(approvers) >= 2:
@@ -938,7 +1563,14 @@ class SQLiteStore:
                 """INSERT OR IGNORE INTO rule_review
                 (rule_id, version, actor, decision, note, ts)
                 VALUES (?, ?, ?, ?, ?, ?)""",
-                (rule.id, rule.version, actor, "reject", note.strip(), datetime.now(UTC).isoformat()),
+                (
+                    rule.id,
+                    rule.version,
+                    actor,
+                    "reject",
+                    note.strip(),
+                    datetime.now(UTC).isoformat(),
+                ),
             )
         updated = replace(rule, publication_status="draft", version=rule.version + 1)
         self.save_rule(updated, actor=actor, note=note.strip() or "rejected; returned to draft")
@@ -977,7 +1609,6 @@ class SQLiteStore:
                 (rule_id, limit),
             )
         )
-
 
     def export_rule_template(self, rule_id: str) -> dict[str, Any]:
         """Export one rule as a portable template without retaining its ID."""
@@ -1064,16 +1695,20 @@ class SQLiteStore:
         """Return one stream's persisted arming state."""
         if not stream_id:
             raise ValueError("stream_id is required")
-        row = self._connection_or_raise().execute(
-            "SELECT armed FROM stream_arming WHERE stream_id = ?", (stream_id,)
-        ).fetchone()
+        row = (
+            self._connection_or_raise()
+            .execute("SELECT armed FROM stream_arming WHERE stream_id = ?", (stream_id,))
+            .fetchone()
+        )
         return bool(row["armed"]) if row is not None else default
 
     def list_stream_arming(self) -> dict[str, bool]:
         """Return all explicitly persisted stream arming states."""
         return {
             str(row["stream_id"]): bool(row["armed"])
-            for row in self._connection_or_raise().execute("SELECT stream_id, armed FROM stream_arming")
+            for row in self._connection_or_raise().execute(
+                "SELECT stream_id, armed FROM stream_arming"
+            )
         }
 
     def set_stream_armed(self, stream_id: str, armed: bool, *, actor: str = "system") -> None:
@@ -1130,15 +1765,22 @@ class SQLiteStore:
             connection.execute(
                 """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
                    VALUES (?, 'arming.schedule.changed', ?, 'success', ?, ?)""",
-                (actor, schedule.stream_id, now, json.dumps(payload, ensure_ascii=False, sort_keys=True)),
+                (
+                    actor,
+                    schedule.stream_id,
+                    now,
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                ),
             )
 
     def get_arming_schedule(self, stream_id: str) -> ArmingSchedule | None:
         if not stream_id:
             raise ValueError("stream_id is required")
-        row = self._connection_or_raise().execute(
-            "SELECT * FROM arming_schedule WHERE stream_id = ?", (stream_id,)
-        ).fetchone()
+        row = (
+            self._connection_or_raise()
+            .execute("SELECT * FROM arming_schedule WHERE stream_id = ?", (stream_id,))
+            .fetchone()
+        )
         if row is None:
             return None
         weekly = json.loads(row["weekly"])
@@ -1147,16 +1789,14 @@ class SQLiteStore:
         return ArmingSchedule(
             stream_id=str(row["stream_id"]),
             weekly=tuple(
-                tuple(
-                    TimeWindow(int(pair[0]), int(pair[1]))
-                    for pair in day
-                )
-                for day in weekly
+                tuple(TimeWindow(int(pair[0]), int(pair[1])) for pair in day) for day in weekly
             ),
             holidays=frozenset(str(item) for item in holidays),
             enabled=bool(row["enabled"]),
             default_armed=bool(row["default_armed"]),
-            override_armed=bool(row["override_armed"]) if row["override_armed"] is not None else None,
+            override_armed=bool(row["override_armed"])
+            if row["override_armed"] is not None
+            else None,
             override_until=datetime.fromisoformat(str(override_until)) if override_until else None,
             timezone=str(row["timezone"]),
         )
@@ -1175,7 +1815,6 @@ class SQLiteStore:
             stream["url"] = _redact_url(str(stream["url"]))
         for device in topology_payload.get("devices", []):
             device["endpoint"] = _redact_url(str(device["endpoint"]))
-        profiles, bindings = self.load_model_configuration()
         schedules: list[dict[str, Any]] = []
         schedule_stream_ids = set(self.list_stream_arming()) | {
             str(row["stream_id"])
@@ -1193,10 +1832,6 @@ class SQLiteStore:
             "rules": [_rule_to_dict(rule) for rule in self.load_rules()],
             "stream_arming": self.list_stream_arming(),
             "arming_schedules": schedules,
-            "models": {
-                "profiles": [profile.to_public_dict() for profile in profiles],
-                "bindings": [binding.to_public_dict() for binding in bindings],
-            },
         }
 
     def import_configuration(
@@ -1223,18 +1858,9 @@ class SQLiteStore:
         rules = [_rule_from_dict(item) for item in payload.get("rules", ())]
         if any(rule.stream_id not in streams for rule in rules):
             raise ValueError("configuration rule references an unknown stream")
-        model_payload = payload.get("models", {})
-        profiles = tuple(
-            ModelProfile.from_public_dict(dict(item))
-            for item in (model_payload.get("profiles", ()) if isinstance(model_payload, Mapping) else ())
-        )
-        bindings = tuple(
-            ModelBinding.from_public_dict(dict(item))
-            for item in (model_payload.get("bindings", ()) if isinstance(model_payload, Mapping) else ())
-        )
-        if any(binding.model_profile_id not in {profile.id for profile in profiles} for binding in bindings):
-            raise ValueError("configuration model binding references an unknown model")
-        schedules = [ArmingSchedule.from_dict(dict(item)) for item in payload.get("arming_schedules", ())]
+        schedules = [
+            ArmingSchedule.from_dict(dict(item)) for item in payload.get("arming_schedules", ())
+        ]
         if any(schedule.stream_id not in streams for schedule in schedules):
             raise ValueError("configuration schedule references an unknown stream")
         arming = {
@@ -1251,8 +1877,6 @@ class SQLiteStore:
                 connection.execute("DELETE FROM arming_schedule")
                 connection.execute("DELETE FROM stream_arming")
                 connection.execute("DELETE FROM detection_rule")
-                connection.execute("DELETE FROM model_binding")
-                connection.execute("DELETE FROM model_profile")
                 connection.execute("DELETE FROM video_stream")
                 connection.execute("DELETE FROM camera_device")
                 connection.execute("DELETE FROM video_device")
@@ -1268,10 +1892,6 @@ class SQLiteStore:
                 self._upsert_camera(connection, camera)
             for stream in topology.streams:
                 self._upsert_stream(connection, stream)
-            for profile in profiles:
-                self._upsert_model_profile(connection, profile)
-            for binding in bindings:
-                self._upsert_model_binding(connection, binding)
             for rule in rules:
                 self._upsert_rule(connection, rule)
             for stream_id, armed in arming.items():
@@ -1307,7 +1927,14 @@ class SQLiteStore:
                ON CONFLICT(id) DO UPDATE SET site_id=excluded.site_id, parent_id=excluded.parent_id,
                                              name=excluded.name, geometry=excluded.geometry,
                                              enabled=excluded.enabled""",
-            (area.id, area.site_id, area.parent_id, area.name, json.dumps(area.geometry), int(area.enabled)),
+            (
+                area.id,
+                area.site_id,
+                area.parent_id,
+                area.name,
+                json.dumps(area.geometry),
+                int(area.enabled),
+            ),
         )
 
     @staticmethod
@@ -1339,7 +1966,9 @@ class SQLiteStore:
                 device.serial_number,
                 device.device_id,
                 device.credentials_ref,
-                json.dumps(device.capabilities.as_dict(), ensure_ascii=False, separators=(",", ":")),
+                json.dumps(
+                    device.capabilities.as_dict(), ensure_ascii=False, separators=(",", ":")
+                ),
                 str(device.analysis_policy),
                 int(device.enabled),
                 device.last_probe_at,
@@ -1372,15 +2001,18 @@ class SQLiteStore:
     @staticmethod
     def _upsert_stream(connection: sqlite3.Connection, stream: VideoStream) -> None:
         connection.execute(
+            # Legacy schemas retain model/confidence/input_size as NOT NULL
+            # columns.  They are scrubbed with fixed compatibility values and
+            # are no longer part of the stream domain or user configuration.
             """INSERT INTO video_stream
                (id, camera_id, name, url, role, width, height, fps, model, confidence,
                 enabled, input_size, device_id, analysis_policy, native_event_codes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0.25, ?, 640, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET camera_id=excluded.camera_id, name=excluded.name,
                  url=excluded.url, role=excluded.role, width=excluded.width, height=excluded.height,
-                 fps=excluded.fps, model=excluded.model, confidence=excluded.confidence,
-                 enabled=excluded.enabled, input_size=excluded.input_size,
-                 device_id=excluded.device_id, analysis_policy=excluded.analysis_policy,
+                 fps=excluded.fps, model=NULL, confidence=0.25, enabled=excluded.enabled,
+                 input_size=640, device_id=excluded.device_id,
+                 analysis_policy=excluded.analysis_policy,
                  native_event_codes=excluded.native_event_codes""",
             (
                 stream.id,
@@ -1391,10 +2023,7 @@ class SQLiteStore:
                 stream.width,
                 stream.height,
                 stream.fps,
-                stream.model,
-                stream.confidence,
                 int(stream.enabled),
-                stream.input_size,
                 stream.device_id,
                 str(stream.analysis_policy) if stream.analysis_policy is not None else None,
                 json.dumps(list(stream.native_event_codes), separators=(",", ":")),
@@ -1447,18 +2076,18 @@ class SQLiteStore:
                 rule.area_id,
                 rule.camera_id,
                 rule.name,
-                str(rule.type.value) if rule.type is not None else "",
-                json.dumps(rule.geometry, separators=(",", ":")),
-                json.dumps(sorted(rule.target_labels), separators=(",", ":")),
-                rule.min_confidence,
-                rule.min_box_height,
-                rule.confirm_frames,
-                rule.cooldown_seconds,
-                rule.direction,
-                rule.condition,
-                rule.count_threshold,
-                rule.window_seconds,
-                rule.dwell_seconds,
+                "",
+                "[]",
+                "[]",
+                0.0,
+                0.0,
+                0,
+                0.0,
+                "",
+                "",
+                0,
+                0.0,
+                0.0,
                 json.dumps(list(rule.actions), separators=(",", ":")),
                 rule.http_action_url,
                 rule.http_action_timeout,
@@ -1466,8 +2095,8 @@ class SQLiteStore:
                 rule.escalation_level,
                 json.dumps(list(rule.destination_ids), separators=(",", ":")),
                 json.dumps(list(rule.assignees), separators=(",", ":")),
-                json.dumps(list(rule.condition_nodes), ensure_ascii=False, separators=(",", ":")),
-                str(rule.trigger_mode),
+                "[]",
+                "native_event",
                 json.dumps(list(rule.native_event_codes), separators=(",", ":")),
                 rule.dedup_window_seconds,
                 int(rule.enabled),
@@ -1517,7 +2146,11 @@ class SQLiteStore:
         locally configured adapters without duplicating the event record.
         """
         connection = self._connection_or_raise()
-        raw_channels = (channels,) if isinstance(channels, str) else (channels if channels is not None else (channel,))
+        raw_channels = (
+            (channels,)
+            if isinstance(channels, str)
+            else (channels if channels is not None else (channel,))
+        )
         normalized_channels: list[str] = []
         for value in raw_channels:
             normalized = str(value).strip().lower()
@@ -1551,7 +2184,6 @@ class SQLiteStore:
             "clip_uri": event.clip_uri,
             "clip_status": event.clip_status,
             "status": event.status.value,
-            "track": event.track,
             "device_id": event.device_id,
             "source": str(event.source),
             "source_event_id": event.source_event_id,
@@ -1567,7 +2199,12 @@ class SQLiteStore:
                    WHERE correlation_key = ? AND source != ?
                      AND ABS(julianday(occurred_at) - julianday(?)) * 86400 <= ?
                    LIMIT 1""",
-                (event.correlation_key, str(event.source), event.occurred_at.isoformat(), duplicate_window),
+                (
+                    event.correlation_key,
+                    str(event.source),
+                    event.occurred_at.isoformat(),
+                    duplicate_window,
+                ),
             ).fetchone()
             if cross_source is not None:
                 return False
@@ -1723,6 +2360,492 @@ class SQLiteStore:
             )
         )
 
+    def create_incident(self, incident: Incident, *, actor: str = "system") -> bool:
+        """Persist one operator-facing incident and its audit trail."""
+        if not isinstance(incident, Incident):
+            raise TypeError("incident must be an Incident")
+        if not actor.strip():
+            raise ValueError("incident actor is required")
+        connection = self._connection_or_raise()
+        with connection:
+            try:
+                connection.execute(
+                    """INSERT INTO incident(
+                           id, title, description, severity, status, site_id, area_id,
+                           camera_id, site_name_snapshot, area_name_snapshot,
+                           camera_name_snapshot,
+                           source, reporter, occurred_at, created_at,
+                           updated_at, ai_summary, metadata
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        incident.id,
+                        incident.title,
+                        incident.description,
+                        incident.severity.value,
+                        incident.status.value,
+                        incident.site_id,
+                        incident.area_id,
+                        incident.camera_id,
+                        incident.site_name_snapshot,
+                        incident.area_name_snapshot,
+                        incident.camera_name_snapshot,
+                        incident.source.value,
+                        incident.reporter,
+                        incident.occurred_at.astimezone(UTC).isoformat(),
+                        incident.created_at.astimezone(UTC).isoformat(),
+                        incident.updated_at.astimezone(UTC).isoformat(),
+                        incident.ai_summary,
+                        json.dumps(dict(incident.metadata), ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return False
+            connection.execute(
+                """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
+                   VALUES (?, 'incident.created', ?, 'success', ?, ?)""",
+                (
+                    actor,
+                    incident.id,
+                    datetime.now(UTC).isoformat(),
+                    f"severity={incident.severity.value}; status={incident.status.value}",
+                ),
+            )
+        return True
+
+    def list_incidents(
+        self,
+        *,
+        status: IncidentStatus | str | None = None,
+        severity: IncidentSeverity | str | None = None,
+        site_id: str | None = None,
+        area_id: str | None = None,
+        camera_id: str | None = None,
+        query: str = "",
+        limit: int = 500,
+    ) -> list[Incident]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("incident limit must be a positive integer")
+        clauses: list[str] = []
+        values: list[object] = []
+        for column, value in (
+            ("status", status),
+            ("severity", severity),
+            ("site_id", site_id),
+            ("area_id", area_id),
+            ("camera_id", camera_id),
+        ):
+            if value is None:
+                continue
+            normalized = (
+                value.value if isinstance(value, (IncidentStatus, IncidentSeverity)) else str(value)
+            )
+            clauses.append(f"{column} = ?")
+            values.append(normalized)
+        if query.strip():
+            clauses.append(
+                "(title LIKE ? OR description LIKE ? OR ai_summary LIKE ? OR id LIKE ?"
+                " OR reporter LIKE ? OR area_name_snapshot LIKE ? OR camera_name_snapshot LIKE ?"
+                " OR source LIKE ? OR severity LIKE ? OR status LIKE ?)"
+            )
+            pattern = f"%{query.strip()}%"
+            values.extend((pattern,) * 10)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        values.append(limit)
+        rows = self._connection_or_raise().execute(
+            f"SELECT * FROM incident {where} ORDER BY occurred_at DESC LIMIT ?", values
+        )
+        return [_incident_from_row(row) for row in rows]
+
+    def list_operational_incidents(self, *, recent_limit: int = 100) -> list[Incident]:
+        """Return every unresolved incident plus a bounded recent history."""
+        if isinstance(recent_limit, bool) or not isinstance(recent_limit, int) or recent_limit < 1:
+            raise ValueError("incident recent limit must be a positive integer")
+        rows = self._connection_or_raise().execute(
+            """SELECT * FROM incident
+               WHERE status IN ('open', 'acknowledged')
+                  OR id IN (
+                      SELECT id FROM incident
+                      ORDER BY occurred_at DESC
+                      LIMIT ?
+                  )
+               ORDER BY occurred_at DESC""",
+            (recent_limit,),
+        )
+        return [_incident_from_row(row) for row in rows]
+
+    def get_incident(self, incident_id: str) -> Incident | None:
+        if not incident_id.strip():
+            raise ValueError("incident_id is required")
+        row = (
+            self._connection_or_raise()
+            .execute("SELECT * FROM incident WHERE id = ?", (incident_id,))
+            .fetchone()
+        )
+        return _incident_from_row(row) if row is not None else None
+
+    def record_incident_notification(
+        self,
+        incident_id: str,
+        channel: str,
+        *,
+        success: bool,
+        detail: str = "",
+    ) -> None:
+        """Persist the latest delivery state for one incident/channel."""
+        if not incident_id.strip() or not channel.strip():
+            raise ValueError("incident_id and channel are required")
+        connection = self._connection_or_raise()
+        now = datetime.now(UTC).isoformat()
+        with connection:
+            incident = connection.execute(
+                "SELECT 1 FROM incident WHERE id = ?",
+                (incident_id,),
+            ).fetchone()
+            if incident is None:
+                raise KeyError(f"incident not found: {incident_id}")
+            connection.execute(
+                """INSERT INTO incident_notification_delivery(
+                       incident_id, channel, status, attempts, detail, created_at, updated_at
+                   ) VALUES (?, ?, ?, 1, ?, ?, ?)
+                   ON CONFLICT(incident_id, channel) DO UPDATE SET
+                     status=excluded.status,
+                     attempts=incident_notification_delivery.attempts + 1,
+                     detail=excluded.detail,
+                     updated_at=excluded.updated_at""",
+                (
+                    incident_id,
+                    channel.strip().lower(),
+                    "sent" if success else "failed",
+                    detail[:1000],
+                    now,
+                    now,
+                ),
+            )
+
+    def list_incident_notifications(self, incident_id: str) -> list[dict[str, Any]]:
+        if not incident_id.strip():
+            raise ValueError("incident_id is required")
+        return [
+            {
+                "channel": str(row["channel"]),
+                "status": str(row["status"]),
+                "attempts": int(row["attempts"]),
+                "detail": str(row["detail"]),
+                "updated_at": str(row["updated_at"]),
+            }
+            for row in self._connection_or_raise().execute(
+                """SELECT channel, status, attempts, detail, updated_at
+                   FROM incident_notification_delivery
+                   WHERE incident_id = ? ORDER BY id""",
+                (incident_id,),
+            )
+        ]
+
+    def failed_incident_notification_channels(self, incident_id: str) -> tuple[str, ...]:
+        return tuple(
+            item["channel"]
+            for item in self.list_incident_notifications(incident_id)
+            if item["status"] == "failed"
+        )
+
+    def incident_notification_retry_candidates(
+        self,
+        *,
+        max_attempts: int | None = None,
+        min_age_seconds: float = 60.0,
+        limit: int = 20,
+        backoff_seconds: float = 60.0,
+        max_backoff_seconds: float = 3600.0,
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """Return failed channels grouped by incident when their backoff elapsed.
+
+        A safety alert must not be dropped because the network was down for a
+        while, so the attempt limit is optional and the wait grows with the
+        number of failures.
+        """
+        if limit < 1 or min_age_seconds < 0:
+            raise ValueError("retry limits must be positive and min_age_seconds non-negative")
+        if max_attempts is not None and max_attempts < 1:
+            raise ValueError("max_attempts must be positive when provided")
+        if backoff_seconds <= 0 or max_backoff_seconds < backoff_seconds:
+            raise ValueError("retry backoff must be positive and not shrink")
+        now = datetime.now(UTC)
+        attempt_clause = "" if max_attempts is None else " AND attempts < ?"
+        parameters: list[object] = []
+        if max_attempts is not None:
+            parameters.append(max_attempts)
+        parameters.append(limit)
+        rows = self._connection_or_raise().execute(
+            """SELECT d.incident_id, d.channel, d.updated_at, d.attempts
+               FROM incident_notification_delivery AS d
+               JOIN incident AS i ON i.id = d.incident_id
+               WHERE d.status = 'failed'
+                 AND i.status IN ('open', 'acknowledged')"""
+            + attempt_clause
+            + """
+               ORDER BY d.updated_at, d.id LIMIT ?""",
+            parameters,
+        )
+        grouped: dict[str, list[str]] = {}
+        for row in rows:
+            try:
+                updated = datetime.fromisoformat(str(row["updated_at"]))
+            except ValueError:
+                updated = datetime.min.replace(tzinfo=UTC)
+            attempts = max(int(row["attempts"] or 0), 1)
+            wait = float(min_age_seconds) + min(
+                backoff_seconds * (2 ** (attempts - 1)) - backoff_seconds,
+                max_backoff_seconds,
+            )
+            if updated > now - timedelta(seconds=wait):
+                continue
+            grouped.setdefault(str(row["incident_id"]), []).append(str(row["channel"]))
+        return tuple((incident_id, tuple(channels)) for incident_id, channels in grouped.items())
+
+    def update_incident_status(
+        self,
+        incident_id: str,
+        status: IncidentStatus | str,
+        *,
+        actor: str = "operator",
+        note: str = "",
+    ) -> bool:
+        if not incident_id.strip():
+            raise ValueError("incident_id is required")
+        if not actor.strip():
+            raise ValueError("incident actor is required")
+        try:
+            normalized = (
+                status if isinstance(status, IncidentStatus) else IncidentStatus(str(status))
+            )
+        except ValueError as exc:
+            raise ValueError("incident status is invalid") from exc
+        connection = self._connection_or_raise()
+        row = connection.execute("SELECT * FROM incident WHERE id = ?", (incident_id,)).fetchone()
+        if row is None:
+            return False
+        current = IncidentStatus(str(row["status"]))
+        if normalized == current:
+            return False
+        if normalized not in ALLOWED_INCIDENT_STATUS_TRANSITIONS[current]:
+            raise ValueError(
+                f"险情状态不能从“{STATUS_LABELS[current]}”直接变更为“{STATUS_LABELS[normalized]}”；"
+                "已关闭险情请先重新打开"
+            )
+        now = datetime.now(UTC).isoformat()
+        with connection:
+            result = connection.execute(
+                "UPDATE incident SET status = ?, updated_at = ? WHERE id = ?",
+                (normalized.value, now, incident_id),
+            )
+            if result.rowcount != 1:
+                return False
+            connection.execute(
+                """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
+                   VALUES (?, 'incident.status.changed', ?, 'success', ?, ?)""",
+                (
+                    actor,
+                    incident_id,
+                    now,
+                    json.dumps({"status": normalized.value, "note": note}, ensure_ascii=False),
+                ),
+            )
+        return True
+
+    def assign_incident_location(
+        self,
+        incident_id: str,
+        *,
+        area_id: str | None = None,
+        camera_id: str | None = None,
+        actor: str = "operator",
+    ) -> bool:
+        """Attach an area and camera to an incident and refresh its snapshots.
+
+        Operators report incidents from the field, so the place is often
+        unknown at first and only becomes clear during the follow-up.  The
+        stored snapshot keeps the exported report pointing at the right
+        place even after the area is renamed later.
+        """
+        if not incident_id.strip():
+            raise ValueError("incident_id is required")
+        if not actor.strip():
+            raise ValueError("incident actor is required")
+        connection = self._connection_or_raise()
+        row = connection.execute("SELECT * FROM incident WHERE id = ?", (incident_id,)).fetchone()
+        if row is None:
+            return False
+        target_area = area_id if area_id is not None else str(row["area_id"] or "")
+        target_camera = camera_id if camera_id is not None else str(row["camera_id"] or "")
+        area_name = ""
+        site_id = str(row["site_id"] or "")
+        if target_area:
+            area_row = connection.execute(
+                "SELECT name, site_id FROM area WHERE id = ?", (target_area,)
+            ).fetchone()
+            if area_row is None:
+                raise ValueError(f"area {target_area!r} does not exist")
+            area_name = str(area_row["name"])
+            site_id = str(area_row["site_id"])
+        camera_name = ""
+        if target_camera:
+            camera_row = connection.execute(
+                "SELECT name, area_id FROM camera_device WHERE id = ?", (target_camera,)
+            ).fetchone()
+            if camera_row is None:
+                raise ValueError(f"camera {target_camera!r} does not exist")
+            camera_name = str(camera_row["name"])
+            camera_area = str(camera_row["area_id"])
+            if target_area and camera_area != target_area:
+                raise ValueError("摄像头不属于所选区域")
+            if not target_area:
+                target_area = camera_area
+                area_row = connection.execute(
+                    "SELECT name, site_id FROM area WHERE id = ?", (camera_area,)
+                ).fetchone()
+                if area_row is not None:
+                    area_name = str(area_row["name"])
+                    site_id = str(area_row["site_id"])
+        now = datetime.now(UTC).isoformat()
+        with connection:
+            result = connection.execute(
+                """UPDATE incident
+                   SET area_id = ?, camera_id = ?, site_id = ?,
+                       area_name_snapshot = ?, camera_name_snapshot = ?,
+                       updated_at = ?
+                   WHERE id = ?""",
+                (
+                    target_area or None,
+                    target_camera or None,
+                    site_id or None,
+                    area_name,
+                    camera_name,
+                    now,
+                    incident_id,
+                ),
+            )
+            if result.rowcount != 1:
+                return False
+            connection.execute(
+                """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
+                   VALUES (?, 'incident.location.changed', ?, 'success', ?, ?)""",
+                (
+                    actor,
+                    incident_id,
+                    now,
+                    json.dumps(
+                        {
+                            "area_id": target_area,
+                            "camera_id": target_camera,
+                            "area_name": area_name,
+                            "camera_name": camera_name,
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+        return True
+
+    def list_incident_audit(self, incident_id: str, *, limit: int = 20) -> list[dict[str, str]]:
+        """Return incident creation and status-change audit entries."""
+        if not incident_id.strip():
+            raise ValueError("incident_id is required")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("incident audit limit must be a positive integer")
+        rows = self._connection_or_raise().execute(
+            """SELECT actor, action, result, ts, detail
+               FROM audit_log
+               WHERE resource = ? AND action IN (?, ?, ?)
+               ORDER BY id DESC LIMIT ?""",
+            (
+                incident_id,
+                "incident.created",
+                "incident.status.changed",
+                "incident.location.changed",
+                limit,
+            ),
+        )
+        return [
+            {
+                "actor": str(row["actor"]),
+                "action": str(row["action"]),
+                "result": str(row["result"]),
+                "ts": str(row["ts"]),
+                "detail": str(row["detail"]),
+            }
+            for row in rows
+        ]
+
+    def append_assistant_message(
+        self,
+        conversation_id: str,
+        *,
+        role: str,
+        content: str,
+        provider: str = "offline",
+        citations: Sequence[str] = (),
+        conversation_title: str = "现场助手",
+    ) -> str:
+        if not conversation_id.strip():
+            raise ValueError("conversation_id is required")
+        normalized_role = str(role).strip().lower()
+        if normalized_role not in {"user", "assistant", "system"}:
+            raise ValueError("assistant message role is invalid")
+        if not str(content).strip():
+            raise ValueError("assistant message content is required")
+        now = datetime.now(UTC).isoformat()
+        message_id = f"msg-{uuid4().hex}"
+        connection = self._connection_or_raise()
+        with connection:
+            connection.execute(
+                """INSERT INTO assistant_conversation(id, title, created_at, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at""",
+                (conversation_id, conversation_title, now, now),
+            )
+            connection.execute(
+                """INSERT INTO assistant_message(
+                       id, conversation_id, role, content, provider, citations, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    message_id,
+                    conversation_id,
+                    normalized_role,
+                    str(content).strip(),
+                    str(provider).strip() or "offline",
+                    json.dumps(list(citations), ensure_ascii=False),
+                    now,
+                ),
+            )
+        return message_id
+
+    def list_assistant_messages(
+        self, conversation_id: str, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        if not conversation_id.strip():
+            raise ValueError("conversation_id is required")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("assistant message limit must be a positive integer")
+        rows = self._connection_or_raise().execute(
+            """SELECT * FROM assistant_message
+               WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?""",
+            (conversation_id, limit),
+        )
+        messages = []
+        for row in reversed(list(rows)):
+            messages.append(
+                {
+                    "id": str(row["id"]),
+                    "conversation_id": str(row["conversation_id"]),
+                    "role": str(row["role"]),
+                    "content": str(row["content"]),
+                    "provider": str(row["provider"]),
+                    "citations": json.loads(row["citations"] or "[]"),
+                    "created_at": str(row["created_at"]),
+                }
+            )
+        return messages
+
     def search_events(
         self,
         *,
@@ -1741,7 +2864,7 @@ class SQLiteStore:
 
         Search is deliberately kept at the storage boundary so the UI never
         interpolates user text into SQL.  The payload contains target labels,
-        track IDs and media paths, making it useful for a small local review
+        business metadata and media paths, making it useful for a small local review
         queue without another indexing service.
         """
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
@@ -1790,9 +2913,11 @@ class SQLiteStore:
     def get_event(self, event_id: str) -> sqlite3.Row | None:
         if not event_id:
             raise ValueError("event_id is required")
-        return self._connection_or_raise().execute(
-            "SELECT * FROM event WHERE id = ?", (event_id,)
-        ).fetchone()
+        return (
+            self._connection_or_raise()
+            .execute("SELECT * FROM event WHERE id = ?", (event_id,))
+            .fetchone()
+        )
 
     def update_event_media(
         self,
@@ -1852,6 +2977,7 @@ class SQLiteStore:
                 (actor, event_id, datetime.now(UTC).isoformat(), payload_json),
             )
         return True
+
     def clear_event_media(
         self,
         event_id: str,
@@ -1891,11 +3017,7 @@ class SQLiteStore:
         remaining_snapshot = bool(row["snapshot_uri"]) and not clear_snapshot
         remaining_clip = bool(row["clip_uri"]) and not clear_clip
         clip_status = (
-            "ready"
-            if remaining_clip
-            else "snapshot_only"
-            if remaining_snapshot
-            else "expired"
+            "ready" if remaining_clip else "snapshot_only" if remaining_snapshot else "expired"
         )
         assignments.append("clip_status = ?")
         values.append(clip_status)
@@ -1935,9 +3057,13 @@ class SQLiteStore:
         if not event_id:
             raise ValueError("event_id is required")
         try:
-            status_text = status.value if isinstance(status, EventStatus) else EventStatus(str(status)).value
+            status_text = (
+                status.value if isinstance(status, EventStatus) else EventStatus(str(status)).value
+            )
         except ValueError as exc:
-            raise ValueError("event status must be open, confirmed, false_positive, or closed") from exc
+            raise ValueError(
+                "event status must be open, confirmed, false_positive, or closed"
+            ) from exc
         if not actor.strip():
             raise ValueError("event actor is required")
         connection = self._connection_or_raise()
@@ -1957,7 +3083,13 @@ class SQLiteStore:
             connection.execute(
                 """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
                    VALUES (?, ?, ?, 'success', ?, ?)""",
-                (actor, f"event.status.{status_text}", event_id, datetime.now(UTC).isoformat(), detail),
+                (
+                    actor,
+                    f"event.status.{status_text}",
+                    event_id,
+                    datetime.now(UTC).isoformat(),
+                    detail,
+                ),
             )
         return True
 
@@ -2172,95 +3304,6 @@ class SQLiteStore:
             temporary.unlink(missing_ok=True)
         return target
 
-    def save_model_configuration(
-        self,
-        profiles: Sequence[ModelProfile],
-        bindings: Sequence[ModelBinding],
-        *,
-        actor: str = "system",
-    ) -> None:
-        """Persist local fallback models and their scope bindings."""
-        profile_ids = {profile.id for profile in profiles}
-        if any(binding.model_profile_id not in profile_ids for binding in bindings):
-            raise ValueError("model binding references an unknown model profile")
-        connection = self._connection_or_raise()
-        now = datetime.now(UTC).isoformat()
-        with connection:
-            connection.execute("DELETE FROM model_binding")
-            connection.execute("DELETE FROM model_profile")
-            for profile in profiles:
-                connection.execute(
-                    """INSERT INTO model_profile
-                       (id, name, task_type, backend, model_uri, input_width, input_height,
-                        labels, confidence, iou, version, enabled)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        profile.id,
-                        profile.name,
-                        profile.task_type,
-                        profile.backend,
-                        profile.model_uri,
-                        profile.input_width,
-                        profile.input_height,
-                        json.dumps(list(profile.labels), separators=(",", ":")),
-                        profile.confidence,
-                        profile.iou,
-                        profile.version,
-                        int(profile.enabled),
-                    ),
-                )
-            for binding in bindings:
-                connection.execute(
-                    """INSERT INTO model_binding
-                       (id, model_profile_id, scope_type, scope_id, priority, enabled)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        binding.id,
-                        binding.model_profile_id,
-                        binding.scope_type,
-                        binding.scope_id,
-                        binding.priority,
-                        int(binding.enabled),
-                    ),
-                )
-            connection.execute(
-                """INSERT INTO audit_log(actor, action, resource, result, ts, detail)
-                   VALUES (?, 'model.configuration.updated', 'local-fallback', 'success', ?, ?)""",
-                (actor, now, f"profiles={len(profiles)}; bindings={len(bindings)}"),
-            )
-
-    def load_model_configuration(self) -> tuple[tuple[ModelProfile, ...], tuple[ModelBinding, ...]]:
-        connection = self._connection_or_raise()
-        profiles = tuple(
-            ModelProfile(
-                id=str(row["id"]),
-                name=str(row["name"]),
-                task_type=str(row["task_type"]),
-                backend=str(row["backend"]),
-                model_uri=str(row["model_uri"]),
-                input_width=int(row["input_width"]),
-                input_height=int(row["input_height"]),
-                labels=tuple(json.loads(row["labels"] or "[]")),
-                confidence=float(row["confidence"]),
-                iou=float(row["iou"]),
-                version=str(row["version"]),
-                enabled=bool(row["enabled"]),
-            )
-            for row in connection.execute("SELECT * FROM model_profile ORDER BY rowid")
-        )
-        bindings = tuple(
-            ModelBinding(
-                id=str(row["id"]),
-                model_profile_id=str(row["model_profile_id"]),
-                scope_type=str(row["scope_type"]),
-                scope_id=str(row["scope_id"]),
-                priority=int(row["priority"]),
-                enabled=bool(row["enabled"]),
-            )
-            for row in connection.execute("SELECT * FROM model_binding ORDER BY priority DESC, rowid")
-        )
-        return profiles, bindings
-
     def save_device_credential(
         self,
         credential_ref: str,
@@ -2287,9 +3330,14 @@ class SQLiteStore:
             )
 
     def get_device_credential_blob(self, credential_ref: str) -> str | None:
-        row = self._connection_or_raise().execute(
-            "SELECT ciphertext FROM device_credential WHERE credential_ref = ?", (credential_ref,)
-        ).fetchone()
+        row = (
+            self._connection_or_raise()
+            .execute(
+                "SELECT ciphertext FROM device_credential WHERE credential_ref = ?",
+                (credential_ref,),
+            )
+            .fetchone()
+        )
         return str(row["ciphertext"]) if row else None
 
     def delete_device_credential(self, credential_ref: str, *, actor: str = "system") -> bool:
@@ -2429,44 +3477,12 @@ class SQLiteStore:
         if exclude_source:
             clauses.append("source != ?")
             values.append(exclude_source)
-        row = self._connection_or_raise().execute(
-            f"SELECT id FROM event WHERE {' AND '.join(clauses)} LIMIT 1", values
-        ).fetchone()
+        row = (
+            self._connection_or_raise()
+            .execute(f"SELECT id FROM event WHERE {' AND '.join(clauses)} LIMIT 1", values)
+            .fetchone()
+        )
         return row is not None
-
-    @staticmethod
-    def _upsert_model_profile(connection: sqlite3.Connection, profile: ModelProfile) -> None:
-        connection.execute(
-            """INSERT INTO model_profile
-               (id, name, task_type, backend, model_uri, input_width, input_height,
-                labels, confidence, iou, version, enabled)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET name=excluded.name, task_type=excluded.task_type,
-                 backend=excluded.backend, model_uri=excluded.model_uri,
-                 input_width=excluded.input_width, input_height=excluded.input_height,
-                 labels=excluded.labels, confidence=excluded.confidence, iou=excluded.iou,
-                 version=excluded.version, enabled=excluded.enabled""",
-            (
-                profile.id, profile.name, profile.task_type, profile.backend, profile.model_uri,
-                profile.input_width, profile.input_height, json.dumps(list(profile.labels), separators=(",", ":")),
-                profile.confidence, profile.iou, profile.version, int(profile.enabled),
-            ),
-        )
-
-    @staticmethod
-    def _upsert_model_binding(connection: sqlite3.Connection, binding: ModelBinding) -> None:
-        connection.execute(
-            """INSERT INTO model_binding
-               (id, model_profile_id, scope_type, scope_id, priority, enabled)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET model_profile_id=excluded.model_profile_id,
-                 scope_type=excluded.scope_type, scope_id=excluded.scope_id,
-                 priority=excluded.priority, enabled=excluded.enabled""",
-            (
-                binding.id, binding.model_profile_id, binding.scope_type, binding.scope_id,
-                binding.priority, int(binding.enabled),
-            ),
-        )
 
     def _connection_or_raise(self) -> sqlite3.Connection:
         if self._connection is None:
@@ -2495,22 +3511,13 @@ def _rule_to_dict(rule: Rule) -> dict[str, Any]:
     return {
         "id": rule.id,
         "stream_id": rule.stream_id,
+        "channel_id": rule.channel_id,
         "site_id": rule.site_id,
         "area_id": rule.area_id,
         "camera_id": rule.camera_id,
         "name": rule.name,
-        "type": rule.type.value if rule.type is not None else "",
-        "geometry": [list(point) for point in rule.geometry],
-        "target_labels": sorted(rule.target_labels),
-        "min_confidence": rule.min_confidence,
-        "min_box_height": rule.min_box_height,
-        "confirm_frames": rule.confirm_frames,
-        "cooldown_seconds": rule.cooldown_seconds,
-        "direction": rule.direction,
-        "condition": rule.condition,
-        "count_threshold": rule.count_threshold,
-        "window_seconds": rule.window_seconds,
-        "dwell_seconds": rule.dwell_seconds,
+        "native_event_codes": list(rule.native_event_codes),
+        "dedup_window_seconds": rule.dedup_window_seconds,
         "actions": list(rule.actions),
         "http_action_url": rule.http_action_url,
         "http_action_timeout": rule.http_action_timeout,
@@ -2518,10 +3525,6 @@ def _rule_to_dict(rule: Rule) -> dict[str, Any]:
         "escalation_level": rule.escalation_level,
         "destination_ids": list(rule.destination_ids),
         "assignees": list(rule.assignees),
-        "condition_nodes": list(rule.condition_nodes),
-        "trigger_mode": str(rule.trigger_mode),
-        "native_event_codes": list(rule.native_event_codes),
-        "dedup_window_seconds": rule.dedup_window_seconds,
         "enabled": rule.enabled,
         "publication_status": rule.publication_status,
         "version": rule.version,
@@ -2533,37 +3536,51 @@ def _rule_from_dict(value: Mapping[str, Any]) -> Rule:
         raise TypeError("configuration rule must be a mapping")
     return Rule(
         id=str(value["id"]),
+        channel_id=str(value.get("channel_id") or value.get("stream_id") or ""),
         stream_id=str(value.get("stream_id") or value.get("channel_id") or ""),
         site_id=str(value["site_id"]) if value.get("site_id") is not None else None,
         area_id=str(value["area_id"]) if value.get("area_id") is not None else None,
         camera_id=str(value["camera_id"]) if value.get("camera_id") is not None else None,
         name=str(value.get("name", "")),
-        type=RuleType(str(value["type"])) if value.get("type") else None,
-        geometry=tuple((float(point[0]), float(point[1])) for point in value["geometry"]),
-        target_labels=frozenset(str(label) for label in value.get("target_labels", ("person",))),
-        min_confidence=float(value.get("min_confidence", 0.45)),
-        min_box_height=float(value.get("min_box_height", 32.0)),
-        confirm_frames=int(value.get("confirm_frames", 3)),
-        cooldown_seconds=float(value.get("cooldown_seconds", 60.0)),
-        direction=str(value.get("direction", "both")),
-        condition=str(value.get("condition", "")),
-        count_threshold=int(value.get("count_threshold", 0)),
-        window_seconds=float(value.get("window_seconds", 0.0)),
-        dwell_seconds=float(value.get("dwell_seconds", 0.0)),
-        actions=tuple(value.get("actions", ("event", "snapshot", "clip", "notify"))),
+        actions=tuple(value.get("actions", ("event", "notify"))),
         http_action_url=str(value.get("http_action_url", "")),
         http_action_timeout=float(value.get("http_action_timeout", 5.0)),
         ack_deadline_seconds=float(value.get("ack_deadline_seconds", 0.0)),
         escalation_level=str(value.get("escalation_level", "")),
         destination_ids=tuple(str(item) for item in value.get("destination_ids", ())),
         assignees=tuple(str(item) for item in value.get("assignees", ())),
-        condition_nodes=tuple(dict(item) for item in value.get("condition_nodes", ())),
-        trigger_mode=str(value.get("trigger_mode", "analysis")),
         native_event_codes=tuple(str(item) for item in value.get("native_event_codes", ())),
         dedup_window_seconds=float(value.get("dedup_window_seconds", 5.0)),
         enabled=bool(value.get("enabled", True)),
         publication_status=str(value.get("publication_status", "published")),
         version=int(value.get("version", 1)),
+    )
+
+
+def _incident_from_row(row: sqlite3.Row) -> Incident:
+    try:
+        metadata = json.loads(row["metadata"] or "{}")
+    except json.JSONDecodeError:
+        metadata = {}
+    return Incident(
+        id=str(row["id"]),
+        title=str(row["title"]),
+        description=str(row["description"] or ""),
+        severity=IncidentSeverity(str(row["severity"])),
+        status=IncidentStatus(str(row["status"])),
+        site_id=str(row["site_id"]) if row["site_id"] else None,
+        area_id=str(row["area_id"]) if row["area_id"] else None,
+        camera_id=str(row["camera_id"]) if row["camera_id"] else None,
+        site_name_snapshot=str(row["site_name_snapshot"] or ""),
+        area_name_snapshot=str(row["area_name_snapshot"] or ""),
+        camera_name_snapshot=str(row["camera_name_snapshot"] or ""),
+        source=IncidentSource(str(row["source"])),
+        reporter=str(row["reporter"] or ""),
+        occurred_at=_parse_timestamp(str(row["occurred_at"])),
+        created_at=_parse_timestamp(str(row["created_at"])),
+        updated_at=_parse_timestamp(str(row["updated_at"])),
+        ai_summary=str(row["ai_summary"] or ""),
+        metadata=metadata if isinstance(metadata, Mapping) else {},
     )
 
 

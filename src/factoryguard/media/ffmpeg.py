@@ -4,16 +4,25 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 
 
 def _creation_flags() -> int:
-    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0
+    """Return the Windows creation flags used for every FFmpeg child."""
+    if os.name != "nt":
+        return 0
+    # A dedicated process group lets the console stop FFmpeg together with
+    # the helper processes FFmpeg starts.
+    return int(
+        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,28 +64,34 @@ class FFmpegInstallation:
             filters.insert(0, f"scale={width}:{height}")
         command = [str(self.executable), "-hide_banner", "-loglevel", "warning"]
         if url.lower().startswith(("rtsp://", "rtsps://")):
-            command.extend([
-                "-rtsp_transport",
-                "tcp",
-                "-timeout",
-                str(max(1, round(read_timeout * 1_000_000))),
-            ])
-        command.extend([
-            "-i",
-            url,
-            "-an",
-            "-vf",
-            ",".join(filters),
-        ])
+            command.extend(
+                [
+                    "-rtsp_transport",
+                    "tcp",
+                    "-timeout",
+                    str(max(1, round(read_timeout * 1_000_000))),
+                ]
+            )
+        command.extend(
+            [
+                "-i",
+                url,
+                "-an",
+                "-vf",
+                ",".join(filters),
+            ]
+        )
         if frames is not None:
             command.extend(["-frames:v", str(frames)])
-        command.extend([
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgr24",
-            "pipe:1",
-        ])
+        command.extend(
+            [
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "bgr24",
+                "pipe:1",
+            ]
+        )
         return command
 
     def command_for_rtsp(
@@ -123,8 +138,7 @@ class FFmpegInstallation:
         try:
             completed = subprocess.run(
                 command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 timeout=timeout,
                 check=False,
                 shell=False,
@@ -182,17 +196,19 @@ class FFmpegInstallation:
         ]
         if frames is not None:
             command.extend(["-frames:v", str(frames)])
-        command.extend([
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            str(destination),
-        ])
+        command.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(destination),
+            ]
+        )
         return command
 
 
@@ -229,8 +245,7 @@ def encode_raw_clip(
         completed = subprocess.run(
             command,
             input=b"".join(packed),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=timeout,
             check=False,
             shell=False,
@@ -289,8 +304,7 @@ def encode_raw_image(
         completed = subprocess.run(
             command,
             input=payload,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=timeout,
             check=False,
             shell=False,
@@ -305,6 +319,32 @@ def encode_raw_image(
         raise RuntimeError(f"FFmpeg image encoding failed ({completed.returncode}): {detail}")
     return str(destination)
 
+
+def _runtime_roots() -> list[Path]:
+    """Return every directory that may hold the bundled FFmpeg tree.
+
+    In a normal checkout the toolchain sits under ``src/third_party``.  A
+    PyInstaller one-directory build copies it into ``sys._MEIPASS`` (the
+    ``_internal`` folder), and an operator may also drop a bundle next to the
+    executable, so all three locations are checked.
+    """
+    roots: list[Path] = []
+    bundle = getattr(sys, "_MEIPASS", None)
+    if bundle:
+        roots.append(Path(bundle))
+    if getattr(sys, "frozen", False):
+        try:
+            roots.append(Path(sys.executable).resolve().parent)
+        except (OSError, TypeError, ValueError):
+            pass
+    roots.append(Path(__file__).resolve().parents[3])
+    unique: list[Path] = []
+    for root in roots:
+        if root not in unique:
+            unique.append(root)
+    return unique
+
+
 def find_ffmpeg(explicit: str | os.PathLike[str] | None = None) -> FFmpegInstallation | None:
     """Find the supplied bundle, an explicit path, or a PATH executable."""
     candidates: list[Path] = []
@@ -313,12 +353,13 @@ def find_ffmpeg(explicit: str | os.PathLike[str] | None = None) -> FFmpegInstall
     configured = os.environ.get("FACTORYGUARD_FFMPEG")
     if configured:
         candidates.append(Path(configured))
-    repository_root = Path(__file__).resolve().parents[3]
-    # The bundled toolchain lives under ``src`` so a source checkout and a
-    # packaged application use the same relative layout.  Keep the old root
-    # location as a compatibility fallback for existing installations.
-    candidates.extend(sorted((repository_root / "src" / "third_party").glob("ffmpeg-*/bin/ffmpeg.exe")))
-    candidates.extend(sorted(repository_root.glob("ffmpeg-*/bin/ffmpeg.exe")))
+    # The bundled toolchain lives under ``src/third_party`` in a source
+    # checkout.  A PyInstaller bundle places the same tree next to the module
+    # inside ``sys._MEIPASS``, so every runtime root is searched.
+    for root in _runtime_roots():
+        candidates.extend(sorted((root / "src" / "third_party").glob("ffmpeg-*/bin/ffmpeg.exe")))
+        candidates.extend(sorted((root / "third_party").glob("ffmpeg-*/bin/ffmpeg.exe")))
+        candidates.extend(sorted(root.glob("ffmpeg-*/bin/ffmpeg.exe")))
     path_candidate = shutil.which("ffmpeg")
     if path_candidate:
         candidates.append(Path(path_candidate))
@@ -327,7 +368,9 @@ def find_ffmpeg(explicit: str | os.PathLike[str] | None = None) -> FFmpegInstall
         if executable is None:
             continue
         ffprobe = executable.with_name("ffprobe.exe")
-        return FFmpegInstallation(executable, _version(executable), ffprobe if ffprobe.exists() else None)
+        return FFmpegInstallation(
+            executable, _version(executable), ffprobe if ffprobe.exists() else None
+        )
     return None
 
 

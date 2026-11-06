@@ -1,12 +1,11 @@
-from __future__ import annotations
-
 """Transactional Notification Outbox delivery."""
 
+from __future__ import annotations
+
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Callable
 
 from factoryguard.domain.models import Event, EventStatus
 from factoryguard.notifications.adapters import NotificationAdapter, WebhookAdapter
@@ -41,7 +40,9 @@ class OutboxDispatcher:
         if self.webhook_url.strip():
             self.adapters.setdefault(
                 "webhook",
-                WebhookAdapter(url=self.webhook_url, secret=self.webhook_secret, notifier=self.notifier),
+                WebhookAdapter(
+                    url=self.webhook_url, secret=self.webhook_secret, notifier=self.notifier
+                ),
             )
         self.clock = clock or (lambda: datetime.now(UTC))
 
@@ -88,7 +89,6 @@ def _event_from_row(row: object) -> Event:
     nvr_value = row["nvr_time"]  # type: ignore[index]
     nvr_time = datetime.fromisoformat(str(nvr_value)) if nvr_value else None
     status = EventStatus(str(row["status"]))  # type: ignore[index]
-    track = tuple(tuple(point) for point in payload.get("track", ()))
     return Event(
         id=str(row["id"]),  # type: ignore[index]
         dedup_key=str(row["dedup_key"]),  # type: ignore[index]
@@ -107,7 +107,6 @@ def _event_from_row(row: object) -> Event:
         clip_status=str(row["clip_status"]),  # type: ignore[index]
         status=status,
         target=payload.get("target") or {},
-        track=track,
     )
 
 

@@ -4,9 +4,27 @@ import hashlib
 import os
 from datetime import UTC, datetime, timedelta
 
-from factoryguard.domain.models import Detection, Event, Frame, Rule, RuleType
+from factoryguard.domain.models import Event, EventSource, NativeEvent, Rule
 from factoryguard.storage.retention import MediaRetentionManager
 from factoryguard.storage.sqlite import SQLiteStore
+
+
+def _event() -> Event:
+    rule = Rule(
+        "retention-rule",
+        "stream-1",
+        "设备原生告警",
+        native_event_codes=("person",),
+    )
+    native = NativeEvent(
+        device_id="device-1",
+        channel_id="stream-1",
+        event_code="person",
+        occurred_at=datetime.now(UTC),
+        source=EventSource.SYSTEM,
+        stream_id="stream-1",
+    )
+    return native.to_event(rule=rule)
 
 
 def test_media_retention_removes_old_files_but_keeps_event(tmp_path):
@@ -22,16 +40,17 @@ def test_media_retention_removes_old_files_but_keeps_event(tmp_path):
     os.utime(clip, (old_time, old_time))
 
     store = SQLiteStore(database)
-    event = Event.create(
-        rule=Rule("r1", "stream-1", "test", RuleType.POLYGON, ((0, 0), (10, 0), (10, 10))),
-        frame=Frame("stream-1", 1, datetime.now(UTC), 20, 20),
-        detection=Detection("person", 0.9, (1, 1, 4, 8)),
-    )
+    event = _event()
     assert store.create_event_with_outbox(event)
-    assert store.update_event_media(event.id, snapshot_uri=str(snapshot), clip_uri=str(clip), clip_status="ready")
+    assert store.update_event_media(
+        event.id, snapshot_uri=str(snapshot), clip_uri=str(clip), clip_status="ready"
+    )
     event_row = store.get_event(event.id)
     outbox_row = store.list_pending_outbox()[0]
-    assert outbox_row["payload_hash"] == hashlib.sha256(event_row["payload"].encode("utf-8")).hexdigest()
+    assert (
+        outbox_row["payload_hash"]
+        == hashlib.sha256(event_row["payload"].encode("utf-8")).hexdigest()
+    )
     assert any(row["action"] == "event.media.updated" for row in store.list_audit())
     report = MediaRetentionManager(media_root=media).cleanup(store, retention_days=3)
 
@@ -46,7 +65,10 @@ def test_media_retention_removes_old_files_but_keeps_event(tmp_path):
     assert row["clip_status"] == "expired"
     expired_event_row = store.get_event(event.id)
     expired_outbox_row = store.list_pending_outbox()[0]
-    assert expired_outbox_row["payload_hash"] == hashlib.sha256(expired_event_row["payload"].encode("utf-8")).hexdigest()
+    assert (
+        expired_outbox_row["payload_hash"]
+        == hashlib.sha256(expired_event_row["payload"].encode("utf-8")).hexdigest()
+    )
     assert any(item["action"] == "event.media.expired" for item in store.list_audit())
     assert len(store.list_events()) == 1
     store.close()
@@ -54,11 +76,7 @@ def test_media_retention_removes_old_files_but_keeps_event(tmp_path):
 
 def test_clear_event_media_marks_remaining_clip_as_ready(tmp_path):
     store = SQLiteStore(tmp_path / "media-status.db")
-    event = Event.create(
-        rule=Rule("status-rule", "stream-1", "status", RuleType.POLYGON, ((0, 0), (10, 0), (10, 10))),
-        frame=Frame("stream-1", 1, datetime.now(UTC), 20, 20),
-        detection=Detection("person", 0.9, (1, 1, 4, 8)),
-    )
+    event = _event()
     assert store.create_event_with_outbox(event)
     assert store.update_event_media(
         event.id,
@@ -74,6 +92,7 @@ def test_clear_event_media_marks_remaining_clip_as_ready(tmp_path):
     assert row["clip_uri"] == "clip.mp4"
     assert row["clip_status"] == "ready"
     store.close()
+
 
 def test_media_retention_dry_run_does_not_delete(tmp_path):
     media = tmp_path / "events-media"

@@ -1,3 +1,3 @@
-"""FactoryGuard local-first detection core."""
+"""FactoryGuard multi-camera operations and grounded text assistant."""
 
-__version__ = "0.1.0"
+__version__ = "2.0.0"

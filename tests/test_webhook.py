@@ -1,21 +1,38 @@
+from __future__ import annotations
+
 import hashlib
 import hmac
 from datetime import UTC, datetime
 
-from factoryguard.domain.models import Detection, Event, Frame, Rule, RuleType
+from factoryguard.domain.models import Event, EventSource, NativeEvent, Rule
 from factoryguard.notifications.dispatcher import OutboxDispatcher
 from factoryguard.notifications.webhook import build_webhook_request
 from factoryguard.storage.sqlite import SQLiteStore
 
 
-def test_webhook_signature_and_idempotency_headers():
-    rule = Rule("r1", "CH01", "fence", RuleType.POLYGON, ((0, 0), (10, 0), (10, 10), (0, 10)))
-    event = Event.create(
-        rule=rule,
-        frame=Frame("CH01", 1, datetime(2026, 1, 1, tzinfo=UTC), 20, 20),
-        detection=Detection("person", 0.9, (1, 1, 4, 8), "track-1"),
+def _event() -> Event:
+    rule = Rule(
+        "r-dispatch",
+        "CH01",
+        "设备原生告警",
+        native_event_codes=("person",),
     )
-    request = build_webhook_request(event, url="https://example.test/hook", secret="secret", timestamp=123, nonce="abc")
+    native = NativeEvent(
+        device_id="device-1",
+        channel_id="CH01",
+        event_code="person",
+        occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+        source=EventSource.SYSTEM,
+        stream_id="CH01",
+    )
+    return native.to_event(rule=rule)
+
+
+def test_webhook_signature_and_idempotency_headers():
+    event = _event()
+    request = build_webhook_request(
+        event, url="https://example.test/hook", secret="secret", timestamp=123, nonce="abc"
+    )
     expected = hmac.new(b"secret", request.body + b"123abc", hashlib.sha256).hexdigest()
     assert request.headers["signature"] == expected
     assert request.headers["Idempotency-Key"] == event.dedup_key
@@ -29,15 +46,6 @@ class _FakeNotifier:
     def send(self, request):
         self.requests.append(request)
         return self.result
-
-
-def _event():
-    rule = Rule("r-dispatch", "CH01", "fence", RuleType.POLYGON, ((0, 0), (10, 0), (10, 10), (0, 10)))
-    return Event.create(
-        rule=rule,
-        frame=Frame("CH01", 1, datetime(2026, 1, 1, tzinfo=UTC), 20, 20),
-        detection=Detection("person", 0.9, (1, 1, 4, 8), "track-1"),
-    )
 
 
 def test_outbox_dispatcher_sends_and_marks_success(tmp_path):

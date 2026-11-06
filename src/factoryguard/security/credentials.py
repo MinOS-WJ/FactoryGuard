@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Windows DPAPI-backed credential storage with explicit secret references."""
+
+from __future__ import annotations
 
 import ctypes
 import json
@@ -44,7 +44,9 @@ class WindowsDpapiProtector:
         input_blob = _DataBlob(len(value), ctypes.cast(input_buffer, ctypes.POINTER(ctypes.c_byte)))
         output_blob = _DataBlob()
         entropy_buffer = ctypes.create_string_buffer(b"FactoryGuard.DeviceCredential.v1")
-        entropy = _DataBlob(len(entropy_buffer.raw), ctypes.cast(entropy_buffer, ctypes.POINTER(ctypes.c_byte)))
+        entropy = _DataBlob(
+            len(entropy_buffer.raw), ctypes.cast(entropy_buffer, ctypes.POINTER(ctypes.c_byte))
+        )
         flags = 0
         if protect:
             result = self._crypt32.CryptProtectData(
@@ -81,7 +83,9 @@ class XorTestProtector:
         self.key = key or secrets.token_bytes(32)
 
     def protect(self, plaintext: bytes) -> bytes:
-        return bytes(value ^ self.key[index % len(self.key)] for index, value in enumerate(plaintext))
+        return bytes(
+            value ^ self.key[index % len(self.key)] for index, value in enumerate(plaintext)
+        )
 
     unprotect = protect
 
@@ -116,6 +120,33 @@ class CredentialVault:
         )
 
 
+@dataclass(slots=True)
+class PlaintextCredentialVault:
+    """Readable JSON credential encoding for small local deployments."""
+
+    def encode(self, credentials: DeviceCredentials) -> str:
+        return json.dumps(
+            {
+                "username": credentials.username,
+                "password": credentials.password,
+                "token": credentials.token,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def decode(self, value: str) -> DeviceCredentials:
+        try:
+            payload = json.loads(value)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise SecretProtectionError("credential payload is invalid JSON") from exc
+        return DeviceCredentials(
+            username=str(payload.get("username", "")),
+            password=str(payload.get("password", "")),
+            token=str(payload.get("token", "")),
+        )
+
+
 def default_vault() -> CredentialVault:
     return CredentialVault(WindowsDpapiProtector())
 
@@ -126,6 +157,7 @@ def new_credential_ref() -> str:
 
 __all__ = [
     "CredentialVault",
+    "PlaintextCredentialVault",
     "SecretProtectionError",
     "SecretProtector",
     "WindowsDpapiProtector",

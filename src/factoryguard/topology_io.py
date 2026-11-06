@@ -1,12 +1,12 @@
-from __future__ import annotations
-
 """CSV interchange for site, area, physical device, channel and stream inventory."""
+
+from __future__ import annotations
 
 import csv
 import json
 import re
+from collections.abc import Mapping
 from io import StringIO
-from typing import Iterable, Mapping
 
 from factoryguard.domain.models import (
     AnalysisPolicy,
@@ -20,7 +20,6 @@ from factoryguard.domain.models import (
     VideoStream,
 )
 from factoryguard.domain.topology import EntityRegistry
-
 
 CSV_FIELDS = (
     "site_id",
@@ -47,10 +46,6 @@ CSV_FIELDS = (
     "device_last_ok_at",
     "device_health_status",
     "device_health_detail",
-    "device_last_probe_at",
-    "device_last_ok_at",
-    "device_health_status",
-    "device_health_detail",
     "camera_id",
     "camera_name",
     "camera_vendor",
@@ -65,9 +60,6 @@ CSV_FIELDS = (
     "stream_width",
     "stream_height",
     "stream_fps",
-    "stream_model",
-    "stream_confidence",
-    "stream_input_size",
     "stream_enabled",
     "stream_device_id",
     "stream_analysis_policy",
@@ -75,7 +67,6 @@ CSV_FIELDS = (
 )
 
 OPTIONAL_FIELDS = {
-    "stream_input_size",
     "device_id",
     "device_name",
     "device_protocol",
@@ -120,12 +111,16 @@ def topology_to_csv(topology: EntityRegistry) -> str:
                 if not device_cameras:
                     writer.writerow(_row(site, area, None, None, device))
                 for camera in device_cameras:
-                    streams = [stream for stream in topology.streams if stream.camera_id == camera.id]
+                    streams = [
+                        stream for stream in topology.streams if stream.camera_id == camera.id
+                    ]
                     for stream in streams or (None,):
                         writer.writerow(_row(site, area, camera, stream, device))
             for camera in cameras:
                 if camera.device_id is None:
-                    streams = [stream for stream in topology.streams if stream.camera_id == camera.id]
+                    streams = [
+                        stream for stream in topology.streams if stream.camera_id == camera.id
+                    ]
                     for stream in streams or (None,):
                         writer.writerow(_row(site, area, camera, stream, None))
             if not devices and not cameras:
@@ -137,7 +132,11 @@ def topology_from_csv(text: str) -> EntityRegistry:
     reader = csv.DictReader(StringIO(text))
     if reader.fieldnames is None:
         raise ValueError("topology CSV is missing a header row")
-    missing = [field for field in CSV_FIELDS if field not in reader.fieldnames and field not in OPTIONAL_FIELDS]
+    missing = [
+        field
+        for field in CSV_FIELDS
+        if field not in reader.fieldnames and field not in OPTIONAL_FIELDS
+    ]
     if missing:
         raise ValueError(f"topology CSV is missing columns: {', '.join(missing)}")
     sites: dict[str, Site] = {}
@@ -180,8 +179,12 @@ def topology_from_csv(text: str) -> EntityRegistry:
                     firmware=row.get("device_firmware", ""),
                     serial_number=row.get("device_serial_number", ""),
                     device_id=row.get("device_device_id", ""),
-                    capabilities=DeviceCapabilities.from_dict(json.loads(row.get("device_capabilities") or "{}")),
-                    analysis_policy=AnalysisPolicy(row.get("device_analysis_policy", AnalysisPolicy.LOCAL_FALLBACK.value)),
+                    capabilities=DeviceCapabilities.from_dict(
+                        json.loads(row.get("device_capabilities") or "{}")
+                    ),
+                    analysis_policy=AnalysisPolicy(
+                        row.get("device_analysis_policy", AnalysisPolicy.NATIVE_ONLY.value)
+                    ),
                     enabled=_parse_bool(row.get("device_enabled", "1"), "device_enabled", line_no),
                     last_probe_at=row.get("device_last_probe_at") or None,
                     last_ok_at=row.get("device_last_ok_at") or None,
@@ -216,7 +219,9 @@ def topology_from_csv(text: str) -> EntityRegistry:
         try:
             stream_url = _required(row, "stream_url", line_no)
             if _contains_redacted_credentials(stream_url):
-                raise ValueError(f"line {line_no}: stream_url contains redacted credentials; replace them before importing")
+                raise ValueError(
+                    f"line {line_no}: stream_url contains redacted credentials; replace them before importing"
+                )
             policy_value = row.get("stream_analysis_policy", "")
             stream = VideoStream(
                 id=stream_id,
@@ -227,12 +232,9 @@ def topology_from_csv(text: str) -> EntityRegistry:
                 width=int(row.get("stream_width") or 1280),
                 height=int(row.get("stream_height") or 720),
                 fps=float(row.get("stream_fps") or 2.0),
-                model=row.get("stream_model") or None,
-                confidence=float(row.get("stream_confidence") or 0.25),
-                input_size=int(row.get("stream_input_size") or 640),
                 enabled=_parse_bool(row.get("stream_enabled", "1"), "stream_enabled", line_no),
                 device_id=row.get("stream_device_id", "") or camera_device_id,
-                analysis_policy=AnalysisPolicy(policy_value) if policy_value else None,
+                analysis_policy=AnalysisPolicy.normalize(policy_value),
                 native_event_codes=tuple(
                     value.strip()
                     for value in row.get("stream_native_event_codes", "").split(",")
@@ -279,7 +281,9 @@ def _row(
         "device_serial_number": device.serial_number if device else "",
         "device_device_id": device.device_id if device else "",
         "device_analysis_policy": str(device.analysis_policy) if device else "",
-        "device_capabilities": json.dumps(device.capabilities.as_dict(), separators=(",", ":")) if device else "",
+        "device_capabilities": json.dumps(device.capabilities.as_dict(), separators=(",", ":"))
+        if device
+        else "",
         "device_enabled": int(device.enabled) if device else "",
         "device_last_probe_at": device.last_probe_at or "" if device else "",
         "device_last_ok_at": device.last_ok_at or "" if device else "",
@@ -299,12 +303,11 @@ def _row(
         "stream_width": stream.width if stream else "",
         "stream_height": stream.height if stream else "",
         "stream_fps": stream.fps if stream else "",
-        "stream_model": stream.model or "" if stream else "",
-        "stream_confidence": stream.confidence if stream else "",
-        "stream_input_size": stream.input_size if stream else "",
         "stream_enabled": int(stream.enabled) if stream else "",
         "stream_device_id": stream.device_id or "" if stream else "",
-        "stream_analysis_policy": str(stream.analysis_policy) if stream and stream.analysis_policy else "",
+        "stream_analysis_policy": str(stream.analysis_policy)
+        if stream and stream.analysis_policy
+        else "",
         "stream_native_event_codes": ",".join(stream.native_event_codes) if stream else "",
     }
 
@@ -326,7 +329,7 @@ def _parse_bool(value: str, field: str, line_no: int) -> bool:
 
 
 def _merge(bucket: dict[str, object], value: object, kind: str, line_no: int) -> None:
-    identifier = str(getattr(value, "id"))
+    identifier = str(value.id)
     existing = bucket.get(identifier)
     if existing is not None and existing != value:
         raise ValueError(f"line {line_no}: conflicting {kind} definition for {identifier}")

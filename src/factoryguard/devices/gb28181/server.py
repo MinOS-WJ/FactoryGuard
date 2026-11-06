@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Local GB/T 28181 platform-side SIP endpoint.
 
 FactoryGuard receives registrations from compatible cameras, encoders and
@@ -7,6 +5,8 @@ NVRs. The implementation uses asyncio UDP and TCP SIP transports without
 PJSIP or another native service. Media still flows over the negotiated RTP
 port and is handed to the FFmpeg pipeline by a live session descriptor.
 """
+
+from __future__ import annotations
 
 import asyncio
 import queue
@@ -20,7 +20,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 from factoryguard.domain.models import (
-    AnalysisPolicy,
     DeviceCapabilities,
     DeviceProtocol,
     EventSource,
@@ -91,7 +90,7 @@ class Gb28181LiveSession:
 class Gb28181TcpProtocol(asyncio.Protocol):
     """Framed SIP-over-TCP receiver for persistent device connections."""
 
-    def __init__(self, platform: "Gb28181Platform") -> None:
+    def __init__(self, platform: Gb28181Platform) -> None:
         self.platform = platform
         self.transport: asyncio.Transport | None = None
         self.buffer = bytearray()
@@ -118,7 +117,7 @@ class Gb28181TcpProtocol(asyncio.Protocol):
                     transport=self.transport,
                     transport_kind="tcp",
                 )
-            except Exception as exc:  # noqa: BLE001 - isolate one bad SIP message
+            except Exception as exc:
                 self.platform._record_error(f"{self.address[0]}: {exc}")
 
     def error_received(self, exc: Exception) -> None:
@@ -188,20 +187,36 @@ class Gb28181Platform(asyncio.DatagramProtocol):
         loop = asyncio.get_running_loop()
         bind_host = host or self.host
         bind_port = self.port if port is None else port
-        transport, _protocol = await loop.create_datagram_endpoint(
-            lambda: self,
-            local_addr=(bind_host, bind_port),
-        )
-        self._transport = transport
-        self.loop = loop
-        sockname = transport.get_extra_info("sockname")
-        actual_port = int(sockname[1])
-        self._tcp_server = await loop.create_server(
-            lambda: Gb28181TcpProtocol(self),
-            host=bind_host,
-            port=actual_port,
-        )
-        return str(sockname[0]), actual_port
+        attempts = 5 if bind_port == 0 else 1
+        last_error: OSError | None = None
+        for attempt in range(attempts):
+            transport: asyncio.DatagramTransport | None = None
+            try:
+                transport, _protocol = await loop.create_datagram_endpoint(
+                    lambda: self,
+                    local_addr=(bind_host, bind_port),
+                )
+                self._transport = transport
+                sockname = transport.get_extra_info("sockname")
+                actual_port = int(sockname[1])
+                self._tcp_server = await loop.create_server(
+                    lambda: Gb28181TcpProtocol(self),
+                    host=bind_host,
+                    port=actual_port,
+                )
+                self.loop = loop
+                return str(sockname[0]), actual_port
+            except OSError as exc:
+                last_error = exc
+                if transport is not None:
+                    transport.close()
+                self._transport = None
+                self._tcp_server = None
+                self.loop = None
+                if bind_port != 0 or attempt == attempts - 1:
+                    raise
+        assert last_error is not None
+        raise last_error
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self._transport = transport  # type: ignore[assignment]
@@ -210,7 +225,7 @@ class Gb28181Platform(asyncio.DatagramProtocol):
         self._messages_received += 1
         try:
             self.handle_datagram(data, addr)
-        except Exception as exc:  # noqa: BLE001 - one malformed datagram must not stop registration
+        except Exception as exc:
             self._record_error(f"{addr[0]}: {exc}")
 
     def error_received(self, exc: Exception) -> None:
@@ -278,10 +293,17 @@ class Gb28181Platform(asyncio.DatagramProtocol):
     ) -> None:
         device_id = _sip_user(message.to_header) or _sip_user(message.from_header)
         if not device_id:
-            self._send(message.response(400, "Bad Request"), addr, transport=transport, transport_kind=transport_kind)
+            self._send(
+                message.response(400, "Bad Request"),
+                addr,
+                transport=transport,
+                transport_kind=transport_kind,
+            )
             return
         authorization = message.get("authorization")
-        if self.password and not verify_digest(authorization, password=self.password, method="REGISTER", uri=message.request_uri):
+        if self.password and not verify_digest(
+            authorization, password=self.password, method="REGISTER", uri=message.request_uri
+        ):
             challenge = DigestChallenge(realm=self.domain, nonce=secrets.token_hex(16))
             self._send(
                 message.response(
@@ -339,7 +361,7 @@ class Gb28181Platform(asyncio.DatagramProtocol):
         if not message.body:
             return
         try:
-            root = ET.fromstring(message.body)
+            root = _parse_xml_body(message.body)
         except ET.ParseError as exc:
             self._record_error(f"{addr[0]}: invalid GB28181 XML: {exc}")
             return
@@ -381,7 +403,13 @@ class Gb28181Platform(asyncio.DatagramProtocol):
                     status=_xml_text(item, "Status", "ON"),
                 )
             return
-        if command in {"alarm", "videolosssignal", "tamperdetection", "motiondetect", "fielddetection"}:
+        if command in {
+            "alarm",
+            "videolosssignal",
+            "tamperdetection",
+            "motiondetect",
+            "fielddetection",
+        }:
             event = NativeEvent(
                 device_id=device_id,
                 channel_id=_xml_text(root, "DeviceID", device_id),
@@ -390,9 +418,14 @@ class Gb28181Platform(asyncio.DatagramProtocol):
                 source=EventSource.GB28181,
                 title=_xml_text(root, "AlarmDescription", command),
                 level="critical" if command == "alarm" else "high",
-                source_event_id=_xml_text(root, "SN") or f"{device_id}:{command}:{_xml_text(root, 'Time')}",
+                source_event_id=_xml_text(root, "SN")
+                or f"{device_id}:{command}:{_xml_text(root, 'Time')}",
                 stream_id=_xml_text(root, "DeviceID", device_id),
-                payload={"command": command, "alarm_method": _xml_text(root, "AlarmMethod"), "alarm_type": _xml_text(root, "AlarmType")},
+                payload={
+                    "command": command,
+                    "alarm_method": _xml_text(root, "AlarmMethod"),
+                    "alarm_type": _xml_text(root, "AlarmType"),
+                },
             )
             try:
                 self.native_events.put_nowait(event)
@@ -474,7 +507,7 @@ class Gb28181Platform(asyncio.DatagramProtocol):
  <StartTime>{start_at.astimezone(UTC).isoformat()}</StartTime>
  <EndTime>{end_at.astimezone(UTC).isoformat()}</EndTime>
  <Secutity><Type>0</Type></Secutity>
-</Query>""".encode("utf-8")
+</Query>""".encode()
         request = SipMessage.request(
             "MESSAGE",
             f"sip:{device_id}@{registration.address[0]}:{registration.address[1]}",
@@ -521,7 +554,6 @@ class Gb28181Platform(asyncio.DatagramProtocol):
             raise RuntimeError("GB/T 28181 设备未注册或注册已过期")
         if channel_id not in registration.channels:
             raise KeyError(f"unknown GB/T 28181 channel: {channel_id}")
-        loop = asyncio.get_running_loop()
         media_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         media_sock.bind(("0.0.0.0", 0))
         media_port = int(media_sock.getsockname()[1])
@@ -543,7 +575,7 @@ class Gb28181Platform(asyncio.DatagramProtocol):
             "a=rtpmap:96 PS/90000\r\n"
             "a=rtpmap:97 MPEG4/90000\r\n"
             "a=rtpmap:98 H264/90000\r\n"
-        ).encode("utf-8")
+        ).encode()
         request = SipMessage.request(
             "INVITE",
             f"sip:{channel_id}@{registration.address[0]}:{registration.address[1]}",
@@ -554,7 +586,13 @@ class Gb28181Platform(asyncio.DatagramProtocol):
             via=via,
             content_type="Application/SDP",
             body=sdp,
-            extra_headers=(("Contact", f"<sip:{self.platform_id}@{_local_signaling_host(registration.address)}:{self.port}>"), ("Subject", f"{channel_id}:{0},{self.platform_id}:{0}")),
+            extra_headers=(
+                (
+                    "Contact",
+                    f"<sip:{self.platform_id}@{_local_signaling_host(registration.address)}:{self.port}>",
+                ),
+                ("Subject", f"{channel_id}:{0},{self.platform_id}:{0}"),
+            ),
         )
         response = await self._request(
             request,
@@ -564,7 +602,9 @@ class Gb28181Platform(asyncio.DatagramProtocol):
             transport_kind=registration.transport_kind,
         )
         if response.status_code != 200:
-            raise RuntimeError(f"GB/T 28181 INVITE failed: {response.status_code} {response.reason}")
+            raise RuntimeError(
+                f"GB/T 28181 INVITE failed: {response.status_code} {response.reason}"
+            )
         remote_host, remote_port = _sdp_media(response.text)
         if remote_port == 0:
             remote_host = registration.address[0]
@@ -595,7 +635,10 @@ class Gb28181Platform(asyncio.DatagramProtocol):
 
     async def bye(self, session: Gb28181LiveSession) -> None:
         self._dialogs.pop(session.call_id, None)
-        registration = next((item for item in self.registrations.values() if item.channels.get(session.channel_id)), None)
+        registration = next(
+            (item for item in self.registrations.values() if item.channels.get(session.channel_id)),
+            None,
+        )
         if registration is not None:
             self._send(
                 SipMessage.request(
@@ -706,8 +749,15 @@ class Gb28181Adapter(DeviceAdapter):
         require_open(self)
         registered = self.device.device_id in self.platform.registrations
         if not registered:
-            return ProbeResult(ok=False, detail="等待 GB/T 28181 设备注册", capabilities=self.get_capabilities())
-        return ProbeResult(ok=True, detail="设备已注册", capabilities=self.get_capabilities(), diagnostics=self.platform.diagnostics)
+            return ProbeResult(
+                ok=False, detail="等待 GB/T 28181 设备注册", capabilities=self.get_capabilities()
+            )
+        return ProbeResult(
+            ok=True,
+            detail="设备已注册",
+            capabilities=self.get_capabilities(),
+            diagnostics=self.platform.diagnostics,
+        )
 
     def get_device_info(self) -> DeviceInfo:
         registration = self.platform.registrations.get(self.device.device_id)
@@ -725,13 +775,22 @@ class Gb28181Adapter(DeviceAdapter):
             native_events=True,
             recording_search=True,
             profiles=("GB/T 28181-2022",),
-            event_types=("alarm", "videolosssignal", "tamperdetection", "motiondetect", "fielddetection"),
+            event_types=(
+                "alarm",
+                "videolosssignal",
+                "tamperdetection",
+                "motiondetect",
+                "fielddetection",
+            ),
             media_profiles=tuple(channel.id for channel in channels),
         )
 
     def list_channels(self) -> tuple[DeviceChannel, ...]:
         channels = self.platform.list_channels(self.device.device_id)
-        self._channels = tuple(DeviceChannel(id=item.id, name=item.name, enabled=item.status.upper() == "ON") for item in channels)
+        self._channels = tuple(
+            DeviceChannel(id=item.id, name=item.name, enabled=item.status.upper() == "ON")
+            for item in channels
+        )
         return self._channels
 
     def get_live_stream(self, channel_id: str, *, role: str = "sub") -> LiveStream:
@@ -871,7 +930,9 @@ def _with_to_tag(value: str, tag: str) -> str:
 
 
 def _xml_escape(value: str) -> str:
-    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    return (
+        value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
 
 
 def _xml_text(node: ET.Element, name: str, default: str = "") -> str:
@@ -909,6 +970,33 @@ def _normalize_gb_event(command: str, method: str) -> str:
     if normalized in {"2", "motion"}:
         return "motiondetect"
     return command.strip().lower() or "alarm"
+
+
+def _parse_xml_body(payload: bytes) -> ET.Element:
+    """Parse GB28181 XML while tolerating GB2312/GB18030 declarations."""
+    declared = ""
+    match = re.search(
+        rb"<\?xml[^>]*encoding=[\"']([^\"']+)",
+        payload[:256],
+        re.IGNORECASE,
+    )
+    if match:
+        declared = match.group(1).decode("ascii", errors="ignore")
+    encodings = [declared, "gb18030", "utf-8"] if declared else ["utf-8", "gb18030"]
+    last_error: ET.ParseError | None = None
+    for encoding in dict.fromkeys(value for value in encodings if value):
+        try:
+            text = payload.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+        text = re.sub(r"^\s*<\?xml[^>]*\?>", "", text, count=1, flags=re.IGNORECASE)
+        try:
+            return ET.fromstring(text)
+        except ET.ParseError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise ET.ParseError("unsupported GB28181 XML encoding")
 
 
 def _sdp_media(body: str) -> tuple[str, int]:

@@ -1,5 +1,3 @@
 """Application orchestration layer."""
 
-from .pipeline import DetectionPipeline, PipelineResult
-
-__all__ = ["DetectionPipeline", "PipelineResult"]
+__all__: list[str] = []

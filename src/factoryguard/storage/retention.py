@@ -1,12 +1,12 @@
-from __future__ import annotations
-
 """Safe retention cleanup for locally stored event media."""
 
+from __future__ import annotations
+
+import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from math import isfinite
 from pathlib import Path
-import sqlite3
 from typing import Any
 
 from .sqlite import SQLiteStore

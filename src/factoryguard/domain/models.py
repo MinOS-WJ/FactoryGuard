@@ -6,13 +6,10 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from math import isfinite
 from types import MappingProxyType
-from types import MappingProxyType
 from typing import Any
-from .condition_tree import normalize_condition_nodes
 from uuid import uuid4
 
 Point = tuple[float, float]
-BBox = tuple[float, float, float, float]
 
 
 class StreamRole(StrEnum):
@@ -38,12 +35,24 @@ class DeviceProtocol(StrEnum):
 
 
 class AnalysisPolicy(StrEnum):
-    """Controls whether native device events or local inference are used."""
+    """Controls whether native device events are ingested."""
 
     NATIVE_ONLY = "native_only"
-    LOCAL_FALLBACK = "local_fallback"
-    LOCAL_PRIMARY = "local_primary"
     DISABLED = "disabled"
+
+    @classmethod
+    def normalize(cls, value: AnalysisPolicy | str | None) -> AnalysisPolicy:
+        if value is None:
+            return cls.NATIVE_ONLY
+        if isinstance(value, cls):
+            return value
+        normalized = str(value).strip().lower()
+        if normalized in {"local_fallback", "local_primary", "analysis"}:
+            return cls.NATIVE_ONLY
+        try:
+            return cls(normalized)
+        except ValueError as exc:
+            raise ValueError("analysis policy is invalid") from exc
 
 
 class EventSource(StrEnum):
@@ -51,16 +60,9 @@ class EventSource(StrEnum):
 
     ONVIF = "onvif"
     GB28181 = "gb28181"
-    LOCAL_INFERENCE = "local_inference"
+    SYSTEM = "system"
     DEVICE_HEALTH = "device_health"
     MANUAL = "manual"
-
-
-class RuleMode(StrEnum):
-    """Whether a rule is evaluated from pixels or device event codes."""
-
-    ANALYSIS = "analysis"
-    NATIVE_EVENT = "native_event"
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,8 +134,9 @@ class DeviceCapabilities:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any] | None) -> "DeviceCapabilities":
+    def from_dict(cls, value: Mapping[str, Any] | None) -> DeviceCapabilities:
         data = value if isinstance(value, Mapping) else {}
+
         def values(key: str) -> tuple[str, ...]:
             raw = data.get(key, ())
             if isinstance(raw, str):
@@ -142,6 +145,7 @@ class DeviceCapabilities:
                 return tuple(str(item) for item in raw)
             except TypeError:
                 return ()
+
         return cls(
             live_video=bool(data.get("live_video", False)),
             native_events=bool(data.get("native_events", False)),
@@ -172,7 +176,7 @@ class VideoDevice:
     device_id: str = ""
     credentials_ref: str | None = None
     capabilities: DeviceCapabilities = DeviceCapabilities()
-    analysis_policy: AnalysisPolicy | str = AnalysisPolicy.LOCAL_FALLBACK
+    analysis_policy: AnalysisPolicy | str = AnalysisPolicy.NATIVE_ONLY
     enabled: bool = True
     last_probe_at: str | None = None
     last_ok_at: str | None = None
@@ -185,21 +189,23 @@ class VideoDevice:
         if not self.endpoint.strip():
             raise ValueError("device endpoint is required")
         try:
-            protocol = self.protocol if isinstance(self.protocol, DeviceProtocol) else DeviceProtocol(str(self.protocol))
-        except ValueError as exc:
-            raise ValueError("device protocol must be manual, rtsp, onvif or gb28181") from exc
-        try:
-            policy = (
-                self.analysis_policy
-                if isinstance(self.analysis_policy, AnalysisPolicy)
-                else AnalysisPolicy(str(self.analysis_policy))
+            protocol = (
+                self.protocol
+                if isinstance(self.protocol, DeviceProtocol)
+                else DeviceProtocol(str(self.protocol))
             )
         except ValueError as exc:
-            raise ValueError("analysis policy is invalid") from exc
+            raise ValueError("device protocol must be manual, rtsp, onvif or gb28181") from exc
         object.__setattr__(self, "protocol", protocol)
-        object.__setattr__(self, "analysis_policy", policy)
+        object.__setattr__(
+            self,
+            "analysis_policy",
+            AnalysisPolicy.normalize(self.analysis_policy),
+        )
         if not isinstance(self.capabilities, DeviceCapabilities):
-            object.__setattr__(self, "capabilities", DeviceCapabilities.from_dict(self.capabilities))
+            object.__setattr__(
+                self, "capabilities", DeviceCapabilities.from_dict(self.capabilities)
+            )
         for field_name in ("last_probe_at", "last_ok_at"):
             value = getattr(self, field_name)
             if isinstance(value, datetime):
@@ -238,12 +244,9 @@ class VideoStream:
     width: int = 1280
     height: int = 720
     fps: float = 2.0
-    model: str | None = None
-    confidence: float = 0.25
     enabled: bool = True
-    input_size: int = 640
     device_id: str | None = None
-    analysis_policy: AnalysisPolicy | str | None = None
+    analysis_policy: AnalysisPolicy | str = AnalysisPolicy.NATIVE_ONLY
     native_event_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -260,25 +263,21 @@ class VideoStream:
             raise ValueError("stream dimensions must be positive")
         if not isfinite(self.fps) or self.fps <= 0:
             raise ValueError("stream fps must be positive")
-        if not isfinite(self.confidence) or not 0 < self.confidence <= 1:
-            raise ValueError("stream confidence must be between 0 and 1")
-        if isinstance(self.input_size, bool) or not 64 <= int(self.input_size) <= 4096:
-            raise ValueError("stream input_size must be between 64 and 4096")
-        object.__setattr__(self, "input_size", int(self.input_size))
-        if self.analysis_policy is not None:
-            try:
-                policy = (
-                    self.analysis_policy
-                    if isinstance(self.analysis_policy, AnalysisPolicy)
-                    else AnalysisPolicy(str(self.analysis_policy))
-                )
-            except ValueError as exc:
-                raise ValueError("stream analysis policy is invalid") from exc
-            object.__setattr__(self, "analysis_policy", policy)
+        object.__setattr__(
+            self,
+            "analysis_policy",
+            AnalysisPolicy.normalize(self.analysis_policy),
+        )
         object.__setattr__(
             self,
             "native_event_codes",
-            tuple(dict.fromkeys(str(value).strip().lower() for value in self.native_event_codes if str(value).strip())),
+            tuple(
+                dict.fromkeys(
+                    str(value).strip().lower()
+                    for value in self.native_event_codes
+                    if str(value).strip()
+                )
+            ),
         )
 
 
@@ -289,11 +288,6 @@ Camera = CameraDevice
 Stream = VideoStream
 
 
-class RuleType(StrEnum):
-    POLYGON = "polygon"
-    LINE = "line"
-
-
 class EventStatus(StrEnum):
     OPEN = "open"
     CONFIRMED = "confirmed"
@@ -301,97 +295,22 @@ class EventStatus(StrEnum):
     CLOSED = "closed"
 
 
-@dataclass(frozen=True, slots=True)
-class Detection:
-    """One model output. Coordinates are pixels in the source frame."""
-
-    label: str
-    confidence: float
-    bbox: BBox
-    track_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if not self.label:
-            raise ValueError("detection label is required")
-        if not isfinite(self.confidence) or not 0 <= self.confidence <= 1:
-            raise ValueError("detection confidence must be between 0 and 1")
-        if len(self.bbox) != 4:
-            raise ValueError("detection bbox must contain four coordinates")
-        x1, y1, x2, y2 = self.bbox
-        if not all(isfinite(value) for value in self.bbox):
-            raise ValueError("detection bbox coordinates must be finite")
-        if x2 < x1 or y2 < y1:
-            raise ValueError("detection bbox must use x1 <= x2 and y1 <= y2")
-
-    @property
-    def anchor(self) -> Point:
-        x1, _y1, x2, y2 = self.bbox
-        return ((x1 + x2) / 2.0, y2)
-
-    @property
-    def height(self) -> float:
-        return max(0.0, self.bbox[3] - self.bbox[1])
-
-
-@dataclass(frozen=True, slots=True)
-class Frame:
-    stream_id: str
-    frame_no: int
-    captured_at: datetime
-    width: int
-    height: int
-    detections: tuple[Detection, ...] = ()
-    nvr_time: datetime | None = None
-    site_id: str | None = None
-    area_id: str | None = None
-    camera_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if self.captured_at.tzinfo is None:
-            raise ValueError("captured_at must be timezone-aware")
-        if self.frame_no < 0:
-            raise ValueError("frame_no must be non-negative")
-        if self.width <= 0 or self.height <= 0:
-            raise ValueError("frame dimensions must be positive")
-
-    @property
-    def entity_ids(self) -> dict[str, str | None]:
-        return {
-            "site_id": self.site_id,
-            "area_id": self.area_id,
-            "camera_id": self.camera_id,
-            "stream_id": self.stream_id,
-        }
-
-
 @dataclass(frozen=True, slots=True, init=False)
-class Rule:
+class NativeEventRule:
+    """Maps authoritative device event codes into the event workflow."""
+
     id: str = ""
     channel_id: str = ""
     name: str = ""
-    type: RuleType | None = None
-    geometry: tuple[Point, ...] = ()
-    target_labels: frozenset[str] = frozenset({"person"})
-    min_confidence: float = 0.45
-    min_box_height: float = 32.0
-    confirm_frames: int = 3
-    cooldown_seconds: float = 60.0
-    direction: str = "both"
-    condition: str = ""
-    count_threshold: int = 0
-    window_seconds: float = 0.0
-    dwell_seconds: float = 0.0
-    actions: tuple[str, ...] = ("event", "snapshot", "clip", "notify")
+    native_event_codes: tuple[str, ...] = ()
+    dedup_window_seconds: float = 5.0
+    actions: tuple[str, ...] = ("event", "notify")
     http_action_url: str = ""
     http_action_timeout: float = 5.0
     ack_deadline_seconds: float = 0.0
     escalation_level: str = ""
     destination_ids: tuple[str, ...] = ()
     assignees: tuple[str, ...] = ()
-    condition_nodes: tuple[dict[str, Any], ...] = ()
-    trigger_mode: RuleMode | str = RuleMode.ANALYSIS
-    native_event_codes: tuple[str, ...] = ()
-    dedup_window_seconds: float = 5.0
     enabled: bool = True
     publication_status: str = "published"
     version: int = 1
@@ -405,61 +324,34 @@ class Rule:
         id: str,
         channel_id: str | None = None,
         name: str | None = None,
-        type: RuleType | None = None,
-        geometry: tuple[Point, ...] = (),
-        target_labels: frozenset[str] = frozenset({"person"}),
-        min_confidence: float = 0.45,
-        min_box_height: float = 32.0,
-        confirm_frames: int = 3,
-        cooldown_seconds: float = 60.0,
-        direction: str = "both",
-        condition: str = "",
-        count_threshold: int = 0,
-        window_seconds: float = 0.0,
-        dwell_seconds: float = 0.0,
-        actions: tuple[str, ...] = ("event", "snapshot", "clip", "notify"),
+        *_legacy_positional: Any,
+        native_event_codes: Sequence[str] = (),
+        dedup_window_seconds: float = 5.0,
+        actions: Sequence[str] = ("event", "notify"),
         http_action_url: str = "",
         http_action_timeout: float = 5.0,
         ack_deadline_seconds: float = 0.0,
         escalation_level: str = "",
-        destination_ids: tuple[str, ...] = (),
-        assignees: tuple[str, ...] = (),
-        condition_nodes: tuple[dict[str, Any], ...] = (),
+        destination_ids: Sequence[str] = (),
+        assignees: Sequence[str] = (),
         enabled: bool = True,
         publication_status: str = "published",
         version: int = 1,
-        *,
-        trigger_mode: RuleMode | str = RuleMode.ANALYSIS,
-        native_event_codes: tuple[str, ...] = (),
-        dedup_window_seconds: float = 5.0,
         stream_id: str | None = None,
         site_id: str | None = None,
         area_id: str | None = None,
         camera_id: str | None = None,
+        **legacy: Any,
     ) -> None:
+        del _legacy_positional, legacy  # Legacy visual-rule fields are intentionally ignored.
         resolved_stream = stream_id or channel_id or ""
-        if type is not None and not isinstance(type, RuleType):
-            try:
-                type = RuleType(str(type))
-            except ValueError as exc:
-                raise ValueError("rule type must be polygon or line") from exc
+        resolved_channel = channel_id or resolved_stream
         values = {
             "id": id,
-            "channel_id": resolved_stream,
-            "stream_id": resolved_stream,
+            "channel_id": resolved_channel,
             "name": name or "",
-            "type": type,
-            "geometry": geometry,
-            "target_labels": frozenset(target_labels),
-            "min_confidence": min_confidence,
-            "min_box_height": min_box_height,
-            "confirm_frames": confirm_frames,
-            "cooldown_seconds": cooldown_seconds,
-            "direction": direction,
-            "condition": condition,
-            "count_threshold": count_threshold,
-            "window_seconds": window_seconds,
-            "dwell_seconds": dwell_seconds,
+            "native_event_codes": tuple(native_event_codes),
+            "dedup_window_seconds": dedup_window_seconds,
             "actions": tuple(actions),
             "http_action_url": http_action_url.strip(),
             "http_action_timeout": http_action_timeout,
@@ -467,113 +359,57 @@ class Rule:
             "escalation_level": escalation_level.strip().lower(),
             "destination_ids": tuple(destination_ids),
             "assignees": tuple(assignees),
-            "condition_nodes": normalize_condition_nodes(condition_nodes),
-            "native_event_codes": tuple(
-                dict.fromkeys(str(value).strip().lower() for value in native_event_codes if str(value).strip())
-            ),
-            "dedup_window_seconds": dedup_window_seconds,
-            "enabled": enabled,
+            "enabled": bool(enabled),
             "publication_status": publication_status,
             "version": version,
+            "stream_id": resolved_stream,
             "site_id": site_id,
             "area_id": area_id,
             "camera_id": camera_id,
         }
         for key, value in values.items():
             object.__setattr__(self, key, value)
-        try:
-            mode = trigger_mode if isinstance(trigger_mode, RuleMode) else RuleMode(str(trigger_mode))
-        except ValueError as exc:
-            raise ValueError("rule trigger_mode must be analysis or native_event") from exc
-        object.__setattr__(self, "trigger_mode", mode)
         self.__post_init__()
 
     def __post_init__(self) -> None:
         if not self.id or not self.stream_id:
             raise ValueError("rule id and stream_id (channel_id) are required")
-        if self.trigger_mode is RuleMode.NATIVE_EVENT:
-            self._validate_native_event()
-        else:
-            self._validate_analysis()
-        allowed_actions = {"event", "snapshot", "clip", "notify", "audit", "http"}
+        if not isfinite(self.dedup_window_seconds) or self.dedup_window_seconds < 0:
+            raise ValueError("rule dedup_window_seconds must be finite and non-negative")
+        if not isfinite(self.http_action_timeout) or self.http_action_timeout <= 0:
+            raise ValueError("rule http_action_timeout must be positive")
+        if not isfinite(self.ack_deadline_seconds) or self.ack_deadline_seconds < 0:
+            raise ValueError("rule ack_deadline_seconds must be finite and non-negative")
+        allowed_actions = {"event", "notify", "audit", "http"}
         normalized_actions: list[str] = []
         for action in self.actions:
             normalized = str(action).strip().lower()
-            if normalized not in allowed_actions:
-                raise ValueError(f"unsupported rule action: {action!r}")
-            if normalized not in normalized_actions:
-                normalized_actions.append(normalized)
+            if normalized not in allowed_actions or normalized in normalized_actions:
+                continue
+            normalized_actions.append(normalized)
         if "event" not in normalized_actions:
             normalized_actions.insert(0, "event")
         object.__setattr__(self, "actions", tuple(normalized_actions))
-        if self.http_action_url and not self.http_action_url.lower().startswith(("http://", "https://")):
-            raise ValueError("http_action_url must use HTTP or HTTPS")
-        if not isfinite(self.http_action_timeout) or self.http_action_timeout <= 0:
-            raise ValueError("http_action_timeout must be positive")
-        if "http" in normalized_actions and not self.http_action_url:
-            raise ValueError("http action requires http_action_url")
-        if not isfinite(self.ack_deadline_seconds) or self.ack_deadline_seconds < 0:
-            raise ValueError("ack_deadline_seconds must be finite and non-negative")
-        if self.escalation_level and self.escalation_level not in {"low", "medium", "high", "critical"}:
-            raise ValueError("escalation_level must be low, medium, high or critical")
-        if any(not str(value).strip() for value in self.destination_ids):
-            raise ValueError("destination_ids must not contain empty values")
-        if any(not str(value).strip() for value in self.assignees):
-            raise ValueError("assignees must not contain empty values")
-        if self.publication_status not in {"draft", "pending_review", "published"}:
-            raise ValueError("publication_status must be draft, pending_review or published")
+        object.__setattr__(
+            self,
+            "native_event_codes",
+            tuple(
+                dict.fromkeys(
+                    str(value).strip().lower()
+                    for value in self.native_event_codes
+                    if str(value).strip()
+                )
+            ),
+        )
+        object.__setattr__(self, "destination_ids", tuple(dict.fromkeys(self.destination_ids)))
+        object.__setattr__(self, "assignees", tuple(dict.fromkeys(self.assignees)))
+        if self.publication_status not in {"draft", "pending_review", "published", "rejected"}:
+            raise ValueError("rule publication_status is invalid")
+        if self.version < 1:
+            raise ValueError("rule version must be positive")
 
-    def _validate_native_event(self) -> None:
-        if not self.native_event_codes:
-            raise ValueError("native event rules require at least one event code")
-        if not isfinite(self.dedup_window_seconds) or self.dedup_window_seconds < 0:
-            raise ValueError("dedup_window_seconds must be finite and non-negative")
-        object.__setattr__(self, "condition", self.condition or "native_event")
 
-    def _validate_analysis(self) -> None:
-        if not isinstance(self.type, RuleType):
-            raise TypeError("rule type must be polygon or line")
-        if not self.geometry or not all(
-            len(point) == 2 and all(isfinite(value) for value in point) for point in self.geometry
-        ):
-            raise ValueError("rule geometry must contain finite points")
-        if self.type is RuleType.POLYGON and len(self.geometry) < 3:
-            raise ValueError("polygon rules require at least three points")
-        if self.type is RuleType.LINE and len(self.geometry) != 2:
-            raise ValueError("line rules require exactly two points")
-        if self.type is RuleType.POLYGON:
-            from .geometry import polygon_is_valid
-
-            if not polygon_is_valid(self.geometry):
-                raise ValueError("polygon rule geometry must be non-degenerate and non-self-intersecting")
-        elif self.geometry[0] == self.geometry[1]:
-            raise ValueError("line rule endpoints must be distinct")
-        if not 0 <= self.min_confidence <= 1:
-            raise ValueError("min_confidence must be between 0 and 1")
-        if not isfinite(self.min_box_height) or self.min_box_height < 0:
-            raise ValueError("min_box_height must be finite and non-negative")
-        if not isinstance(self.confirm_frames, int) or self.confirm_frames < 1:
-            raise ValueError("confirm_frames must be positive and cooldown non-negative")
-        if not isfinite(self.cooldown_seconds) or self.cooldown_seconds < 0:
-            raise ValueError("cooldown_seconds must be finite and non-negative")
-        if self.direction not in {"both", "up", "down", "left", "right"}:
-            raise ValueError("direction must be both, up, down, left, or right")
-        condition = self.condition or ("line_cross" if self.type is RuleType.LINE else "intrusion")
-        line_conditions = {"line_cross", "line_count"}
-        area_conditions = {"intrusion", "occupancy", "dwell"}
-        if condition not in line_conditions | area_conditions:
-            raise ValueError("condition must be intrusion, line_cross, line_count, occupancy, or dwell")
-        if condition in line_conditions and self.type is not RuleType.LINE:
-            raise ValueError("line conditions require a line rule")
-        if condition in area_conditions and self.type is not RuleType.POLYGON:
-            raise ValueError("area conditions require a polygon rule")
-        if condition in {"line_count", "occupancy"} and (isinstance(self.count_threshold, bool) or self.count_threshold < 1):
-            raise ValueError("count_threshold must be positive for count conditions")
-        if condition == "line_count" and (not isfinite(self.window_seconds) or self.window_seconds <= 0):
-            raise ValueError("window_seconds must be positive for line_count")
-        if condition == "dwell" and (not isfinite(self.dwell_seconds) or self.dwell_seconds <= 0):
-            raise ValueError("dwell_seconds must be positive for dwell")
-        object.__setattr__(self, "condition", condition)
+Rule = NativeEventRule
 
 
 @dataclass(frozen=True, slots=True)
@@ -600,7 +436,11 @@ class NativeEvent:
         if self.occurred_at.tzinfo is None:
             raise ValueError("native event occurred_at must be timezone-aware")
         try:
-            source = self.source if isinstance(self.source, EventSource) else EventSource(str(self.source))
+            source = (
+                self.source
+                if isinstance(self.source, EventSource)
+                else EventSource(str(self.source))
+            )
         except ValueError as exc:
             raise ValueError("native event source is invalid") from exc
         object.__setattr__(self, "source", source)
@@ -611,17 +451,18 @@ class NativeEvent:
     @property
     def correlation_key(self) -> str:
         semantic = self.payload.get("semantic") or self.event_code
-        return f"native:{self.stream_id}:{str(semantic).strip().lower()}"
+        return f"native:{self.device_id}:{self.channel_id}:{str(semantic).strip().lower()}"
 
-    def to_event(self, *, rule: Rule) -> "Event":
-        if rule.trigger_mode is not RuleMode.NATIVE_EVENT:
-            raise ValueError("native events require a native_event rule")
+    def to_event(self, *, rule: Rule) -> Event:
         if self.event_code not in rule.native_event_codes:
             raise ValueError(f"rule {rule.id} does not accept event code {self.event_code}")
-        source_event_id = self.source_event_id or f"{self.source.value}:{self.event_code}:{self.occurred_at.isoformat()}"
+        source_event_id = (
+            self.source_event_id
+            or f"{self.source.value}:{self.event_code}:{self.occurred_at.isoformat()}"
+        )
         return Event(
             id=f"evt-{uuid4().hex}",
-            dedup_key=f"native:{self.source.value}:{source_event_id}",
+            dedup_key=f"native:{self.source.value}:{self.device_id}:{source_event_id}",
             rule_id=rule.id,
             channel_id=rule.channel_id,
             stream_id=self.stream_id or rule.stream_id,
@@ -666,46 +507,50 @@ class Event:
     snapshot_uri: str | None = None
     clip_uri: str | None = None
     clip_status: str = "pending"
-    track: tuple[Point, ...] = ()
     assignees: tuple[str, ...] = ()
     stream_id: str | None = None
     site_id: str | None = None
     area_id: str | None = None
     camera_id: str | None = None
     device_id: str | None = None
-    source: EventSource | str = EventSource.LOCAL_INFERENCE
+    source: EventSource | str = EventSource.SYSTEM
     source_event_id: str | None = None
     native: bool = False
-    analysis_policy: AnalysisPolicy | str = AnalysisPolicy.LOCAL_FALLBACK
+    analysis_policy: AnalysisPolicy | str = AnalysisPolicy.NATIVE_ONLY
     correlation_key: str = ""
     dedup_window_seconds: float = 5.0
 
     def __post_init__(self) -> None:
         if not self.id or not self.dedup_key or not self.rule_id or not self.channel_id:
-            raise ValueError("event id, dedup_key, rule_id and stream_id are required")
+            raise ValueError("event id, dedup_key, rule_id and channel_id are required")
         if self.occurred_at.tzinfo is None:
             raise ValueError("event occurred_at must be timezone-aware")
         if self.stream_id is None:
             object.__setattr__(self, "stream_id", self.channel_id)
         try:
-            source = self.source if isinstance(self.source, EventSource) else EventSource(str(self.source))
-        except ValueError as exc:
-            raise ValueError("event source is invalid") from exc
-        try:
-            policy = (
-                self.analysis_policy
-                if isinstance(self.analysis_policy, AnalysisPolicy)
-                else AnalysisPolicy(str(self.analysis_policy))
+            source = (
+                self.source
+                if isinstance(self.source, EventSource)
+                else EventSource(str(self.source))
             )
         except ValueError as exc:
-            raise ValueError("event analysis policy is invalid") from exc
+            raise ValueError("event source is invalid") from exc
         object.__setattr__(self, "source", source)
-        object.__setattr__(self, "analysis_policy", policy)
+        object.__setattr__(
+            self,
+            "analysis_policy",
+            AnalysisPolicy.normalize(self.analysis_policy),
+        )
         object.__setattr__(self, "native", bool(self.native))
         if not isfinite(self.dedup_window_seconds) or self.dedup_window_seconds < 0:
             raise ValueError("event dedup_window_seconds must be finite and non-negative")
         if not self.correlation_key:
-            semantic = self.target.get("semantic") or self.target.get("condition") or self.target.get("label") or "event"
+            semantic = (
+                self.target.get("semantic")
+                or self.target.get("condition")
+                or self.target.get("label")
+                or "event"
+            )
             object.__setattr__(
                 self,
                 "correlation_key",
@@ -720,53 +565,6 @@ class Event:
             "camera_id": self.camera_id,
             "stream_id": self.stream_id or self.channel_id,
         }
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        rule: Rule,
-        frame: Frame,
-        detection: Detection,
-        track: Sequence[Point] = (),
-        level: str = "high",
-    ) -> "Event":
-        track_id = detection.track_id or "untracked"
-        dedup_key = f"{frame.stream_id}:{rule.id}:{track_id}:{frame.captured_at.isoformat()}"
-        nvr_time = frame.nvr_time
-        delta = None
-        if nvr_time is not None:
-            delta = round((frame.captured_at - nvr_time).total_seconds() * 1000)
-        return cls(
-            id=f"evt-{uuid4().hex}",
-            dedup_key=dedup_key,
-            rule_id=rule.id,
-            channel_id=rule.channel_id,
-            stream_id=frame.stream_id,
-            site_id=frame.site_id or rule.site_id,
-            area_id=frame.area_id or rule.area_id,
-            camera_id=frame.camera_id or rule.camera_id,
-            level=level,
-            occurred_at=frame.captured_at,
-            nvr_time=nvr_time,
-            clock_delta_ms=delta,
-            target={
-                "label": detection.label,
-                "confidence": detection.confidence,
-                "bbox": detection.bbox,
-                "track_id": detection.track_id,
-                "condition": rule.condition,
-                "rule_name": rule.name,
-                "assignees": list(rule.assignees),
-            },
-            track=tuple(track),
-            assignees=tuple(rule.assignees),
-            source=EventSource.LOCAL_INFERENCE,
-            native=False,
-            analysis_policy=AnalysisPolicy.LOCAL_FALLBACK,
-            correlation_key=f"semantic:{frame.stream_id}:{rule.condition}",
-            dedup_window_seconds=rule.dedup_window_seconds,
-        )
 
 
 def utc_now() -> datetime:

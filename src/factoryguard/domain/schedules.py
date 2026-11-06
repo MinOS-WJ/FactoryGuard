@@ -1,11 +1,45 @@
-from __future__ import annotations
-
 """Pure arming schedule rules for stream-level deployment control."""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+def parse_windows(text: str) -> tuple[TimeWindow, ...]:
+    """Parse comma or semicolon separated ``HH:MM-HH:MM`` windows."""
+    windows: list[TimeWindow] = []
+    for raw in text.replace("，", ",").replace("；", ",").replace(";", ",").split(","):
+        value = raw.strip()
+        if not value:
+            continue
+        if "-" not in value:
+            raise ValueError(f"时间段格式错误：{value}，应为 HH:MM-HH:MM")
+        start, end = (part.strip() for part in value.split("-", 1))
+        windows.append(TimeWindow(_parse_minute(start), _parse_minute(end)))
+    return tuple(windows)
+
+
+def _parse_minute(value: str) -> int:
+    try:
+        hour_text, minute_text = value.split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(f"时间格式错误：{value}") from exc
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise ValueError(f"时间超出范围：{value}")
+    return hour * 60 + minute
+
+
+def format_windows(windows: tuple[TimeWindow, ...]) -> str:
+    def format_minute(value: int) -> str:
+        return f"{value // 60:02d}:{value % 60:02d}"
+
+    return ", ".join(
+        f"{format_minute(item.start_minute)}-{format_minute(item.end_minute)}" for item in windows
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,9 +98,10 @@ class ArmingSchedule:
         """Evaluate the schedule at an aware wall-clock timestamp."""
         if at.tzinfo is None:
             raise ValueError("schedule evaluation time must be timezone-aware")
-        if self.override_armed is not None:
-            if self.override_until is None or at < self.override_until:
-                return self.override_armed
+        if self.override_armed is not None and (
+            self.override_until is None or at < self.override_until
+        ):
+            return self.override_armed
         if not self.enabled:
             return self.default_armed
         local_at = at.astimezone(self._zone())
@@ -79,9 +114,9 @@ class ArmingSchedule:
         if any(window.contains(minute) for window in today):
             return True
         previous = self.weekly[(local_at.weekday() - 1) % 7]
-        if minute < 1440 and any(window.crosses_midnight and minute < window.end_minute for window in previous):
-            return True
-        return False
+        return minute < 1440 and any(
+            window.crosses_midnight and minute < window.end_minute for window in previous
+        )
 
     def _zone(self) -> ZoneInfo | None:
         if self.timezone.strip().lower() in {"", "local", "system"}:
@@ -94,7 +129,9 @@ class ArmingSchedule:
     def as_dict(self) -> dict[str, Any]:
         return {
             "stream_id": self.stream_id,
-            "weekly": [[[window.start_minute, window.end_minute] for window in day] for day in self.weekly],
+            "weekly": [
+                [[window.start_minute, window.end_minute] for window in day] for day in self.weekly
+            ],
             "holidays": sorted(self.holidays),
             "enabled": self.enabled,
             "default_armed": self.default_armed,
@@ -123,4 +160,4 @@ class ArmingSchedule:
         )
 
 
-__all__ = ["ArmingSchedule", "TimeWindow"]
+__all__ = ["ArmingSchedule", "TimeWindow", "format_windows", "parse_windows"]

@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Manual RTSP/RTP compatibility adapter for cameras without ONVIF."""
+
+from __future__ import annotations
 
 from datetime import datetime
 
@@ -25,7 +25,9 @@ class RtspAdapter(DeviceAdapter):
 
     def __init__(self, device: VideoDevice, credentials: DeviceCredentials | None = None) -> None:
         super().__init__(device, credentials)
-        self._stream_uri = credentials.with_password_in_url(device.endpoint) if credentials else device.endpoint
+        self._stream_uri = (
+            credentials.with_password_in_url(device.endpoint) if credentials else device.endpoint
+        )
 
     def probe(self, *, timeout: float = 5.0) -> ProbeResult:
         require_open(self)

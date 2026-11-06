@@ -3,8 +3,8 @@ param(
     [string]$Mode = "gui",
     [string]$Url = "rtsp://localhost/live",
     [string]$Database = "data/factoryguard.db",
+    [string]$Config = "config/factoryguard.json",
     [string]$MediaDir = "events-media",
-    [string]$Model = "models/yolo11n.onnx",
     [string]$Python = "",
     [switch]$Check,
     [switch]$StrictCheck
@@ -34,19 +34,16 @@ if (-not (Test-Path -LiteralPath $entrypoint)) {
     throw "Missing entry point: $entrypoint"
 }
 
-& $Python -c "import PySide6, onnxruntime"
+& $Python -c "import PySide6, numpy"
 if ($LASTEXITCODE -ne 0) {
     throw "FactoryGuard runtime dependencies are missing. Run: python -m pip install -r requirements.txt"
 }
 
 if ($Check) {
-    $healthArgs = @(
-        "health",
-        "--db", $Database,
-        "--media-dir", $MediaDir,
-        "--model", $Model,
-        "--rtsp", $Url
-    )
+    $healthArgs = @("health", "--db", $Database, "--media-dir", $MediaDir)
+    if ($Url) {
+        $healthArgs += @("--rtsp", $Url)
+    }
     if ($StrictCheck) {
         $healthArgs += "--strict"
     }
@@ -54,5 +51,5 @@ if ($Check) {
     exit $LASTEXITCODE
 }
 
-& $Python $entrypoint $Mode --url $Url --db $Database --media-dir $MediaDir --model $Model
+& $Python $entrypoint $Mode --db $Database --config $Config
 exit $LASTEXITCODE

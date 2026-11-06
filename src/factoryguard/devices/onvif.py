@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """ONVIF device discovery, capability probing, media and PullPoint events.
 
 The implementation speaks the ONVIF SOAP contract directly so one lightweight
@@ -7,12 +5,12 @@ adapter works across vendor extensions. WS-Discovery is used only to find
 candidate XAddr values; all device operations then use authenticated SOAP.
 """
 
+from __future__ import annotations
+
 import base64
 import hashlib
 import os
-import re
 import socket
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,13 +22,13 @@ from typing import Any
 from uuid import uuid4
 
 from factoryguard.domain.models import (
-    AnalysisPolicy,
     DeviceCapabilities,
     DeviceProtocol,
     EventSource,
     NativeEvent,
     VideoDevice,
 )
+from factoryguard.net import read_http_error
 
 from .base import (
     DeviceAdapter,
@@ -43,7 +41,6 @@ from .base import (
     Recording,
     require_open,
 )
-
 
 WS_DISCOVERY_ADDRESS = ("239.255.255.250", 3702)
 SOAP_ENV = "http://www.w3.org/2003/05/soap-envelope"
@@ -79,10 +76,19 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def _child_text(node: ET.Element | None, local_name: str, default: str = "") -> str:
+def _child_text(
+    node: ET.Element | None,
+    local_name: str,
+    default: str = "",
+    *,
+    direct_only: bool = False,
+) -> str:
+    # direct_only limits the search to immediate children, which matters for
+    # SOAP replies that repeat the same tag inside sibling elements.
     if node is None:
         return default
-    for child in node.iter():
+    children = list(node) if direct_only else list(node.iter())
+    for child in children:
         if _local(child.tag) == local_name and child.text:
             return child.text.strip()
     return default
@@ -119,7 +125,9 @@ class OnvifDiscoveredDevice:
 class OnvifDiscovery:
     """WS-Discovery Probe implementation for local network inspection."""
 
-    def discover(self, *, timeout: float = 3.0, probes: int = 2) -> tuple[OnvifDiscoveredDevice, ...]:
+    def discover(
+        self, *, timeout: float = 3.0, probes: int = 2
+    ) -> tuple[OnvifDiscoveredDevice, ...]:
         if timeout <= 0 or probes < 1:
             raise ValueError("discovery timeout and probe count must be positive")
         probe = _ws_discovery_probe()
@@ -133,7 +141,7 @@ class OnvifDiscovery:
                 while time.monotonic() < deadline:
                     try:
                         data, _address = sock.recvfrom(65535)
-                    except socket.timeout:
+                    except TimeoutError:
                         break
                     for item in self._parse_matches(data):
                         found.setdefault(item.endpoint, item)
@@ -215,7 +223,11 @@ class OnvifSoapClient:
             raise RuntimeError(f"ONVIF returned invalid SOAP XML for {action}") from exc
         fault = _find_child(root, "Fault")
         if fault is not None:
-            reason = _child_text(fault, "Text") or _child_text(fault, "Reason") or _child_text(fault, "Value")
+            reason = (
+                _child_text(fault, "Text")
+                or _child_text(fault, "Reason")
+                or _child_text(fault, "Value")
+            )
             raise RuntimeError(f"ONVIF SOAP fault for {action}: {reason or 'unknown fault'}")
         return root
 
@@ -225,17 +237,23 @@ class OnvifSoapClient:
             content = getattr(response, "content", response)
             self.last_status = int(getattr(response, "status_code", 200))
             return content if isinstance(content, bytes) else str(content).encode("utf-8")
-        request = urllib.request.Request(address, data=payload, headers=dict(headers), method="POST")
+        request = urllib.request.Request(
+            address, data=payload, headers=dict(headers), method="POST"
+        )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 self.last_status = int(response.status)
                 return response.read()
         except urllib.error.HTTPError as exc:
             self.last_status = int(exc.code)
-            detail = exc.read(2048).decode("utf-8", errors="replace")
-            raise RuntimeError(f"ONVIF HTTP {exc.code} for {self.last_action}: {detail[:300]}") from exc
+            detail = read_http_error(exc)
+            raise RuntimeError(
+                f"ONVIF HTTP {exc.code} for {self.last_action}: {detail[:300]}"
+            ) from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"ONVIF connection failed for {self.last_action}: {exc.reason}") from exc
+            raise RuntimeError(
+                f"ONVIF connection failed for {self.last_action}: {exc.reason}"
+            ) from exc
 
     def _envelope(self, action: str, body: str) -> str:
         security = ""
@@ -244,9 +262,17 @@ class OnvifSoapClient:
             nonce = base64.b64encode(nonce_bytes).decode("ascii")
             created_dt = datetime.now(UTC)
             created = created_dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-            expires = (created_dt + timedelta(minutes=5)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            expires = (
+                (created_dt + timedelta(minutes=5))
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            )
             digest = base64.b64encode(
-                hashlib.sha1(nonce_bytes + created.encode("ascii") + self.credentials.password.encode("utf-8")).digest()
+                hashlib.sha1(
+                    nonce_bytes
+                    + created.encode("ascii")
+                    + self.credentials.password.encode("utf-8")
+                ).digest()
             ).decode("ascii")
             security = f"""
   <o:Security s:mustUnderstand="true" xmlns:o="{WSSE}" xmlns:u="{WSU}">
@@ -267,11 +293,20 @@ class OnvifSoapClient:
 
 
 def _xml_escape(value: str) -> str:
-    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    return (
+        value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
 
 
 class OnvifAdapter(DeviceAdapter):
     protocol = DeviceProtocol.ONVIF
+
+    # A camera that drops one poll must not end the alarm stream.  The
+    # subscription keeps retrying with a bounded backoff so a short outage
+    # heals on its own while a permanently offline device still gives up.
+    PULL_MAX_FAILURES: int = 10
+    PULL_BACKOFF_SECONDS: float = 2.0
+    PULL_BACKOFF_MAX_SECONDS: float = 15.0
 
     def __init__(
         self,
@@ -287,6 +322,7 @@ class OnvifAdapter(DeviceAdapter):
         self._services: dict[str, str] = {}
         self._profiles: tuple[DeviceChannel, ...] = ()
         self._media_is_media2 = False
+        self._pull_cancelled = False
 
     def probe(self, *, timeout: float = 5.0) -> ProbeResult:
         require_open(self)
@@ -302,19 +338,29 @@ class OnvifAdapter(DeviceAdapter):
                 latency_ms=latency,
                 info=self._info,
                 capabilities=capabilities,
-                diagnostics={"last_action": self.soap.last_action, "http_status": self.soap.last_status},
+                diagnostics={
+                    "last_action": self.soap.last_action,
+                    "http_status": self.soap.last_status,
+                },
             )
         except (RuntimeError, ValueError) as exc:
             return ProbeResult(
                 ok=False,
                 detail=str(exc),
                 latency_ms=(time.monotonic() - started) * 1000,
-                diagnostics={"last_action": self.soap.last_action, "http_status": self.soap.last_status},
+                diagnostics={
+                    "last_action": self.soap.last_action,
+                    "http_status": self.soap.last_status,
+                },
             )
 
     def get_device_info(self) -> DeviceInfo:
         require_open(self)
-        root = self.soap.call(_service_url(self.device.endpoint, "device_service"), "GetDeviceInformation", "<GetDeviceInformation/>")
+        root = self.soap.call(
+            _service_url(self.device.endpoint, "device_service"),
+            "GetDeviceInformation",
+            "<GetDeviceInformation/>",
+        )
         self._info = DeviceInfo(
             manufacturer=_child_text(root, "Manufacturer"),
             model=_child_text(root, "Model"),
@@ -328,10 +374,12 @@ class OnvifAdapter(DeviceAdapter):
         require_open(self)
         body = '<GetServices xmlns="http://www.onvif.org/ver10/device/wsdl"><IncludeCapability>true</IncludeCapability></GetServices>'
         try:
-            root = self.soap.call(_service_url(self.device.endpoint, "device_service"), "GetServices", body)
+            root = self.soap.call(
+                _service_url(self.device.endpoint, "device_service"), "GetServices", body
+            )
             for service in _items(root, "Service"):
-                namespace = _child_text(service, "Namespace")
-                xaddr = _child_text(service, "XAddr")
+                namespace = _child_text(service, "Namespace", direct_only=True)
+                xaddr = _child_text(service, "XAddr", direct_only=True)
                 if namespace and xaddr:
                     self._services[namespace] = xaddr
         except RuntimeError:
@@ -356,10 +404,27 @@ class OnvifAdapter(DeviceAdapter):
                     '<GetEventProperties xmlns="http://www.onvif.org/ver10/events/wsdl"/>',
                 )
                 topic_set = _find_child(event_root, "TopicSet")
+                if topic_set is None:
+                    for node in event_root.iter():
+                        if _local(node.tag) == "TopicSet":
+                            topic_set = node
+                            break
                 if topic_set is not None:
-                    event_types = tuple(
-                        sorted({_local(child.tag).lower() for child in list(topic_set)})
-                    )
+                    names: set[str] = set()
+                    for node in topic_set.iter():
+                        local = _local(node.tag).lower()
+                        if local in {"rule", "topic"}:
+                            label = node.attrib.get("Name") or node.attrib.get("Topic") or ""
+                            if label:
+                                names.add(label.split(":")[-1].split("/")[-1].lower())
+                    if not names:
+                        # Some cameras list the topics directly under TopicSet.
+                        for node in list(topic_set):
+                            local = _local(node.tag).lower()
+                            if local and local not in {"ruleengine"}:
+                                names.add(local)
+                    if names:
+                        event_types = tuple(sorted(names))
             except RuntimeError:
                 event_types = ()
         profiles: list[str] = []
@@ -381,10 +446,13 @@ class OnvifAdapter(DeviceAdapter):
         self._capabilities = DeviceCapabilities(
             live_video=any("media" in key.lower() for key in services),
             native_events=bool(event_types) or any("event" in key.lower() for key in services),
-            recording_search=any("recording" in key.lower() or "replay" in key.lower() for key in services),
+            recording_search=any(
+                "recording" in key.lower() or "replay" in key.lower() for key in services
+            ),
             ptz=any("ptz" in key.lower() for key in services),
             digital_io=any("deviceio" in key.lower() for key in services),
-            metadata=bool(event_types) or any("analytics" in key.lower() or "metadata" in key.lower() for key in services),
+            metadata=bool(event_types)
+            or any("analytics" in key.lower() or "metadata" in key.lower() for key in services),
             profiles=tuple(dict.fromkeys(profiles)),
             event_types=event_types,
         )
@@ -395,7 +463,11 @@ class OnvifAdapter(DeviceAdapter):
         service = self._service_for("media")
         if not service:
             raise RuntimeError("设备未提供 ONVIF Media 服务")
-        namespace = "http://www.onvif.org/ver20/media/wsdl" if self._media_is_media2 else "http://www.onvif.org/ver10/media/wsdl"
+        namespace = (
+            "http://www.onvif.org/ver20/media/wsdl"
+            if self._media_is_media2
+            else "http://www.onvif.org/ver10/media/wsdl"
+        )
         body = f'<GetProfiles xmlns="{namespace}"/>'
         root = self.soap.call(service, "GetProfiles", body)
         channels: list[DeviceChannel] = []
@@ -431,7 +503,11 @@ class OnvifAdapter(DeviceAdapter):
         service = self._service_for("media")
         stream = "RTP-Unicast"
         protocol = "RTSP"
-        namespace = "http://www.onvif.org/ver20/media/wsdl" if self._media_is_media2 else "http://www.onvif.org/ver10/media/wsdl"
+        namespace = (
+            "http://www.onvif.org/ver20/media/wsdl"
+            if self._media_is_media2
+            else "http://www.onvif.org/ver10/media/wsdl"
+        )
         body = f"""<GetStreamUri xmlns="{namespace}">
  <StreamSetup><Stream>{stream}</Stream><Transport><Protocol>{protocol}</Protocol></Transport></StreamSetup>
  <ProfileToken>{_xml_escape(profile.profile_token)}</ProfileToken>
@@ -440,7 +516,13 @@ class OnvifAdapter(DeviceAdapter):
         uri = _child_text(root, "Uri")
         if not uri:
             raise RuntimeError("ONVIF 未返回视频流地址")
-        return LiveStream(uri=uri, profile_id=profile.id, transport="rtsp", width=profile.width, height=profile.height)
+        return LiveStream(
+            uri=uri,
+            profile_id=profile.id,
+            transport="rtsp",
+            width=profile.width,
+            height=profile.height,
+        )
 
     def search_recordings(
         self,
@@ -455,7 +537,7 @@ class OnvifAdapter(DeviceAdapter):
         service = self._service_for("recording")
         if not service:
             raise RuntimeError("设备未启用 ONVIF Profile G 录像检索")
-        scope = f'<Scope><Value>{_xml_escape(channel_id)}</Value></Scope>'
+        scope = f"<Scope><Value>{_xml_escape(channel_id)}</Value></Scope>"
         body = f"""<FindRecordings xmlns="http://www.onvif.org/ver10/recording/wsdl">
  <SearchScope>{scope}</SearchScope>
  <IncludeJobs>false</IncludeJobs>
@@ -506,8 +588,16 @@ class OnvifAdapter(DeviceAdapter):
         require_open(self)
         service = self._service_for("events")
         if not service:
+            # Discovering the services here keeps the call self-contained
+            # instead of relying on a previous probe.
+            try:
+                self.get_capabilities()
+            except (RuntimeError, ValueError) as exc:
+                raise RuntimeError("设备未启用 ONVIF 事件服务") from exc
+            service = self._service_for("events")
+        if not service:
             raise RuntimeError("设备未启用 ONVIF 事件服务")
-        body = f"""<CreatePullPointSubscription xmlns="http://www.onvif.org/ver10/events/wsdl">
+        body = """<CreatePullPointSubscription xmlns="http://www.onvif.org/ver10/events/wsdl">
  <InitialTerminationTime>PT1H</InitialTerminationTime>
 </CreatePullPointSubscription>"""
         root = self.soap.call(service, "CreatePullPointSubscription", body)
@@ -518,14 +608,23 @@ class OnvifAdapter(DeviceAdapter):
         )
 
     def _pull_messages(self, address: str, channel_id: str | None) -> Iterator[NativeEvent]:
-        while not self.closed:
+        failures = 0
+        while not self.closed and not self._pull_cancelled:
             body = """<PullMessages xmlns="http://www.onvif.org/ver10/events/wsdl">
  <Timeout>PT30S</Timeout><MessageLimit>100</MessageLimit>
 </PullMessages>"""
             try:
                 root = self.soap.call(address, "PullMessages", body)
             except RuntimeError:
-                break
+                # A single dropped connection must not end the alarm stream.
+                # Retry with a bounded backoff and only give up when the
+                # camera has been unreachable for a sustained period.
+                failures += 1
+                if failures > self.PULL_MAX_FAILURES:
+                    break
+                time.sleep(min(self.PULL_BACKOFF_SECONDS * failures, self.PULL_BACKOFF_MAX_SECONDS))
+                continue
+            failures = 0
             for message in _items(root, "Message"):
                 event = self._parse_event(message, channel_id)
                 if event is not None:
@@ -541,24 +640,50 @@ class OnvifAdapter(DeviceAdapter):
             if name in {"source", "channel", "channelid", "videosourceconfigurationtoken"}:
                 source_channel = item.attrib.get("Value") or source_channel
         data = _find_child(message, "Data")
-        values = {item.attrib.get("Name", "").lower(): item.attrib.get("Value", "") for item in _items(data, "SimpleItem")}
+        values = {
+            item.attrib.get("Name", "").lower(): item.attrib.get("Value", "")
+            for item in _items(data, "SimpleItem")
+        }
         state = str(values.get("state", values.get("value", ""))).lower()
-        code = topic.rsplit("/", 1)[-1].lower() or "propertyoperation" if "PropertyOperation" in message.attrib else "onvif_event"
+        code = (
+            topic.rsplit("/", 1)[-1].lower() or "propertyoperation"
+            if "PropertyOperation" in message.attrib
+            else "onvif_event"
+        )
         if code in {"propertyoperation", "source"} and topic:
             code = topic.lower().replace("/", ".")
-        occurred = _utc(_child_text(message, "UtcTime"))
-        source_event_id = message.attrib.get("PropertyOperation") or _child_text(message, "Message") or f"{code}:{occurred.isoformat()}"
+        occurred = _utc(message.attrib.get("UtcTime") or _child_text(message, "UtcTime"))
+        fingerprint = "|".join(
+            (
+                topic,
+                occurred.isoformat(),
+                source_channel or "",
+                code,
+                repr(sorted(values.items())),
+            )
+        )
+        source_event_id = f"onvif-{hashlib.sha1(fingerprint.encode('utf-8')).hexdigest()}"
         return NativeEvent(
             device_id=self.device.id,
             channel_id=source_channel or "unknown",
             event_code=code,
             occurred_at=occurred,
             source=EventSource.ONVIF,
-            title=topic or code,
-            level="high" if state in {"true", "active", "triggered"} else "info",
+            title=_friendly_onvif_title(topic, code),
+            level=(
+                "high"
+                if state in {"true", "active", "triggered", "on", "open"}
+                else "info"
+                if state in {"false", "inactive", "idle", "off", "closed"}
+                else "medium"
+            ),
             source_event_id=source_event_id,
             stream_id=source_channel,
-            payload={"topic": topic, "items": values, "raw_property_operation": message.attrib.get("PropertyOperation", "")},
+            payload={
+                "topic": topic,
+                "items": values,
+                "raw_property_operation": message.attrib.get("PropertyOperation", ""),
+            },
         )
 
     def _service_for(self, kind: str) -> str:
@@ -569,11 +694,32 @@ class OnvifAdapter(DeviceAdapter):
 
     def close(self) -> None:
         self.closed = True
+        self._pull_cancelled = True
+
+
+def _friendly_onvif_title(topic: str, code: str) -> str:
+    lowered = f"{topic} {code}".lower()
+    mappings = (
+        (("tamper", "遮挡"), "摄像头遮挡告警"),
+        (("videoloss", "videosignal"), "视频信号丢失"),
+        (("fielddetector", "fielddetection", "intrusion"), "检测到区域入侵"),
+        (("linedetector", "linecrossing"), "检测到越线"),
+        (("loitering", "dwell"), "检测到人员滞留"),
+        (("cellmotiondetector", "motiondetect", "motion"), "检测到移动"),
+        (("alarm",), "设备主动报警"),
+    )
+    for markers, label in mappings:
+        if any(marker in lowered for marker in markers):
+            return label
+    return "设备原生告警"
 
 
 def _service_url(endpoint: str, default_path: str) -> str:
     lowered = endpoint.lower()
-    if any(marker in lowered for marker in ("/onvif/", "/device_service", "/device/wsdl", "/media_service")):
+    if any(
+        marker in lowered
+        for marker in ("/onvif/", "/device_service", "/device/wsdl", "/media_service")
+    ):
         return endpoint
     return endpoint.rstrip("/") + "/" + default_path
 
@@ -587,7 +733,7 @@ def _int_text(value: str) -> int:
 
 __all__ = [
     "OnvifAdapter",
-    "OnvifDiscovery",
     "OnvifDiscoveredDevice",
+    "OnvifDiscovery",
     "OnvifSoapClient",
 ]

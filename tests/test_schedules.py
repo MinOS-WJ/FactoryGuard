@@ -1,8 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
-from factoryguard.domain.schedules import ArmingSchedule, TimeWindow
+from factoryguard.domain.schedules import ArmingSchedule, TimeWindow, format_windows, parse_windows
 from factoryguard.storage.sqlite import SQLiteStore
-from factoryguard.ui.schedule_dialog import format_windows, parse_windows
 
 
 def test_schedule_handles_cross_midnight_holidays_and_override():
@@ -59,7 +58,7 @@ def test_schedule_evaluates_in_configured_timezone():
     assert schedule.is_armed(datetime(2026, 1, 5, 0, 30, tzinfo=UTC)) is False
 
 
-def test_schedule_editor_time_parser_round_trips_and_rejects_invalid_ranges():
+def test_schedule_time_parser_round_trips_and_rejects_invalid_ranges():
     windows = parse_windows("08:00-18:00, 22:30-02:15")
     assert format_windows(windows) == "08:00-18:00, 22:30-02:15"
     assert parse_windows("08:00-18:00，22:30-02:15") == windows

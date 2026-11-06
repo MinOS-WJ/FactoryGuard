@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """The physical hierarchy used by standard video device integrations.
 
 The registry deliberately lives in the domain layer. UI and persistence
@@ -7,8 +5,11 @@ adapters present or store the tree while media, native events and local
 fallback analysis resolve the same immutable identity path.
 """
 
+from __future__ import annotations
+
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable
+from typing import Any
 
 from .models import Area, CameraDevice, Site, VideoDevice, VideoStream
 
@@ -112,7 +113,9 @@ class EntityRegistry:
                 progress = True
             if not progress:
                 unresolved = ", ".join(area.id for area in pending_areas)
-                raise ValueError(f"area hierarchy contains an unknown parent or cycle: {unresolved}")
+                raise ValueError(
+                    f"area hierarchy contains an unknown parent or cycle: {unresolved}"
+                )
         for device in devices:
             self.add_device(device)
         for camera in cameras:
@@ -150,7 +153,9 @@ class EntityRegistry:
         if area.parent_id is not None:
             parent = self._areas.get(area.parent_id)
             if parent is None:
-                raise ValueError(f"area {area.id!r} references unknown parent area {area.parent_id!r}")
+                raise ValueError(
+                    f"area {area.id!r} references unknown parent area {area.parent_id!r}"
+                )
             if parent.site_id != area.site_id:
                 raise ValueError("nested areas must belong to the same site")
             if area.parent_id == area.id:
@@ -176,7 +181,9 @@ class EntityRegistry:
         if camera.device_id is not None:
             device = self._devices.get(camera.device_id)
             if device is None:
-                raise ValueError(f"camera {camera.id!r} references unknown device {camera.device_id!r}")
+                raise ValueError(
+                    f"camera {camera.id!r} references unknown device {camera.device_id!r}"
+                )
             if device.area_id != camera.area_id:
                 raise ValueError("camera and physical device must belong to the same area")
         self._insert(self._cameras, camera, "camera")
@@ -186,7 +193,11 @@ class EntityRegistry:
         camera = self._cameras.get(stream.camera_id)
         if camera is None:
             raise ValueError(f"stream {stream.id!r} references unknown camera {stream.camera_id!r}")
-        if stream.device_id is not None and camera.device_id is not None and stream.device_id != camera.device_id:
+        if (
+            stream.device_id is not None
+            and camera.device_id is not None
+            and stream.device_id != camera.device_id
+        ):
             raise ValueError("stream device_id must match its video channel")
         self._insert(self._streams, stream, "stream")
         return stream
@@ -208,7 +219,9 @@ class EntityRegistry:
 
     def device_path(self, device_id: str) -> DevicePath:
         device = self.get_device(device_id)
-        return DevicePath(site=self.get_site(device.site_id), area=self.get_area(device.area_id), device=device)
+        return DevicePath(
+            site=self.get_site(device.site_id), area=self.get_area(device.area_id), device=device
+        )
 
     def stream_path(self, stream_id: str) -> EntityPath:
         stream = self.get_stream(stream_id)
@@ -226,9 +239,13 @@ class EntityRegistry:
             chain.append(current)
             current = self._areas.get(current.parent_id) if current.parent_id else None
         chain.reverse()
-        return EntityPath(site=site, areas=tuple(chain), camera=camera, stream=stream, device=device)
+        return EntityPath(
+            site=site, areas=tuple(chain), camera=camera, stream=stream, device=device
+        )
 
-    def streams_for_area(self, area_id: str, *, include_descendants: bool = True) -> tuple[VideoStream, ...]:
+    def streams_for_area(
+        self, area_id: str, *, include_descendants: bool = True
+    ) -> tuple[VideoStream, ...]:
         self.get_area(area_id)
         area_ids = {area_id}
         if include_descendants:
@@ -261,7 +278,9 @@ class EntityRegistry:
             channels = [
                 {
                     **asdict(camera),
-                    "streams": [asdict(stream) for stream in self.streams if stream.camera_id == camera.id],
+                    "streams": [
+                        asdict(stream) for stream in self.streams if stream.camera_id == camera.id
+                    ],
                 }
                 for camera in self.cameras
                 if camera.device_id == device.id
@@ -270,7 +289,9 @@ class EntityRegistry:
         legacy_channels = [
             {
                 **asdict(camera),
-                "streams": [asdict(stream) for stream in self.streams if stream.camera_id == camera.id],
+                "streams": [
+                    asdict(stream) for stream in self.streams if stream.camera_id == camera.id
+                ],
             }
             for camera in self.cameras
             if camera.area_id == area.id and camera.device_id is None
@@ -280,7 +301,9 @@ class EntityRegistry:
             data["cameras"].extend(device.get("channels", ()))
         if legacy_channels:
             data.setdefault("legacy_channels", []).extend(legacy_channels)
-        data["children"] = [self._area_tree(child) for child in self.areas if child.parent_id == area.id]
+        data["children"] = [
+            self._area_tree(child) for child in self.areas if child.parent_id == area.id
+        ]
         return data
 
     def to_dict(self) -> dict[str, Any]:
@@ -293,7 +316,7 @@ class EntityRegistry:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "EntityRegistry":
+    def from_dict(cls, payload: dict[str, Any]) -> EntityRegistry:
         if not isinstance(payload, dict):
             raise TypeError("topology payload must be a mapping")
         return cls(

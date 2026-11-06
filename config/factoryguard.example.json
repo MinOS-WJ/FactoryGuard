@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "llm": {
+    "enabled": false,
+    "provider": "",
+    "endpoint": "",
+    "model": "",
+    "timeout": 35,
+    "api_key": ""
+  },
+  "gb28181": {
+    "enabled": false,
+    "platform_id": "",
+    "domain": "",
+    "port": 5060,
+    "password": ""
+  },
+  "branding": {
+    "banner_svg": "",
+    "banner_height": 82
+  },
+  "notifications": {
+    "enabled": false,
+    "timeout": 10,
+    "webhook": {
+      "enabled": false,
+      "url": "",
+      "secret": ""
+    },
+    "email": {
+      "enabled": false,
+      "host": "",
+      "port": 587,
+      "username": "",
+      "password": "",
+      "sender": "",
+      "recipients": [],
+      "security": "starttls"
+    },
+    "sms": {
+      "enabled": false,
+      "endpoint": "",
+      "provider": "custom_http",
+      "token": "",
+      "sender": "",
+      "template_id": "",
+      "recipients": []
+    }
+  },
+  "credentials": {}
+}

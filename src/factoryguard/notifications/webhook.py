@@ -12,6 +12,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from factoryguard.domain.models import Event
+from factoryguard.net import close_http_error
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,13 +66,16 @@ def build_webhook_request(
         "clip_uri": event.clip_uri,
         "clip_status": event.clip_status,
         "status": event.status.value,
-        "track": event.track,
     }
-    body = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    body = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     timestamp_text = str(int(time.time()) if timestamp is None else timestamp)
     nonce_text = nonce or secrets.token_hex(16)
     signature = hmac.new(
-        secret.encode("utf-8"), body + timestamp_text.encode("ascii") + nonce_text.encode("ascii"), hashlib.sha256
+        secret.encode("utf-8"),
+        body + timestamp_text.encode("ascii") + nonce_text.encode("ascii"),
+        hashlib.sha256,
     ).hexdigest()
     return WebhookRequest(
         url=url,
@@ -94,10 +98,13 @@ class WebhookNotifier:
         self.timeout = timeout
 
     def send(self, request: WebhookRequest) -> tuple[bool, str]:
-        http_request = Request(request.url, data=request.body, headers=dict(request.headers), method="POST")
+        http_request = Request(
+            request.url, data=request.body, headers=dict(request.headers), method="POST"
+        )
         try:
             with urlopen(http_request, timeout=self.timeout) as response:
                 status = getattr(response, "status", 200)
                 return 200 <= status < 300, f"HTTP {status}"
         except (OSError, URLError) as exc:
+            close_http_error(exc)
             return False, str(exc)

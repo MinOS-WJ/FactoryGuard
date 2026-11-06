@@ -72,12 +72,44 @@ WEBHOOK_PRESETS: tuple[WebhookProviderPreset, ...] = (
 )
 
 EMAIL_PRESETS: tuple[EmailProviderPreset, ...] = (
-    EmailProviderPreset("163", "网易 163 邮箱", "smtp.163.com", 465, "ssl", "使用客户端授权码，不要填写网页登录密码。"),
-    EmailProviderPreset("139", "中国移动 139 邮箱", "smtp.139.com", 465, "ssl", "通常需要在邮箱设置中开启 SMTP 并使用授权码。"),
-    EmailProviderPreset("qq", "QQ 邮箱", "smtp.qq.com", 465, "ssl", "使用 QQ 邮箱生成的 SMTP 授权码。"),
-    EmailProviderPreset("outlook", "Outlook", "smtp-mail.outlook.com", 587, "starttls", "Microsoft 账号可能需要应用密码或 OAuth 策略支持。"),
-    EmailProviderPreset("google", "Google Gmail", "smtp.gmail.com", 587, "starttls", "建议启用两步验证并生成应用专用密码。"),
-    EmailProviderPreset("custom", "自定义 SMTP", "", 587, "starttls", "手动填写 SMTP 主机、端口和加密方式。"),
+    EmailProviderPreset(
+        "163",
+        "网易 163 邮箱",
+        "smtp.163.com",
+        465,
+        "ssl",
+        "使用客户端授权码，不要填写网页登录密码。",
+    ),
+    EmailProviderPreset(
+        "139",
+        "中国移动 139 邮箱",
+        "smtp.139.com",
+        465,
+        "ssl",
+        "通常需要在邮箱设置中开启 SMTP 并使用授权码。",
+    ),
+    EmailProviderPreset(
+        "qq", "QQ 邮箱", "smtp.qq.com", 465, "ssl", "使用 QQ 邮箱生成的 SMTP 授权码。"
+    ),
+    EmailProviderPreset(
+        "outlook",
+        "Outlook",
+        "smtp-mail.outlook.com",
+        587,
+        "starttls",
+        "Microsoft 账号可能需要应用密码或 OAuth 策略支持。",
+    ),
+    EmailProviderPreset(
+        "google",
+        "Google Gmail",
+        "smtp.gmail.com",
+        587,
+        "starttls",
+        "建议启用两步验证并生成应用专用密码。",
+    ),
+    EmailProviderPreset(
+        "custom", "自定义 SMTP", "", 587, "starttls", "手动填写 SMTP 主机、端口和加密方式。"
+    ),
 )
 
 SMS_PRESETS: tuple[SmsProviderPreset, ...] = (

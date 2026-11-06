@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Small RFC 3261 message and digest helpers for GB/T 28181 signaling."""
+
+from __future__ import annotations
 
 import hashlib
 import re
@@ -24,7 +24,7 @@ class SipMessage:
     version: str = "SIP/2.0"
 
     @classmethod
-    def parse(cls, data: bytes) -> "SipMessage":
+    def parse(cls, data: bytes) -> SipMessage:
         if not data:
             raise SipParseError("empty SIP message")
         try:
@@ -49,12 +49,19 @@ class SipMessage:
             if b":" not in raw:
                 raise SipParseError(f"invalid SIP header: {raw[:80]!r}")
             name, value = raw.split(b":", 1)
-            headers.append((name.decode("utf-8", errors="replace").strip(), value.decode("utf-8", errors="replace").strip()))
+            headers.append(
+                (
+                    name.decode("utf-8", errors="replace").strip(),
+                    value.decode("utf-8", errors="replace").strip(),
+                )
+            )
         if start.startswith("SIP/2.0 "):
             parts = start.split(" ", 2)
             if len(parts) < 2 or not parts[1].isdigit():
                 raise SipParseError("invalid SIP response status")
-            return cls("", "", int(parts[1]), parts[2] if len(parts) > 2 else "", tuple(headers), body)
+            return cls(
+                "", "", int(parts[1]), parts[2] if len(parts) > 2 else "", tuple(headers), body
+            )
         parts = start.split(" ")
         if len(parts) != 3 or not parts[2].startswith("SIP/"):
             raise SipParseError("invalid SIP request line")
@@ -124,13 +131,18 @@ class SipMessage:
         *,
         extra_headers: tuple[tuple[str, str], ...] = (),
         body: bytes = b"",
-    ) -> "SipMessage":
+    ) -> SipMessage:
         if not self.is_request:
             raise ValueError("cannot build a response from a SIP response")
         headers = [
             ("Via", self.via),
             ("From", self.from_header),
-            ("To", self.to_header if (status < 300 and self.tag) else _with_tag(self.to_header, "fg-" + secrets.token_hex(6))),
+            (
+                "To",
+                self.to_header
+                if (status < 300 and self.tag)
+                else _with_tag(self.to_header, "fg-" + secrets.token_hex(6)),
+            ),
             ("Call-ID", self.call_id),
             ("CSeq", self.cseq),
             ("Content-Length", str(len(body))),
@@ -168,7 +180,7 @@ class SipMessage:
         content_type: str = "",
         body: bytes = b"",
         extra_headers: tuple[tuple[str, str], ...] = (),
-    ) -> "SipMessage":
+    ) -> SipMessage:
         headers = [
             ("Via", via),
             ("Max-Forwards", "70"),
@@ -193,7 +205,7 @@ class DigestChallenge:
     qop: str = "auth"
 
     @classmethod
-    def parse(cls, value: str) -> "DigestChallenge":
+    def parse(cls, value: str) -> DigestChallenge:
         fields = dict(re.findall(r'(\w+)=("[^"]*"|[^,\s]+)', value))
         clean = {key: unquote(item.strip('"')) for key, item in fields.items()}
         return cls(
@@ -234,7 +246,9 @@ def digest_response(
         ha1 = hashlib.new(hash_name, f"{ha1}:{nonce}:{cnonce}".encode()).hexdigest()
     ha2 = hashlib.new(hash_name, f"{method}:{uri}".encode()).hexdigest()
     if qop:
-        response = hashlib.new(hash_name, f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()).hexdigest()
+        response = hashlib.new(
+            hash_name, f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()
+        ).hexdigest()
     else:
         response = hashlib.new(hash_name, f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
     parts = [

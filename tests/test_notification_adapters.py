@@ -1,29 +1,43 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import UTC, datetime
 import json
 import smtplib
+from dataclasses import replace
+from datetime import UTC, datetime
+from typing import ClassVar
 
 import pytest
 
-from factoryguard.notifications.adapters import parse_recipients
-from factoryguard.domain.models import Detection, Event, Frame, Rule, RuleType
-from factoryguard.notifications.adapters import EmailAdapter, SmsHttpAdapter, parse_phone_recipients
+from factoryguard.domain.models import Event, EventSource, NativeEvent, Rule
 from factoryguard.notifications.actions import execute_http_action
+from factoryguard.notifications.adapters import (
+    EmailAdapter,
+    SmsHttpAdapter,
+    parse_phone_recipients,
+    parse_recipients,
+)
 
 
 def _event() -> Event:
-    rule = Rule("email-rule", "CH01", "fence", RuleType.POLYGON, ((0, 0), (10, 0), (10, 10)))
-    return Event.create(
-        rule=rule,
-        frame=Frame("CH01", 1, datetime(2026, 1, 1, tzinfo=UTC), 20, 20),
-        detection=Detection("person", 0.9, (1, 1, 4, 8), "track-1"),
+    rule = Rule(
+        "email-rule",
+        "CH01",
+        "设备原生告警",
+        native_event_codes=("person",),
     )
+    native = NativeEvent(
+        device_id="device-1",
+        channel_id="CH01",
+        event_code="person",
+        occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+        source=EventSource.SYSTEM,
+        stream_id="CH01",
+    )
+    return native.to_event(rule=rule)
 
 
 class _FakeSMTP:
-    instances: list["_FakeSMTP"] = []
+    instances: ClassVar[list[_FakeSMTP]] = []
 
     def __init__(self, host, port, *, timeout):
         self.host = host
@@ -95,6 +109,7 @@ def test_email_adapter_attaches_existing_media(tmp_path, monkeypatch):
     attachments = list(_FakeSMTP.instances[-1].message.iter_attachments())
     assert {item.get_filename() for item in attachments} == {"snapshot.png", "clip.mp4"}
 
+
 def test_email_adapter_rejects_conflicting_tls_modes():
     try:
         EmailAdapter(
@@ -127,7 +142,12 @@ def test_parse_recipients_accepts_common_delimiters_and_deduplicates():
 
 
 def test_parse_recipients_rejects_header_injection_and_invalid_mailboxes():
-    for value in ("bad", "a@example.test\nBcc: attacker@example.test", "a@@example.test", "@example.test"):
+    for value in (
+        "bad",
+        "a@example.test\nBcc: attacker@example.test",
+        "a@@example.test",
+        "@example.test",
+    ):
         try:
             parse_recipients(value)
         except ValueError:

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Field diagnostics for RTSP, ONVIF and GB/T 28181 devices.
 
 Examples:
@@ -9,6 +7,8 @@ Examples:
     python tools/device_probe.py sip-digest --username 340200000000000001 --password-env GB_PASSWORD --realm 3402000000 --uri sip:340200000000000001@3402000000
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -17,11 +17,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from factoryguard.devices.base import DeviceCredentials  # noqa: E402
-from factoryguard.devices.gb28181.sip import digest_response  # noqa: E402
-from factoryguard.devices.onvif import OnvifAdapter, OnvifDiscovery  # noqa: E402
-from factoryguard.devices.rtsp import RtspAdapter  # noqa: E402
-from factoryguard.domain.models import DeviceProtocol, VideoDevice  # noqa: E402
+from factoryguard.devices.base import DeviceCredentials
+from factoryguard.devices.gb28181.sip import digest_response
+from factoryguard.devices.onvif import OnvifAdapter, OnvifDiscovery
+from factoryguard.devices.rtsp import RtspAdapter
+from factoryguard.domain.models import DeviceProtocol, VideoDevice
 
 
 def _password(args: argparse.Namespace) -> str:
@@ -46,10 +46,14 @@ def _print(value: object) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="device_probe", description="FactoryGuard 现场设备诊断工具")
+    parser = argparse.ArgumentParser(
+        prog="device_probe", description="FactoryGuard 现场设备诊断工具"
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    discover = commands.add_parser("discover-onvif", help="发送 WS-Discovery 并列出发现的 ONVIF 设备")
+    discover = commands.add_parser(
+        "discover-onvif", help="发送 WS-Discovery 并列出发现的 ONVIF 设备"
+    )
     discover.add_argument("--timeout", type=float, default=3.0)
 
     rtsp = commands.add_parser("probe-rtsp", help="读取一路 RTSP 首帧并检查分辨率")

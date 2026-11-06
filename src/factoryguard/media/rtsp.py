@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import os
 import queue
-import re
+import signal
 import subprocess
-import threading
 import tempfile
-from contextlib import contextmanager
+import threading
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from math import isfinite
-from typing import Iterator
 
 import numpy as np
 
+from .errors import redact_media_credentials, summarise_media_error
 from .ffmpeg import FFmpegInstallation
 
 
@@ -25,10 +26,19 @@ class RawFrame:
 
 
 def _redact_credentials(value: str) -> str:
-    return re.sub(r"((?:rtsp|rtsps|https?)://)[^/@\s]+@", r"\1***:***@", value, flags=re.IGNORECASE)
+    return redact_media_credentials(value)
+
 
 def _creation_flags() -> int:
-    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0
+    """Return the Windows creation flags used for every FFmpeg child."""
+    if os.name != "nt":
+        return 0
+    # A dedicated process group lets the console stop FFmpeg together with
+    # the helper processes FFmpeg starts.
+    return int(
+        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    )
 
 
 def _read_exact(stream: object, size: int) -> bytes | None:
@@ -41,14 +51,65 @@ def _read_exact(stream: object, size: int) -> bytes | None:
     return bytes(chunks)
 
 
+@contextmanager
+def _temporary_stderr_file() -> Iterator[object]:
+    with tempfile.TemporaryFile() as handle:
+        yield handle
+
+
 def _terminate_process(process: object) -> None:
-    if process.poll() is None:
-        process.terminate()
+    """Stop FFmpeg and every process it started.
+
+    FFmpeg can spawn helper processes.  Terminating only the direct child
+    leaves those helpers running, and a long-lived console would slowly
+    accumulate stray encoders.
+    """
+    if process.poll() is not None:
+        return
+    _kill_process_tree(process)
+    try:
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
         try:
             process.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=2.0)
+            pass
+
+
+def _kill_process_tree(process: object) -> None:
+    """Terminate the child and its descendants on Windows."""
+    if os.name != "nt":
+        try:
+            process.terminate()
+        except (OSError, ValueError):
+            pass
+        return
+    creation_flags = int(getattr(process, "_creationflags", 0) or 0)
+    if creation_flags & getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0):
+        try:
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+            return
+        except (OSError, ValueError, AttributeError):
+            pass
+    # Fall back to a plain terminate and let taskkill remove the rest.
+    try:
+        process.terminate()
+    except (OSError, ValueError):
+        pass
+    pid = getattr(process, "pid", None)
+    if pid is None:
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True,
+            check=False,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
 
 class RTSPCapture:
     """Small bounded FFmpeg capture adapter for RTSP smoke tests."""
@@ -90,7 +151,8 @@ class RTSPCapture:
             height=self.height,
             read_timeout=timeout,
         )
-        stderr_file = tempfile.TemporaryFile()
+        stack = ExitStack()
+        stderr_file = stack.enter_context(_temporary_stderr_file())
         try:
             process = subprocess.Popen(
                 command,
@@ -101,10 +163,11 @@ class RTSPCapture:
                 creationflags=_creation_flags(),
             )
         except OSError as exc:
-            stderr_file.close()
+            stack.close()
             raise RuntimeError(f"FFmpeg could not be started: {exc}") from exc
         if process.stdout is None:
             _terminate_process(process)
+            stack.close()
             raise RuntimeError("FFmpeg did not expose a stdout pipe")
 
         frame_queue: queue.Queue[tuple[bytes | None, Exception | None]] = queue.Queue(maxsize=2)
@@ -128,7 +191,7 @@ class RTSPCapture:
                         return
                     if not post((payload, None)):
                         return
-            except Exception as exc:  # noqa: BLE001 - forward reader failures to the consumer
+            except Exception as exc:
                 post((None, exc))
 
         reader = threading.Thread(target=read_frames, name="rtsp-frame-reader", daemon=True)
@@ -147,10 +210,14 @@ class RTSPCapture:
                     if process.poll() not in (None, 0):
                         stderr_file.seek(0)
                         detail = stderr_file.read().decode("utf-8", errors="replace")[-1000:]
-                        raise RuntimeError(f"FFmpeg RTSP stream ended ({process.returncode}): {_redact_credentials(detail)}")
+                        raise RuntimeError(
+                            f"FFmpeg RTSP stream ended ({process.returncode}): {_redact_credentials(detail)}"
+                        )
                     break
                 yield RawFrame(
-                    image=np.frombuffer(payload, dtype=np.uint8).reshape((self.height, self.width, 3)),
+                    image=np.frombuffer(payload, dtype=np.uint8).reshape(
+                        (self.height, self.width, 3)
+                    ),
                     frame_no=frame_no,
                 )
                 frame_no += 1
@@ -165,7 +232,8 @@ class RTSPCapture:
             except (OSError, ValueError):
                 pass
             reader.join(timeout=2.0)
-            stderr_file.close()
+            stack.close()
+
     def capture_one(self, *, timeout: float = 20.0) -> RawFrame:
         if not isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -179,8 +247,7 @@ class RTSPCapture:
         try:
             completed = subprocess.run(
                 command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 timeout=timeout,
                 check=False,
                 shell=False,
@@ -192,7 +259,11 @@ class RTSPCapture:
             raise RuntimeError(f"FFmpeg could not be started: {exc}") from exc
         if completed.returncode != 0:
             detail = completed.stderr.decode("utf-8", errors="replace")[-1000:]
-            raise RuntimeError(f"FFmpeg RTSP capture failed ({completed.returncode}): {_redact_credentials(detail)}")
+            safe = _redact_credentials(detail)
+            raise RuntimeError(
+                "FFmpeg RTSP capture failed "
+                f"({completed.returncode}): {summarise_media_error(safe)}"
+            )
         if len(completed.stdout) < self.frame_bytes:
             raise RuntimeError(
                 f"FFmpeg returned {len(completed.stdout)} bytes; expected {self.frame_bytes}"

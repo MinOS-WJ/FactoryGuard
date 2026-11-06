@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
+import threading
+import time
 import xml.etree.ElementTree as ET
-from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-import pytest
-
+from factoryguard.agent.context import build_operational_context
+from factoryguard.app.device_manager import DeviceManager
 from factoryguard.app.native_events import NativeEventIngestor, decide_analysis
-from factoryguard.devices.base import DeviceCredentials
+from factoryguard.devices.base import DeviceCredentials, EventSubscription, ProbeResult
 from factoryguard.devices.gb28181.server import Gb28181Platform
-from factoryguard.devices.gb28181.sip import DigestChallenge, SipMessage, digest_response, verify_digest
+from factoryguard.devices.gb28181.sip import (
+    DigestChallenge,
+    SipMessage,
+    digest_response,
+    verify_digest,
+)
 from factoryguard.devices.onvif import OnvifAdapter, OnvifDiscovery
 from factoryguard.domain.models import (
     AnalysisPolicy,
@@ -21,21 +26,15 @@ from factoryguard.domain.models import (
     CameraDevice,
     DeviceCapabilities,
     DeviceProtocol,
-    Event,
     EventSource,
     NativeEvent,
     Rule,
-    RuleMode,
     Site,
     StreamRole,
     VideoDevice,
     VideoStream,
 )
 from factoryguard.domain.topology import EntityRegistry
-from factoryguard.inference.base import InferenceHealth
-from factoryguard.media.rtsp import RawFrame
-from factoryguard.ui.worker import MonitorConfig, MonitorWorker, StreamRuntimeConfig
-from factoryguard.inference.profiles import ModelBinding, ModelProfile
 from factoryguard.security.credentials import CredentialVault, XorTestProtector, default_vault
 from factoryguard.storage.sqlite import SQLiteStore
 from factoryguard.topology_io import topology_from_csv, topology_to_csv
@@ -62,7 +61,9 @@ def _topology() -> EntityRegistry:
                 ),
             ),
         ),
-        cameras=(CameraDevice("camera-1", "area-1", "东门", device_id="device-1", channel_id="ch1"),),
+        cameras=(
+            CameraDevice("camera-1", "area-1", "东门", device_id="device-1", channel_id="ch1"),
+        ),
         streams=(
             VideoStream(
                 "stream-1",
@@ -71,12 +72,11 @@ def _topology() -> EntityRegistry:
                 "rtsp://10.0.0.8/live",
                 StreamRole.SUB,
                 device_id="device-1",
-                analysis_policy=AnalysisPolicy.LOCAL_FALLBACK,
+                analysis_policy=AnalysisPolicy.NATIVE_ONLY,
                 native_event_codes=("motiondetect",),
             ),
         ),
     )
-
 
 
 def test_device_health_snapshot_round_trip():
@@ -116,6 +116,66 @@ def test_device_health_snapshot_round_trip():
         store.close()
 
 
+def test_camera_card_warns_when_the_alarm_subscription_dies(tmp_path):
+    """An online camera with a dead subscription must still be flagged."""
+    store = SQLiteStore(tmp_path / "subscription-warning.db")
+    store.save_topology(_topology())
+    store.set_device_subscription(
+        "device-1",
+        source="onvif",
+        state="degraded",
+        detail="订阅线程已退出",
+        actor="test",
+    )
+    store.set_stream_health(
+        "stream-1",
+        "online",
+        "已连接并取帧",
+        updated_at=datetime.now(UTC),
+        actor="test",
+    )
+
+    context = build_operational_context(store)
+    camera = context.cameras[0]
+
+    assert camera.is_online
+    assert camera.subscription_label
+    assert "告警订阅异常" in camera.subscription_label
+    assert "订阅线程已退出" in camera.subscription_label
+    store.close()
+
+
+def test_operational_context_exposes_native_subscription_health():
+    store = SQLiteStore(":memory:")
+    try:
+        store.save_topology(_topology())
+        store.set_device_subscription(
+            "device-1",
+            source="onvif",
+            state="healthy",
+            detail="原生事件订阅已建立",
+            actor="test",
+        )
+        checked_at = datetime(2026, 1, 1, 12, 30, tzinfo=UTC)
+        store.set_stream_health(
+            "stream-1",
+            "online",
+            "已读取首帧",
+            updated_at=checked_at,
+            actor="test",
+        )
+        context = build_operational_context(store)
+        camera = context.cameras[0]
+        assert camera.subscription_state == "healthy"
+        assert camera.subscription_detail == "原生事件订阅已建立"
+        assert camera.health_updated_at == checked_at.isoformat()
+        assert "检测于" in camera.health_checked_text
+        assert "告警订阅：原生事件订阅已建立" in context.to_prompt()
+        assert camera.health_checked_text in context.to_prompt()
+    finally:
+        store.close()
+
+
 def test_native_event_maps_to_existing_event_workflow_and_deduplicates_sources():
     store = SQLiteStore(":memory:")
     try:
@@ -123,7 +183,6 @@ def test_native_event_maps_to_existing_event_workflow_and_deduplicates_sources()
             "rule-native",
             stream_id="stream-1",
             name="设备移动侦测",
-            trigger_mode=RuleMode.NATIVE_EVENT,
             native_event_codes=("motiondetect",),
             dedup_window_seconds=10,
             actions=("event", "notify"),
@@ -153,50 +212,36 @@ def test_native_event_maps_to_existing_event_workflow_and_deduplicates_sources()
         store.close()
 
 
+def test_native_event_keys_include_device_identity():
+    occurred_at = datetime.now(UTC)
+    rule = Rule(
+        "rule-native-keys",
+        stream_id="stream-1",
+        native_event_codes=("alarm",),
+    )
+    event_a = NativeEvent(
+        device_id="device-a",
+        channel_id="ch1",
+        event_code="alarm",
+        occurred_at=occurred_at,
+        source=EventSource.ONVIF,
+        source_event_id="vendor-event-1",
+        stream_id="stream-1",
+        payload={"semantic": "intrusion"},
+    )
+    event_b = NativeEvent(
+        device_id="device-b",
+        channel_id="ch1",
+        event_code="alarm",
+        occurred_at=occurred_at,
+        source=EventSource.ONVIF,
+        source_event_id="vendor-event-1",
+        stream_id="stream-1",
+        payload={"semantic": "intrusion"},
+    )
 
-def test_native_event_is_merged_with_recent_local_fallback_event():
-    from dataclasses import replace as dataclass_replace
-
-    store = SQLiteStore(":memory:")
-    try:
-        native_rule = Rule(
-            "rule-native",
-            stream_id="stream-1",
-            trigger_mode=RuleMode.NATIVE_EVENT,
-            native_event_codes=("motiondetect",),
-            dedup_window_seconds=30,
-        )
-        store.save_rule(native_rule)
-        now = datetime.now(UTC)
-        native = NativeEvent(
-            device_id="device-1",
-            channel_id="ch1",
-            event_code="motiondetect",
-            occurred_at=now,
-            source=EventSource.ONVIF,
-            source_event_id="native-1",
-            stream_id="stream-1",
-            payload={"semantic": "motion"},
-        )
-        local_event = Event(
-            id="evt-local",
-            dedup_key="local-1",
-            rule_id="rule-analysis",
-            channel_id="stream-1",
-            level="high",
-            occurred_at=now,
-            target={"condition": "motion"},
-            source=EventSource.LOCAL_INFERENCE,
-            correlation_key=native.correlation_key,
-            dedup_window_seconds=30,
-        )
-        assert store.create_event_with_outbox(local_event, enqueue=False)
-        ingestor = NativeEventIngestor(store, (native_rule,), channels=("webhook",))
-        assert ingestor.ingest(native) == ()
-        assert len(store.search_events(stream_id="stream-1")) == 1
-    finally:
-        store.close()
-
+    assert event_a.correlation_key != event_b.correlation_key
+    assert event_a.to_event(rule=rule).dedup_key != event_b.to_event(rule=rule).dedup_key
 
 
 def test_native_event_rule_executes_http_action(monkeypatch):
@@ -210,7 +255,6 @@ def test_native_event_rule_executes_http_action(monkeypatch):
         rule = Rule(
             "rule-http",
             stream_id="stream-1",
-            trigger_mode=RuleMode.NATIVE_EVENT,
             native_event_codes=("alarm",),
             actions=("event", "http"),
             http_action_url="https://example.invalid/hook",
@@ -233,45 +277,35 @@ def test_native_event_rule_executes_http_action(monkeypatch):
         store.close()
 
 
-def test_analysis_policy_prefers_native_events_and_falls_back_when_unhealthy():
+def test_native_event_policy_requires_healthy_subscription():
     capabilities = DeviceCapabilities(native_events=True, event_types=("motiondetect",))
     native_rule = Rule(
         "native",
         stream_id="s",
-        trigger_mode=RuleMode.NATIVE_EVENT,
         native_event_codes=("motiondetect",),
     )
-    analysis_rule = Rule(
-        "analysis",
-        stream_id="s",
-        type="polygon",
-        geometry=((0, 0), (10, 0), (10, 10)),
-        condition="intrusion",
-    )
     healthy = decide_analysis(
-        policy=AnalysisPolicy.LOCAL_FALLBACK,
+        policy=AnalysisPolicy.NATIVE_ONLY,
         capabilities=capabilities,
         native_subscription_healthy=True,
         native_rules=(native_rule,),
     )
-    fallback = decide_analysis(
-        policy=AnalysisPolicy.LOCAL_FALLBACK,
+    unavailable = decide_analysis(
+        policy=AnalysisPolicy.NATIVE_ONLY,
         capabilities=capabilities,
         native_subscription_healthy=False,
         native_rules=(native_rule,),
-        analysis_rules=(analysis_rule,),
     )
-    native_subscription_fallback = decide_analysis(
-        policy=AnalysisPolicy.LOCAL_FALLBACK,
+    disabled = decide_analysis(
+        policy=AnalysisPolicy.DISABLED,
         capabilities=capabilities,
-        native_subscription_healthy=False,
-        native_rules=(native_rule,),
+        native_subscription_healthy=True,
     )
     assert healthy.use_native is True
-    assert healthy.use_local is False
-    assert fallback.use_local is True
-    assert native_subscription_fallback.use_local is True
-    assert fallback.policy is AnalysisPolicy.LOCAL_FALLBACK
+    assert unavailable.use_native is False
+    assert unavailable.label == "事件接入未就绪"
+    assert disabled.use_native is False
+    assert disabled.reason == "事件接入已停用"
 
 
 def test_topology_csv_round_trips_physical_device_capabilities():
@@ -280,7 +314,7 @@ def test_topology_csv_round_trips_physical_device_capabilities():
     assert restored.stream_path("stream-1").device.capabilities.recording_search is True
 
 
-def test_sqlite_migrates_legacy_camera_and_persists_model_configuration(tmp_path):
+def test_sqlite_migrates_legacy_camera(tmp_path):
     database = tmp_path / "legacy.db"
     store = SQLiteStore(database)
     try:
@@ -300,15 +334,8 @@ def test_sqlite_migrates_legacy_camera_and_persists_model_configuration(tmp_path
         assert len(topology.devices) == 1
         assert topology.cameras[0].device_id == topology.devices[0].id
         assert topology.streams[0].device_id == topology.devices[0].id
-        profile = ModelProfile("model-1", "人员模型", model_uri="models/person.onnx")
-        binding = ModelBinding("binding-1", "model-1", "stream", "stream-old")
-        migrated.save_model_configuration((profile,), (binding,))
-        profiles, bindings = migrated.load_model_configuration()
-        assert profiles[0].model_uri == "models/person.onnx"
-        assert bindings[0].scope_id == "stream-old"
     finally:
         migrated.close()
-
 
 
 def test_configuration_export_redacts_device_and_stream_credentials():
@@ -366,7 +393,6 @@ def test_configuration_export_redacts_device_and_stream_credentials():
         source.close()
 
 
-
 def test_configuration_import_accepts_legacy_schema_one():
     store = SQLiteStore(":memory:")
     try:
@@ -374,7 +400,9 @@ def test_configuration_import_accepts_legacy_schema_one():
             {
                 "schema_version": 1,
                 "topology": {
-                    "sites": [{"id": "site-old", "name": "旧厂区", "description": "", "enabled": True}],
+                    "sites": [
+                        {"id": "site-old", "name": "旧厂区", "description": "", "enabled": True}
+                    ],
                     "areas": [],
                     "cameras": [],
                     "streams": [],
@@ -396,7 +424,6 @@ def test_credential_vault_round_trip_and_config_export_has_no_secret():
     encoded = vault.encode(credentials)
     assert "secret" not in encoded
     assert vault.decode(encoded) == credentials
-
 
 
 def test_windows_dpapi_credential_vault_round_trip():
@@ -429,8 +456,12 @@ def test_sip_message_and_digest_authentication():
         method="REGISTER",
         uri="sip:3402000000@3402000000",
     )
-    assert verify_digest(authorization, password="secret", method="REGISTER", uri="sip:3402000000@3402000000")
-    assert not verify_digest(authorization, password="wrong", method="REGISTER", uri="sip:3402000000@3402000000")
+    assert verify_digest(
+        authorization, password="secret", method="REGISTER", uri="sip:3402000000@3402000000"
+    )
+    assert not verify_digest(
+        authorization, password="wrong", method="REGISTER", uri="sip:3402000000@3402000000"
+    )
 
 
 def test_gb28181_platform_registers_catalogs_and_receives_alarm():
@@ -474,7 +505,6 @@ def test_gb28181_platform_registers_catalogs_and_receives_alarm():
     )
     platform.handle_datagram(alarm, ("10.0.0.8", 5060))
     assert events and events[0].source is EventSource.GB28181
-
 
 
 def test_onvif_adapter_probes_media_streams_and_pullpoint_events():
@@ -525,7 +555,9 @@ def test_onvif_adapter_probes_media_streams_and_pullpoint_events():
             raise AssertionError(action)
 
     topology = _topology()
-    adapter = OnvifAdapter(topology.devices[0], DeviceCredentials("admin", "secret"), soap=FakeSoap())
+    adapter = OnvifAdapter(
+        topology.devices[0], DeviceCredentials("admin", "secret"), soap=FakeSoap()
+    )
     result = adapter.probe()
     assert result.ok
     assert result.info.manufacturer == "Acme"
@@ -542,6 +574,104 @@ def test_onvif_adapter_probes_media_streams_and_pullpoint_events():
     assert event.event_code == "propertyoperation"
     assert event.channel_id == "ch1"
 
+
+def test_onvif_pullpoint_survives_transient_connection_loss(monkeypatch):
+    """One dropped poll must not end the alarm stream."""
+    pulls = []
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("factoryguard.devices.onvif.time.sleep", fake_sleep)
+
+    class FlakySoap:
+        last_status = 200
+        last_action = ""
+
+        def call(self, _service, action, _body):
+            self.last_action = action
+            if action == "CreatePullPointSubscription":
+                return ET.fromstring(
+                    "<Response><SubscriptionReference><Address>http://cam/pullpoint</Address>"
+                    "</SubscriptionReference></Response>"
+                )
+            if action == "PullMessages":
+                pulls.append(action)
+                if len(pulls) == 1:
+                    raise RuntimeError("ONVIF connection failed for PullMessages: timed out")
+                if len(pulls) == 2:
+                    raise RuntimeError("ONVIF connection failed for PullMessages: timed out")
+                return ET.fromstring(
+                    '<Response><Message UtcTime="2026-01-01T00:00:00Z" PropertyOperation="Changed">'
+                    '<Source><SimpleItem Name="VideoSourceConfigurationToken" Value="ch1"/></Source>'
+                    '<Data><SimpleItem Name="State" Value="true"/></Data></Message></Response>'
+                )
+            raise AssertionError(action)
+
+    adapter = OnvifAdapter(_topology().devices[0], soap=FlakySoap())
+    adapter._services["http://www.onvif.org/ver10/events/wsdl"] = "http://cam/events"
+    subscription = adapter.subscribe_events("ch1")
+    event = next(subscription.iterator)
+    subscription.close()
+
+    assert len(pulls) == 3
+    assert sleeps == [2.0, 4.0]
+    assert event.event_code == "propertyoperation"
+    assert event.channel_id == "ch1"
+
+
+def test_onvif_pullpoint_gives_up_after_repeated_failures(monkeypatch):
+    pulls = []
+    monkeypatch.setattr("factoryguard.devices.onvif.time.sleep", lambda _seconds: None)
+
+    class DeadSoap:
+        last_status = 200
+        last_action = ""
+
+        def call(self, _service, action, _body):
+            self.last_action = action
+            if action == "CreatePullPointSubscription":
+                return ET.fromstring(
+                    "<Response><SubscriptionReference><Address>http://cam/pullpoint</Address>"
+                    "</SubscriptionReference></Response>"
+                )
+            pulls.append(action)
+            raise RuntimeError("ONVIF connection failed for PullMessages: unreachable")
+
+    adapter = OnvifAdapter(_topology().devices[0], soap=DeadSoap())
+    adapter._services["http://www.onvif.org/ver10/events/wsdl"] = "http://cam/events"
+    subscription = adapter.subscribe_events("ch1")
+    assert list(subscription.iterator) == []
+    assert len(pulls) == OnvifAdapter.PULL_MAX_FAILURES + 1
+
+
+def test_onvif_repeated_property_operations_get_distinct_event_ids():
+    adapter = OnvifAdapter(_topology().devices[0])
+    first = ET.fromstring(
+        '<Message UtcTime="2026-01-01T00:00:00Z" PropertyOperation="Changed">'
+        "<Topic>tns1:RuleEngine/CellMotionDetector/Motion</Topic>"
+        '<Source><SimpleItem Name="VideoSourceConfigurationToken" Value="ch1"/></Source>'
+        '<Data><SimpleItem Name="State" Value="true"/></Data></Message>'
+    )
+    second = ET.fromstring(
+        '<Message UtcTime="2026-01-01T00:00:01Z" PropertyOperation="Changed">'
+        "<Topic>tns1:RuleEngine/CellMotionDetector/Motion</Topic>"
+        '<Source><SimpleItem Name="VideoSourceConfigurationToken" Value="ch1"/></Source>'
+        '<Data><SimpleItem Name="State" Value="false"/></Data></Message>'
+    )
+    event_one = adapter._parse_event(first, None)
+    event_two = adapter._parse_event(second, None)
+    assert event_one is not None and event_two is not None
+    assert event_one.source_event_id != event_two.source_event_id
+    assert event_one.source_event_id.startswith("onvif-")
+    assert event_one.title == "检测到移动"
+    assert event_one.payload["topic"] == "tns1:RuleEngine/CellMotionDetector/Motion"
+    assert event_one.occurred_at == datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+    assert event_two.occurred_at == datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
+    assert event_one.level == "high"
+    assert event_two.level == "info"
+    adapter.close()
 
 
 def _gb_register(auth: str = "") -> bytes:
@@ -603,7 +733,9 @@ def test_gb28181_tcp_invite_ack_bye_and_recording_query():
             platform_id="340200000000000000",
             domain="3402000000",
         )
-        transport = SimpleNamespace(write=lambda payload: transport.writes.append(payload), writes=[])
+        transport = SimpleNamespace(
+            write=lambda payload: transport.writes.append(payload), writes=[]
+        )
         platform.registrations["device-1"] = __import__(
             "factoryguard.devices.gb28181.server", fromlist=["Gb28181Registration"]
         ).Gb28181Registration(
@@ -666,7 +798,6 @@ def test_gb28181_tcp_invite_ack_bye_and_recording_query():
     asyncio.run(run())
 
 
-
 def test_gb28181_platform_starts_udp_and_tcp_listeners_and_closes():
     async def run():
         platform = Gb28181Platform(
@@ -696,9 +827,7 @@ def test_gb28181_malformed_transport_does_not_stop_registration():
     assert "340200000000000001" in platform.registrations
 
 
-
 def test_ws_discovery_probe_receives_local_device_match(monkeypatch):
-    import socket as socket_module
 
     payload = (
         b"<Envelope><Body><ProbeMatches><ProbeMatch>"
@@ -730,7 +859,7 @@ def test_ws_discovery_probe_receives_local_device_match(monkeypatch):
 
         def recvfrom(self, _size):
             if self.received:
-                raise socket_module.timeout()
+                raise TimeoutError()
             self.received = True
             return payload, ("10.0.0.8", 3702)
 
@@ -776,85 +905,232 @@ def test_onvif_soap_client_posts_authenticated_xml(monkeypatch):
         DeviceCredentials(username="admin", password="secret"),
         timeout=3,
     )
-    root = client.call("http://10.0.0.8/onvif/device_service", "GetDeviceInformation", "<GetDeviceInformation/>")
+    root = client.call(
+        "http://10.0.0.8/onvif/device_service", "GetDeviceInformation", "<GetDeviceInformation/>"
+    )
     assert root.find(".//Manufacturer").text == "Acme"
     assert b"UsernameToken" in captured["data"]
     assert captured["timeout"] == 3
 
 
+def test_device_manager_forwards_onvif_native_events(tmp_path, monkeypatch):
+    topology = _topology()
+    device = topology.devices[0]
+    store = SQLiteStore(tmp_path / "native-subscription.db")
+    store.save_topology(topology)
+    received = []
+    received_event = threading.Event()
+    closed = []
 
-def test_monitor_worker_stops_local_analysis_when_native_subscription_recovers(monkeypatch):
-    states = ["healthy", "healthy", "degraded", "degraded", "healthy"]
-    calls = []
+    class FakeAdapter:
+        def probe(self, *, timeout: float):
+            return ProbeResult(
+                ok=True,
+                detail="ready",
+                capabilities=DeviceCapabilities(native_events=True),
+            )
 
-    class FakeStore:
-        def load_rules(self, **_kwargs):
-            return []
+        def subscribe_events(self):
+            native = NativeEvent(
+                device_id=device.id,
+                channel_id="stream-1",
+                event_code="motiondetect",
+                occurred_at=datetime.now(UTC),
+                source=EventSource.ONVIF,
+                title="移动侦测",
+                stream_id="stream-1",
+            )
+            return EventSubscription(source="onvif", iterator=iter((native,)))
 
-        def save_rule(self, _rule):
-            return None
+        def close(self):
+            closed.append(True)
 
-        def get_stream_armed(self, _stream_id, default=True):
-            return default
+    manager = DeviceManager(
+        store,
+        credential_store=store,
+        on_native_event=lambda event: (received.append(event), received_event.set()),
+    )
+    monkeypatch.setattr(manager, "adapter_for", lambda _device: FakeAdapter())
+    manager.start_native_subscription(device, ())
+    assert received_event.wait(3.0)
+    assert received and received[0].event_code == "motiondetect"
+    deadline = time.monotonic() + 3.0
+    while manager.active_native_subscription_ids() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager.active_native_subscription_ids() == ()
+    manager.close()
+    assert closed
 
-        def get_arming_schedule(self, _stream_id):
-            return None
 
-        def list_device_subscriptions(self):
-            return {"device-1": {"state": states.pop(0) if states else "healthy"}}
+def test_native_subscription_recovers_after_connection_loss(tmp_path, monkeypatch):
+    """A device that goes offline must come back without operator action."""
+    topology = _topology()
+    device = topology.devices[0]
+    store = SQLiteStore(tmp_path / "native-reconnect.db")
+    store.save_topology(topology)
+    attempts = []
+    delivered = threading.Event()
 
-        def set_stream_health(self, *_args, **_kwargs):
-            return None
+    class FlakyIterator:
+        def __init__(self, attempt: int):
+            self.attempt = attempt
+            self.sent = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.sent:
+                raise StopIteration
+            self.sent = True
+            if self.attempt == 1:
+                # First attempt drops the connection immediately, simulating a
+                # camera that went offline right after the subscription opened.
+                raise ConnectionError("connection reset by peer")
+            delivered.set()
+            return NativeEvent(
+                device_id=device.id,
+                channel_id="stream-1",
+                event_code="motiondetect",
+                occurred_at=datetime.now(UTC),
+                source=EventSource.ONVIF,
+                stream_id="stream-1",
+            )
+
+    class FlakyAdapter:
+        def __init__(self):
+            self.count = 0
+
+        def probe(self, *, timeout: float):
+            del timeout
+            return ProbeResult(
+                ok=True,
+                detail="ready",
+                capabilities=DeviceCapabilities(native_events=True),
+            )
+
+        def subscribe_events(self):
+            self.count += 1
+            attempts.append(self.count)
+            return EventSubscription(
+                source="onvif",
+                iterator=FlakyIterator(self.count),
+            )
 
         def close(self):
             return None
 
-    class FakeEngine:
-        def infer_image(self, _image):
-            calls.append(frame_index[0])
-            return ()
-
-    class FakeCapture:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        @contextmanager
-        def stream(self, *, timeout):
-            def frames():
-                for frame_index[0] in range(20):
-                    yield RawFrame(__import__("numpy").zeros((2, 2, 3), dtype="uint8"), frame_index[0])
-                worker._stop.set()
-
-            yield frames()
-
-    frame_index = [0]
-    worker = MonitorWorker(
-        MonitorConfig(
-            db=":memory:",
-            notification_channels=(),
-            streams=(
-                StreamRuntimeConfig(
-                    stream_id="stream-1",
-                    url="rtsp://camera/live",
-                    device_id="device-1",
-                    capabilities=DeviceCapabilities(native_events=True),
-                    native_subscription_healthy=True,
-                    analysis_policy=AnalysisPolicy.LOCAL_FALLBACK,
-                ),
-            ),
-        )
-    )
-    monkeypatch.setattr("factoryguard.ui.worker.SQLiteStore", lambda *_args, **_kwargs: FakeStore())
-    monkeypatch.setattr("factoryguard.ui.worker.RTSPCapture", FakeCapture)
+    adapter = FlakyAdapter()
     monkeypatch.setattr(
-        "factoryguard.ui.worker.require_ffmpeg",
-        lambda: SimpleNamespace(version="fake"),
+        "factoryguard.app.device_manager.DeviceAdapterFactory.create",
+        lambda *_args, **_kwargs: adapter,
     )
-    worker._shared_engine = lambda _runtime: (FakeEngine(), InferenceHealth("ready", "fake"))
-    worker._run_stream_once(SimpleNamespace(), worker.config.streams[0])
-    assert calls
-    assert min(calls) >= 5
-    assert max(calls) <= 15
+
+    manager = DeviceManager(store)
+    try:
+        manager.start_native_subscription(device, ())
+        deadline = time.monotonic() + 5.0
+        while not attempts and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert attempts == [1]
+
+        # The operator does nothing: the platform must detect the dead
+        # subscription and restore it on the next sync pass.
+        deadline = time.monotonic() + 5.0
+        while len(attempts) < 2 and time.monotonic() < deadline:
+            manager.start_native_subscription(device, ())
+            time.sleep(0.05)
+
+        assert len(attempts) >= 2
+        assert delivered.wait(3.0)
+    finally:
+        manager.close()
+        store.close()
+
+
+def test_native_subscription_restart_does_not_clear_new_thread_state(tmp_path, monkeypatch):
+    topology = _topology()
+    device = topology.devices[0]
+    store = SQLiteStore(tmp_path / "native-restart.db")
+    store.save_topology(topology)
+    old_started = threading.Event()
+    old_release = threading.Event()
+    new_started = threading.Event()
+    new_release = threading.Event()
+    closed = []
+
+    class BlockingIterator:
+        def __init__(self, started, release):
+            self.started = started
+            self.release = release
+            self.finished = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.finished:
+                raise StopIteration
+            self.started.set()
+            self.release.wait(3.0)
+            self.finished = True
+            return NativeEvent(
+                device_id=device.id,
+                channel_id="stream-1",
+                event_code="motiondetect",
+                occurred_at=datetime.now(UTC),
+                source=EventSource.ONVIF,
+                stream_id="stream-1",
+            )
+
+    class BlockingAdapter:
+        def __init__(self, started, release):
+            self.started = started
+            self.release = release
+
+        def probe(self, *, timeout: float):
+            del timeout
+            return ProbeResult(
+                ok=True,
+                detail="ready",
+                capabilities=DeviceCapabilities(native_events=True),
+            )
+
+        def subscribe_events(self):
+            return EventSubscription(
+                source="onvif",
+                iterator=BlockingIterator(self.started, self.release),
+            )
+
+        def close(self):
+            closed.append(True)
+
+    adapters = [
+        BlockingAdapter(old_started, old_release),
+        BlockingAdapter(new_started, new_release),
+    ]
+    manager = DeviceManager(store, credential_store=store)
+    monkeypatch.setattr(manager, "adapter_for", lambda _device: adapters.pop(0))
+
+    manager.start_native_subscription(device, ())
+    assert old_started.wait(2.0)
+    manager.stop_native_subscription(device.id)
+    manager.start_native_subscription(device, ())
+    assert new_started.wait(2.0)
+    assert manager.active_native_subscription_ids() == (device.id,)
+
+    old_release.set()
+    time.sleep(0.1)
+    assert manager.active_native_subscription_ids() == (device.id,)
+
+    manager.stop_native_subscription(device.id)
+    new_release.set()
+    deadline = time.monotonic() + 2.0
+    while manager.active_native_subscription_ids() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager.active_native_subscription_ids() == ()
+    manager.close()
+    assert len(closed) == 2
 
 
 def test_ws_discovery_parses_probe_match_without_network(monkeypatch):
@@ -864,3 +1140,61 @@ def test_ws_discovery_parses_probe_match_without_network(monkeypatch):
 <Types>dn:NetworkVideoTransmitter</Types><MetadataVersion>3</MetadataVersion>
 </ProbeMatch></ProbeMatches></Body></Envelope>"""
     assert OnvifDiscovery._parse_matches(payload)[0].endpoint.endswith("/device_service")
+
+
+def test_onvif_alarm_reaches_a_registered_device_subscription(tmp_path):
+    """A registered camera must deliver a real ONVIF alarm to the platform."""
+    from tools.camera_sim.service import CameraSimulator
+
+    store = SQLiteStore(tmp_path / "onvif-pipeline.db")
+    simulator = CameraSimulator(
+        count=1,
+        protocols=("onvif",),
+        rtsp_port=0,
+        onvif_port=0,
+    )
+    manager = None
+    try:
+        simulator.start()
+        endpoint = simulator.snapshot()[0]["onvif_endpoint"]
+        device = VideoDevice(
+            "sim-device",
+            "site-1",
+            "area-1",
+            "模拟摄像头",
+            DeviceProtocol.ONVIF,
+            str(endpoint),
+            capabilities=DeviceCapabilities(live_video=True, native_events=True),
+        )
+        camera = CameraDevice("sim-camera", "area-1", "模拟摄像头", device_id=device.id)
+        store.save_topology(
+            EntityRegistry(
+                sites=(Site("site-1", "门店"),),
+                areas=(Area("area-1", "site-1", "东门"),),
+                devices=(device,),
+                cameras=(camera,),
+            )
+        )
+
+        received: list[NativeEvent] = []
+        manager = DeviceManager(store, on_native_event=received.append)
+        manager.start_native_subscription(device, ())
+
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not store.list_device_subscriptions():
+            time.sleep(0.1)
+        assert store.list_device_subscriptions(), "the subscription never became healthy"
+
+        assert simulator.send_alarm() == 1
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and not received:
+            time.sleep(0.2)
+
+        assert received, "the alarm never reached the platform"
+        assert str(received[0].source) == "onvif"
+        assert received[0].event_code
+    finally:
+        if manager is not None:
+            manager.close()
+        store.close()
+        simulator.stop()

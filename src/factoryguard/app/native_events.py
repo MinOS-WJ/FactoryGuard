@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 """Native-first analysis policy and event-to-rule bridge."""
 
+from __future__ import annotations
+
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Sequence
 
 from factoryguard.domain.models import (
     AnalysisPolicy,
@@ -13,7 +13,6 @@ from factoryguard.domain.models import (
     EventSource,
     NativeEvent,
     Rule,
-    RuleMode,
 )
 from factoryguard.notifications.actions import execute_http_action
 from factoryguard.storage.sqlite import SQLiteStore
@@ -21,20 +20,15 @@ from factoryguard.storage.sqlite import SQLiteStore
 
 @dataclass(frozen=True, slots=True)
 class AnalysisDecision:
+    """Describe whether native device events are currently ingested."""
+
     policy: AnalysisPolicy
     use_native: bool
-    use_local: bool
     reason: str
 
     @property
     def label(self) -> str:
-        if self.use_local and self.use_native:
-            return "设备事件 + 本机备用分析"
-        if self.use_native:
-            return "设备原生事件"
-        if self.use_local:
-            return "本机备用分析"
-        return "分析已停用"
+        return "设备原生事件" if self.use_native else "事件接入未就绪"
 
 
 def decide_analysis(
@@ -45,54 +39,27 @@ def decide_analysis(
     native_rules: Sequence[Rule] = (),
     analysis_rules: Sequence[Rule] = (),
 ) -> AnalysisDecision:
-    try:
-        resolved = policy if isinstance(policy, AnalysisPolicy) else AnalysisPolicy(str(policy))
-    except ValueError as exc:
-        raise ValueError("analysis policy is invalid") from exc
+    """Return the native-event state; local frame analysis is unsupported."""
+    del native_rules, analysis_rules
+    resolved = AnalysisPolicy.normalize(policy)
     if resolved is AnalysisPolicy.DISABLED:
-        return AnalysisDecision(resolved, False, False, "已停用")
+        return AnalysisDecision(resolved, False, "事件接入已停用")
     native_available = capabilities.native_events and native_subscription_healthy
-    has_native_work = bool(native_rules)
-    has_analysis_work = bool(analysis_rules)
-    if resolved is AnalysisPolicy.NATIVE_ONLY:
-        return AnalysisDecision(
-            resolved,
-            native_available,
-            False,
-            "仅接收设备原生事件" if native_available else "设备原生事件不可用且不允许本机兜底",
-        )
-    if resolved is AnalysisPolicy.LOCAL_PRIMARY:
-        return AnalysisDecision(
-            resolved,
-            native_available,
-            has_analysis_work or not native_available,
-            "本机分析为主，设备事件作为补充",
-        )
-    if native_available and has_native_work and not has_analysis_work:
-        return AnalysisDecision(resolved, True, False, "设备已提供所需事件，本机分析待命")
-    if native_available and has_native_work and has_analysis_work:
-        return AnalysisDecision(resolved, True, True, "部分规则需要本机分析")
-    use_local = has_analysis_work or not native_available
     return AnalysisDecision(
         resolved,
         native_available,
-        use_local,
-        (
-            "规则需要本机分析"
-            if has_analysis_work
-            else "设备缺少所需事件能力，启用本机备用分析"
-            if use_local
-            else "当前规则由设备事件完成"
-        ),
+        "设备原生事件已就绪" if native_available else "设备原生事件不可用",
     )
 
 
 class NativeEventIngestor:
     """Turn checked device events into the existing event/outbox workflow."""
 
-    def __init__(self, store: SQLiteStore, rules: Sequence[Rule], *, channels: Sequence[str] = ()) -> None:
+    def __init__(
+        self, store: SQLiteStore, rules: Sequence[Rule], *, channels: Sequence[str] = ()
+    ) -> None:
         self.store = store
-        self.rules = tuple(rule for rule in rules if rule.trigger_mode is RuleMode.NATIVE_EVENT and rule.enabled)
+        self.rules = tuple(rule for rule in rules if rule.enabled)
         self.channels = tuple(dict.fromkeys(str(value) for value in channels if str(value)))
         self.last_action_errors: list[str] = []
 

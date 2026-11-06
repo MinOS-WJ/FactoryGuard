@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
-from email.message import EmailMessage
-from pathlib import Path
 import json
-from math import isfinite
 import re
 import smtplib
+from collections.abc import Iterable, Mapping
+from email.message import EmailMessage
+from math import isfinite
+from pathlib import Path
 from typing import Protocol
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from factoryguard.domain.models import Event
+from factoryguard.net import close_http_error
 from factoryguard.notifications.providers import sms_preset
 from factoryguard.notifications.webhook import WebhookNotifier, build_webhook_request
 
@@ -169,6 +170,7 @@ class SmsHttpAdapter:
                 return False, f"SMS gateway returned HTTP {status}"
             return True, f"SMS gateway accepted for {len(self.recipients)} recipient(s)"
         except (OSError, URLError, ValueError) as exc:
+            close_http_error(exc)
             return False, _redact_error(exc, self.token)
 
 
@@ -271,9 +273,12 @@ def _attach_event_media(message: EmailMessage, event: Event) -> None:
         except OSError:
             continue
 
+
 def _email_body(event: Event) -> str:
     stream_id = event.stream_id or event.channel_id
-    entity = "/".join(value for value in (event.site_id, event.area_id, event.camera_id) if value) or "-"
+    entity = (
+        "/".join(value for value in (event.site_id, event.area_id, event.camera_id) if value) or "-"
+    )
     return (
         "FactoryGuard detected an event.\n\n"
         f"Event: {event.id}\n"
@@ -292,10 +297,13 @@ def _email_body(event: Event) -> str:
 
 def _event_message(event: Event) -> str:
     stream_id = event.stream_id or event.channel_id
-    entity = "/".join(value for value in (event.site_id, event.area_id, event.camera_id) if value) or "-"
+    entity = (
+        "/".join(value for value in (event.site_id, event.area_id, event.camera_id) if value) or "-"
+    )
+    assignees = ",".join(event.assignees) if event.assignees else "-"
     return (
         f"FactoryGuard {event.level} event {event.id}; "
-        f"stream={stream_id}; entity={entity}; rule={event.rule_id}; assignees={",".join(event.assignees) if event.assignees else "-"}"
+        f"stream={stream_id}; entity={entity}; rule={event.rule_id}; assignees={assignees}"
     )
 
 

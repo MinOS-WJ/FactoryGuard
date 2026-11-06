@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-
 _DESTINATION_KINDS = {"webhook", "email", "sms"}
 
 
@@ -104,6 +103,7 @@ def resolve_notification_channels(
             channels.append(normalized)
     return tuple(channels)
 
+
 def new_destination_id(kind: str) -> str:
     normalized = str(kind).strip().lower()
     if normalized not in _DESTINATION_KINDS:
@@ -111,7 +111,9 @@ def new_destination_id(kind: str) -> str:
     return f"{normalized}-{uuid4().hex[:10]}"
 
 
-def default_destination(kind: str, *, enabled: bool, provider: str | None = None) -> NotificationDestination:
+def default_destination(
+    kind: str, *, enabled: bool, provider: str | None = None
+) -> NotificationDestination:
     defaults = {
         "webhook": ("默认 Webhook", "custom"),
         "email": ("默认邮箱", "custom"),

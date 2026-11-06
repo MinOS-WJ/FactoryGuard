@@ -1,12 +1,13 @@
-from __future__ import annotations
-
 """Uniform interfaces for RTSP, ONVIF and GB/T 28181 video devices."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from factoryguard.domain.models import (
     AnalysisPolicy,
@@ -26,7 +27,10 @@ class DeviceCredentials:
     token: str = ""
 
     def __post_init__(self) -> None:
-        if any("\n" in str(value) or "\r" in str(value) for value in (self.username, self.password, self.token)):
+        if any(
+            "\n" in str(value) or "\r" in str(value)
+            for value in (self.username, self.password, self.token)
+        ):
             raise ValueError("credentials must be single-line values")
 
     @property
@@ -34,10 +38,14 @@ class DeviceCredentials:
         return not any((self.username, self.password, self.token))
 
     def with_password_in_url(self, url: str) -> str:
-        if not self.password or "@" in url.split("://", 1)[-1]:
+        if not self.password or "://" not in url:
             return url
-        scheme, rest = url.split("://", 1)
-        return f"{scheme}://{self.username}:{self.password}@{rest}"
+        parsed = urlsplit(url)
+        if parsed.username is not None:
+            return url
+        userinfo = f"{quote(self.username, safe='')}:{quote(self.password, safe='')}"
+        netloc = f"{userinfo}@{parsed.netloc}"
+        return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +86,7 @@ class LiveStream:
     width: int = 0
     height: int = 0
 
-    def with_credentials(self, credentials: DeviceCredentials) -> "LiveStream":
+    def with_credentials(self, credentials: DeviceCredentials) -> LiveStream:
         return LiveStream(
             uri=credentials.with_password_in_url(self.uri),
             profile_id=self.profile_id,
@@ -104,7 +112,7 @@ class ProbeResult:
     detail: str
     latency_ms: float | None = None
     info: DeviceInfo | None = None
-    capabilities: DeviceCapabilities = DeviceCapabilities()
+    capabilities: DeviceCapabilities = field(default_factory=DeviceCapabilities)
     diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -117,8 +125,14 @@ class EventSubscription:
 
     def close(self) -> None:
         close = getattr(self.iterator, "close", None)
-        if callable(close):
+        if not callable(close):
+            return
+        try:
             close()
+        except ValueError:
+            # The generator is currently running inside a worker thread; the
+            # protocol loop stops on its own once the adapter is closed.
+            pass
 
 
 class DeviceAdapter(ABC):
@@ -172,7 +186,7 @@ class DeviceAdapter(ABC):
     def close(self) -> None:
         self.closed = True
 
-    def __enter__(self) -> "DeviceAdapter":
+    def __enter__(self) -> DeviceAdapter:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -185,6 +199,7 @@ def require_open(adapter: DeviceAdapter) -> None:
 
 
 __all__ = [
+    "AnalysisPolicy",
     "DeviceAdapter",
     "DeviceCapabilities",
     "DeviceChannel",
@@ -193,9 +208,8 @@ __all__ = [
     "DeviceProtocol",
     "EventSubscription",
     "LiveStream",
+    "NativeEvent",
     "ProbeResult",
     "Recording",
-    "AnalysisPolicy",
-    "NativeEvent",
     "require_open",
 ]

@@ -1,0 +1,52 @@
+{
+  "generated_at": "2026-11-06 13:35:42",
+  "size": {
+    "width": 1440,
+    "height": 900
+  },
+  "video": "console-walkthrough.mp4",
+  "pages": [
+    {
+      "page": "dashboard",
+      "title": "工作台",
+      "screenshot": "page-dashboard.png",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "page": "live",
+      "title": "实时画面",
+      "screenshot": "page-live.png",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "page": "incidents",
+      "title": "险情中心",
+      "screenshot": "page-incidents.png",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "page": "devices",
+      "title": "区域与设备",
+      "screenshot": "page-devices.png",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "page": "assistant",
+      "title": "现场问询",
+      "screenshot": "page-assistant.png",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "page": "settings",
+      "title": "系统设置",
+      "screenshot": "page-settings.png",
+      "width": 1440,
+      "height": 900
+    }
+  ]
+}

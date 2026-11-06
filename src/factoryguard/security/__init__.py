@@ -1,5 +1,17 @@
-"""Local security helpers."""
+"""Local credential helpers."""
 
-from .credentials import CredentialVault, WindowsDpapiProtector, default_vault, new_credential_ref
+from .credentials import (
+    CredentialVault,
+    PlaintextCredentialVault,
+    WindowsDpapiProtector,
+    default_vault,
+    new_credential_ref,
+)
 
-__all__ = ["CredentialVault", "WindowsDpapiProtector", "default_vault", "new_credential_ref"]
+__all__ = [
+    "CredentialVault",
+    "PlaintextCredentialVault",
+    "WindowsDpapiProtector",
+    "default_vault",
+    "new_credential_ref",
+]
